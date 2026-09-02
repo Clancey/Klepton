@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
@@ -37,7 +38,11 @@ int getentropy(void *buf, size_t buflen);
 #include <wchar.h>
 #include <ctype.h>
 #include "klepton.h"
+#include "guest/kl_obbmap.h"
 #include "kl_va.h"
+#include <sys/ucontext.h>   /* Darwin mcontext for the x18-veneer signal repair */
+#include "kl_x18.h"         /* KLX_TSD_SLOT */
+#include "kl_target.h"      /* kl_guest_kind / KL_GUEST_UNITY */
 #include "kl_jni.h"     // kl_jni_build_string — the Build.* half of the system
 #include "kl_fault.h"   // kl_fault_print_frames — who called exit()
                         // properties below, so the two cannot drift apart
@@ -190,12 +195,111 @@ static const struct { const char *prop, *build_field; } g_sysprops[] = {
 // platform 5 is not available in shader blob`, because platform 5 is GLES20 and
 // the game ships no GLES2 shaders. Three symptoms, all graphics-shaped, none of
 // them naming a property.
+// `net.dns1..4` are the DNS servers, and empty is NOT harmless there either:
+// a guest whose curl was built on c-ares (AC Nexus's Ubisoft ClientSdk) never
+// calls getaddrinfo at all — c-ares reads these properties, and four empty
+// answers leave it with no resolver. Every request then dies with "Couldn't
+// resolve host name" while our own getaddrinfo shim, which would have worked,
+// logs nothing because nothing asked it. The game sits in its loading video
+// waiting for a session that can never be created.
+//
+// The host's own resolvers are the truthful answer, read from resolv.conf
+// (macOS keeps it in /var/run, and iOS-family sandboxes have historically let
+// /etc/resolv.conf through). When neither is readable the fallback is public
+// resolvers — a made-up answer, but one that resolves, where the honest empty
+// is one that cannot.
+static const char *sysprop_dns(int idx) {           // idx 0..3 for net.dns1..4
+    static char servers[4][46];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        const char *paths[] = { "/var/run/resolv.conf", "/etc/resolv.conf" };
+        for (size_t p = 0; p < 2 && n == 0; p++) {
+            FILE *f = fopen(paths[p], "r");
+            if (!f) continue;
+            char line[256];
+            while (n < 4 && fgets(line, sizeof line, f)) {
+                char addr[64];
+                if (sscanf(line, " nameserver %63s", addr) != 1) continue;
+                // scoped IPv6 ("fe80::1%en0") does not survive a plain string
+                // round-trip into a guest socket address; skip those.
+                if (strchr(addr, '%')) continue;
+                snprintf(servers[n++], sizeof servers[0], "%s", addr);
+            }
+            fclose(f);
+        }
+        if (n == 0) {
+            snprintf(servers[0], sizeof servers[0], "8.8.8.8");
+            snprintf(servers[1], sizeof servers[0], "1.1.1.1");
+            n = 2;
+        }
+        fprintf(stderr, "  [net] net.dns1..%d -> %s%s%s (%s)\n", n,
+                servers[0], n > 1 ? ", " : "", n > 1 ? servers[1] : "",
+                n == 2 && servers[0][0] == '8' ? "fallback — no resolv.conf readable"
+                                               : "from the host's resolv.conf");
+    }
+    return idx < n ? servers[idx] : NULL;
+}
+
 static const char *sysprop_value(const char *n) {
     if (!n) return NULL;
     if (strcmp(n, "ro.build.version.sdk") == 0) {
+        // KL_SDK_INT overrides ONLY this sysprop, not the JNI Build.VERSION.SDK_INT
+        // (which stays 29 — guests branch on it). SDL2 sets it to 17 so its Android
+        // HIDAPI (PLATFORM_hid_init, gated on SDK>=18) is skipped: SDL's HID needs a
+        // Java HIDDeviceManager Klepton does not provide, and dereferences a NULL
+        // manager the instant it runs.
+        const char *ov = getenv("KL_SDK_INT");
         static char sdk[16];
-        snprintf(sdk, sizeof sdk, "%d", kl_jni_build_int("SDK_INT", 29));
+        snprintf(sdk, sizeof sdk, "%d", ov && *ov ? atoi(ov) : kl_jni_build_int("SDK_INT", 29));
         return sdk;
+    }
+    if (strncmp(n, "net.dns", 7) == 0 && n[7] >= '1' && n[7] <= '4' && !n[8])
+        return sysprop_dns(n[7] - '1');
+    // Klepton: HL2Q3VR (hl2/portal) gates its "Internal multiview probe" on this
+    // debug property — unset means the probe is DISABLED and skipped (its default).
+    // The probe is the port's own runtime check that single-pass multiview actually
+    // works; enabling it makes the port run+confirm the path our ANGLE Metal backend
+    // now supports, instead of leaving it unexercised (hl2 draws black with the
+    // multiview shader variant never generated). Gated to that engine; override the
+    // value (e.g. "true", or "0" to force-disable) with KL_HL2_MV_PROBE.
+    if (strcmp(n, "debug.hl2q3vr.internal_multiview_probe") == 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        // Trace EVERY read, before the target gate, to tell "never read" from
+        // "read too early" (before the target is set, when the gate below returns
+        // NULL and the probe reads disabled). The probe (libsourcevr 0x139c0) is
+        // what enables single-pass multiview; if the guest never reads this, its
+        // render-loop call site is not reached (loading is stuck on the very
+        // multiview shaders the probe would enable — a circular dependency).
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [sysprop] guest read %s (target=%s)\n",
+                    n, t ? t : "(unset — too early)");
+        if (t && (strcmp(t, "hl2") == 0 || strcmp(t, "portal") == 0)) {
+            const char *ov = getenv("KL_HL2_MV_PROBE");
+            return ov && *ov ? ov : "1";
+        }
+    }
+    // Klepton: two-pass companion to the synthesized autoexec.cfg. With the engine
+    // rendering two-pass per-eye (single_pass cvars 0) and the force-multiview patch
+    // disabled, the port's OUTPUT path must be per-eye too. "Direct OpenXR
+    // array-swapchain rendering" is the MULTIVIEW output — it renders the scene into a
+    // 2-layer ARRAY texture that the eye-copy reads; in two-pass that array is never
+    // filled, so the eye-copy finds nothing ("Eye copy skipped: Source render target
+    // is unavailable") and the XR frame loop never presents. libsourcevr (0x10f08)
+    // reads this property FIRST (the internal default only applies when it's unset):
+    // "1"/"true"/"on" = array (multiview) enabled, anything else = "disabled by
+    // property" -> separate per-eye swapchains, which is what two-pass needs. Force
+    // "0" for hl2 two-pass; KL_HL2_MULTIVIEW (Strategy A) leaves the port's default in
+    // place. Override with KL_HL2_ARRAY_SWAPCHAIN.
+    if (strcmp(n, "debug.hl2q3vr.array_swapchain") == 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        const char *ov = getenv("KL_HL2_ARRAY_SWAPCHAIN");
+        if (ov && *ov) return ov;
+        if (t && strcmp(t, "hl2") == 0 && !kl_env_on("KL_HL2_MULTIVIEW", 0))
+            return "0";
     }
     for (size_t i = 0; i < sizeof g_sysprops / sizeof *g_sysprops; i++)
         if (strcmp(n, g_sysprops[i].prop) == 0)
@@ -215,6 +319,14 @@ const void *klb_sysprop_find(const char *n) {
     // string) and must still be findable, or the two-step form answers "no such
     // property" for one this one-step form serves.
     if (strcmp(n, "ro.build.version.sdk") == 0) return "ro.build.version.sdk";
+    // net.dns1..4 need stable name pointers just like the table entries.
+    {
+        static const char *const dns_names[] =
+            { "net.dns1", "net.dns2", "net.dns3", "net.dns4" };
+        for (int i = 0; i < 4; i++)
+            if (strcmp(n, dns_names[i]) == 0 && sysprop_value(n))
+                return dns_names[i];
+    }
     for (size_t i = 0; i < sizeof g_sysprops / sizeof *g_sysprops; i++)
         if (strcmp(n, g_sysprops[i].prop) == 0 && sysprop_value(n))
             return g_sysprops[i].prop;
@@ -295,19 +407,286 @@ static void stat_to_bionic(const struct stat *d, bionic_stat *b) {
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
 static void kl_fs_trace(const char *op, const char *path, const char *extra, int failed);
 
+// hl2 (HL2Q3VR): the engine exec's autoexec.cfg at startup, but that file isn't
+// staged, so we serve it synthetically (see klb_fopen). The engine's `exec`
+// enforces a 1 MB cap by STAT'ing the file FIRST — so stat must report the
+// synthesized size too, or the stat misses, the cap check reads a garbage size,
+// and the engine refuses to exec it ("file size larger than 1 MB!") and never
+// opens it. The two-pass VR cvars then never apply and the world renders
+// single-pass MULTIVIEW (black / "render target unavailable"). fopen and stat
+// share this one source of truth so their size and content cannot drift.
+// Returns the cfg body (sets *len) for an hl2 ".../cfg/autoexec.cfg" path, else NULL.
+static const char *kl_hl2_autoexec_cfg(const char *path, size_t *len) {
+    // Default (two-pass) path: force per-eye rendering via the port's single_pass cvars.
+    static const char cfg_twopass[] =
+        "hl2quest_vr_single_pass_opaque 0\n"
+        "hl2quest_vr_single_pass_brush_models 0\n"
+        "hl2quest_vr_single_pass_opaque_entities 0\n"
+        "hl2quest_vr_single_pass_static_props 0\n";
+    // KL_HL2_RTFIX experiment: the engine's render-target ALLOCATION bracket never runs at
+    // boot under Klepton (no _rt_menu/_rt_gui, VR CreateRenderTargets 0xec64 never called ->
+    // "Eye copy skipped: Source render target is unavailable" -> black; see
+    // hl2-quest-reference-trace). mat_debugalttab simulates a device lost->restore, which
+    // re-runs BeginRenderTargetAllocation -> InitClientRenderTargets -> CreateRenderTargets.
+    // It must fire AFTER VR is active, so `wait` defers it ~1200 engine frames; the echo is
+    // the probe that it fired. Bound to "o" too, in case `wait` is stripped / frames stall,
+    // so it can be retried manually. In multiview mode we serve rtfix ALONE (keep the port's
+    // single-pass path); in two-pass mode we serve the single_pass cvars + rtfix.
+    // autoexec.cfg is exec'd right AFTER "VR activated" (confirmed in the log), so no defer
+    // is needed. mat_debugalttab is a CHEAT cvar and bare it only queries — so the auto-fire
+    // uses mat_setvideomode (a real device reset -> RT re-allocation, no cheats). Manual
+    // binds retry either path (o = setvideomode, p = sv_cheats+debugalttab toggle) since VR
+    // has no console. Echo tags mark which fired.
+    // A device Reset (mat_setvideomode) fired but did NOT re-allocate RTs — a reset only
+    // RESTORES already-registered RTs, and the one-time init bracket (InitClientRenderTargets)
+    // that REGISTERS them never ran. So try the two commands that might re-run the full
+    // material+RT setup: mat_reloadallmaterials and the (now cheat-enabled) mat_debugalttab
+    // lost->restore toggle. Underscore echo tags grep cleanly. Binds o/p retry each manually.
+    // Diagnostic: mat_debugalttab { 1->ShutdownWellKnownRenderTargets, 0->InitWellKnownRenderTargets }
+    // is the exact allocate we need, but a back-to-back 1;0 produced NO callback — either
+    // cheat-blocked (FCVAR_CHEAT) or the toggle collapsed in one command buffer. This splits
+    // them with `wait 90` and marks each set, so the log says which: ShutdownWellKnownRenderTargets
+    // after set1 => cheats OK + mechanism fires; InitWellKnownRenderTargets after set0 => RTs made.
+    // mat_debugalttab is FCVAR_CHEAT and sv_cheats doesn't lift it from a cfg (confirmed:
+    // sv_cheats read "1" yet mat_debugalttab stayed "0"). mat_reset_rendertargets is the
+    // dedicated command ("Resets all the render targets") that Shutdown+Init the well-known
+    // RTs directly — try it (hopefully not cheat-gated). Bare `mat_reset_rendertargets` after
+    // shows its flags if it IS blocked. developer 1 so any WellKnownRenderTargets DevMsg shows.
+    static const char cfg_rtfix_mv[] =
+        "developer 1\n"
+        "echo KL_RTFIX_before\n"
+        "mat_reset_rendertargets\n"
+        "echo KL_RTFIX_after\n";
+    static const char cfg_rtfix_tp[] =
+        "hl2quest_vr_single_pass_opaque 0\n"
+        "hl2quest_vr_single_pass_brush_models 0\n"
+        "hl2quest_vr_single_pass_opaque_entities 0\n"
+        "hl2quest_vr_single_pass_static_props 0\n"
+        "developer 1\n"
+        "echo KL_RTFIX_before\n"
+        "mat_reset_rendertargets\n"
+        "echo KL_RTFIX_after\n";
+    const char *suf = "/cfg/autoexec.cfg";
+    size_t n = strlen(path), sl = strlen(suf);
+    if (n <= sl || strcmp(path + n - sl, suf) != 0) return NULL;
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    if (!t || strcmp(t, "hl2") != 0) return NULL;
+    int mv = kl_env_on("KL_HL2_MULTIVIEW", 0);
+    int rtfix = kl_env_on("KL_HL2_RTFIX", 0);
+    // NOTE: hl2 render-cvar overrides (KL_HL2_VISFIX, KL_HL2_TWOPASS_BRUSH,
+    // KL_HL2_MAT_QUEUE) are applied in kl_hl2_launcher_graphics_cfg, NOT here —
+    // hl2quest_launcher_graphics.cfg execs AFTER autoexec.cfg (confirmed in the
+    // log: autoexec ~23k, launcher ~36k), so anything set here is clobbered by it.
+    const char *body;
+    if (rtfix)     body = mv ? cfg_rtfix_mv : cfg_rtfix_tp;
+    else if (mv)   return NULL;   // multiview, no rtfix: port's own attempt
+    else           body = cfg_twopass;
+    if (len) *len = strlen(body);
+    return body;
+}
+
+#include "kl_hl2_launcher_cfg.h"
+// Flip the single value digit right after `key` (key must include its trailing
+// space) in a mutable cfg body, in place — same length so fopen and stat agree.
+static void kl_cfg_flip_digit(char *body, const char *key, char v) {
+    char *p = strstr(body, key);
+    if (p) p[strlen(key)] = v;
+}
+// The real launcher graphics cfg (single-pass MULTIVIEW config, matches Quest). The Android
+// launcher writes it and libclient exec's it at startup; Klepton never staged it, so it read
+// "not present; not executing" and the cvars that flip the mod's HL2Q3 MatQueue queued
+// rendering ON (mat_queue_mode 2 + single-pass) never applied -> ideal=0/allow=0 ->
+// CreateRenderTargets never called -> no eye RTs -> "Eye copy skipped" -> black. Serving it
+// enables queued rendering -> RT creation. Gated to KL_HL2_MULTIVIEW=1 so it can't fight the
+// two-pass autoexec above (single_pass 0). See hl2-quest-reference-trace + kl_hl2_launcher_cfg.h.
+static const char *kl_hl2_launcher_graphics_cfg(const char *path, size_t *len) {
+    const char *suf = "/cfg/hl2quest_launcher_graphics.cfg";
+    size_t n = strlen(path), sl = strlen(suf);
+    if (n <= sl || strcmp(path + n - sl, suf) != 0) return NULL;
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    if (!t || strcmp(t, "hl2") != 0 || !kl_env_on("KL_HL2_MULTIVIEW", 0)) return NULL;
+    // KL_HL2_MAT_QUEUE overrides the cfg's `mat_queue_mode 2`. Threaded queued
+    // rendering (2) bounces the GL context between the render and material threads,
+    // so the eye-mirror GL work in xrEndFrame runs with NO current context during
+    // gameplay (probe reads status=0x0) and the compositor's eye textures never
+    // update past the menu -> frozen gameplay. "0" forces single-threaded so the
+    // context stays on the render thread through submission. One digit, same length,
+    // so fopen and stat still agree on the size.
+    // This cfg execs LAST (after autoexec.cfg — confirmed in the log), so it is the
+    // right place to apply hl2-render overrides: anything set here wins. All flips
+    // below are single-digit, same length, so fopen and stat still agree on size.
+    const char *mq = getenv("KL_HL2_MAT_QUEUE");
+    int visfix    = kl_env_on("KL_HL2_VISFIX", 0);
+    int twobrush  = kl_env_on("KL_HL2_TWOPASS_BRUSH", 0);
+    int twoopaque = kl_env_on("KL_HL2_TWOPASS_OPAQUE", 0);
+    int svcheats  = kl_env_on("KL_HL2_SV_CHEATS", 0);
+    int lowmem    = kl_env_on("KL_HL2_LOWMEM", 0);
+    // KL_HL2_THREADED_RENDER (default OFF): opt-in threaded material queue. When
+    // set, the mod's queued rendering is left engaged — mat_queue_mode stays at the
+    // cfg's 2 (this flag WINS over the baked KL_HL2_MAT_QUEUE=0, which otherwise
+    // forces single-threaded), and r_threaded_renderables stays at the cfg's 1
+    // (this flag WINS over VISFIX's flip to 0). union_world_lists 1 and
+    // render_diagnostics 1 from VISFIX are kept unchanged. The historical reason
+    // VISFIX forced r_threaded_renderables 0 was that the material system was
+    // single-threaded (mat_queue_mode 0) — a threaded renderable-list build against
+    // a single-threaded matsys dropped entities. With mat_queue_mode 2 the matsys
+    // is threaded again, so r_threaded_renderables 1 is the matching Quest setting.
+    // The context-ownership blocker (the queued render thread bouncing the guest's
+    // GL context onto a thread the compositor/mirror can't reach) is now handled by
+    // the migration machinery in kl_glfb_make_current + the hl2 sticky context in
+    // kl_egl.c, both already live for the eye-mirror and cutscene. See
+    // hl2-quest-reference-trace.
+    int threaded  = kl_env_on("KL_HL2_THREADED_RENDER", 0);
+    if (len) *len = sizeof kl_hl2_launcher_graphics_cfg_body - 1;
+    if ((mq && *mq) || visfix || twobrush || twoopaque || svcheats || threaded || lowmem) {
+        static char body[sizeof kl_hl2_launcher_graphics_cfg_body];
+        static int built;
+        if (!built) {
+            built = 1;
+            memcpy(body, kl_hl2_launcher_graphics_cfg_body, sizeof body);
+            if (threaded) {
+                // Threaded rendering opt-in: keep mat_queue_mode at the cfg's 2 so
+                // the mod's queued matsys engages. Do NOT apply the KL_HL2_MAT_QUEUE
+                // override even when it is set (its baked default is 0) — the
+                // threaded flag deliberately wins for mat_queue_mode.
+                fprintf(stderr, "  [hl2cfg] THREADED_RENDER: mat_queue_mode kept at 2"
+                                "%s\n", (mq && *mq && mq[0] != '2')
+                                        ? " (KL_HL2_MAT_QUEUE override ignored)" : "");
+            } else if (mq && *mq) {
+                char *p = strstr(body, "mat_queue_mode ");
+                if (p) {
+                    p[sizeof "mat_queue_mode " - 1] = mq[0];
+                    fprintf(stderr, "  [hl2cfg] mat_queue_mode overridden to %c "
+                                    "(KL_HL2_MAT_QUEUE)\n", mq[0]);
+                }
+            }
+            if (visfix) {
+                // Dynamic entities / translucent effects are SEE-THROUGH and render
+                // only when they reach certain MAP positions (not gaze/movement) —
+                // the render/visibility list is missing them. The Quest reference
+                // cfg is tuned for Quest's mat_queue_mode 2 + NATIVE multiview; we
+                // force mat_queue_mode 0 and run EMULATED (ANGLE-Metal) multiview, so
+                // two of its cvars are wrong for us: r_threaded_renderables 1 builds
+                // the renderable list on threads while our material system is single-
+                // threaded (-> dropped entities), and union_world_lists 0 leans on
+                // native multiview culling both eyes from one list (emulated, the
+                // single-eye list under-covers -> position-gated pop-in). Force both.
+                // Under KL_HL2_THREADED_RENDER the matsys is threaded (mat_queue_mode
+                // 2), so r_threaded_renderables stays at the cfg's 1 (the matching
+                // Quest setting) instead of being flipped to 0. union_world_lists 1
+                // and render_diagnostics 1 are kept either way.
+                if (!threaded)
+                    kl_cfg_flip_digit(body, "r_threaded_renderables ", '0');
+                kl_cfg_flip_digit(body, "hl2quest_vr_union_world_lists ", '1');
+                kl_cfg_flip_digit(body, "hl2quest_vr_render_diagnostics ", '1');
+                fprintf(stderr, "  [hl2cfg] VISFIX: r_threaded_renderables %c, "
+                                "union_world_lists 1, render_diagnostics 1\n",
+                        threaded ? '1' : '0');
+            }
+            if (twobrush) {
+                kl_cfg_flip_digit(body, "hl2quest_vr_single_pass_brush_models ", '0');
+                fprintf(stderr, "  [hl2cfg] TWOPASS_BRUSH: single_pass_brush_models 0\n");
+            }
+            if (svcheats) {
+                // Flip the sv_cheats gate to 1 so the FCVAR_CHEAT cvars later in the
+                // cfg apply: hl2quest_vr_multiview_color_resolve / _depth_resolve (the
+                // step that composites the forced two-pass per-eye render into the
+                // OpenXR array swapchain — without it the array keeps a STALE frame,
+                // i.e. the frozen menu image in gameplay) AND fog_startskybox /
+                // fog_endskybox (skybox). Single-player (maxplayers 1), so cheats are
+                // harmless. Keeps parity with what Quest's own single-pass path avoids.
+                kl_cfg_flip_digit(body, "sv_cheats ", '1');
+                fprintf(stderr, "  [hl2cfg] SV_CHEATS: sv_cheats 1 "
+                                "(unblocks multiview_color/depth_resolve + fog skybox)\n");
+            }
+            if (twoopaque) {
+                // The last render category still on the single-pass MULTIVIEW path:
+                // the main opaque world/brush pass. TWOPASS_BRUSH (brush models) +
+                // static_props/opaque_entities (already two-pass in the Quest cfg)
+                // recovered the train seats, NPCs, suitcases — but the train FLOOR
+                // and WALL faces and some station walls stayed invisible (decals fall
+                // through to the seats, litter floats). Those faces render in the
+                // opaque pass; forcing it two-pass (per-eye, no multiview instancing)
+                // routes them around the ANGLE-Metal multiview emulation like the rest.
+                // The trailing space in the key avoids matching *_opaque_entities.
+                kl_cfg_flip_digit(body, "hl2quest_vr_single_pass_opaque ", '0');
+                fprintf(stderr, "  [hl2cfg] TWOPASS_OPAQUE: single_pass_opaque 0\n");
+            }
+            if (lowmem) {
+                // Memory-pressure lever: long in-game sessions get signal-9 jettisoned
+                // by the OS (healthy cadence right up to the kill). mat_picmip 2 drops
+                // texture resolution one more mip (quarter the texels of picmip 1) for
+                // a large cut in texture memory; mat_reducefillrate 1 trims the fill.
+                // Opt-in (KL_HL2_LOWMEM) — it is a visible-quality tradeoff.
+                kl_cfg_flip_digit(body, "mat_picmip ", '2');
+                kl_cfg_flip_digit(body, "mat_reducefillrate ", '1');
+                fprintf(stderr, "  [hl2cfg] LOWMEM: mat_picmip 2, mat_reducefillrate 1\n");
+            }
+        }
+        return body;
+    }
+    return kl_hl2_launcher_graphics_cfg_body;
+}
+
 // stat/lstat are traced like open: File.Exists() in managed code is a stat,
 // never an open, so an untraced stat makes a probe for a missing file look
 // like the guest never asked at all. That blind spot read as "the game never
 // checks for settings.cfg" once — it does, it just never opens it.
 int klb_stat(const char *p, bionic_stat *b)  { char kp[1024]; const char *q = kl_guest_path(p, kp, sizeof kp);
                                                struct stat s; int r = stat(q, &s);
+                                               long long osz;
+                                               if (r != 0 && errno == ENOENT && kl_obbmap_stat(q, &osz)) {
+                                                   // Virtual OBB entry: synthesize a plain-file stat of the
+                                                   // right size, so UE4 sizes its pak read from it.
+                                                   memset(&s, 0, sizeof s); s.st_mode = S_IFREG | 0444;
+                                                   s.st_size = (off_t)osz; r = 0;
+                                               }
+                                               if (r != 0 && errno == ENOENT && kl_obbmap_icu_dir(q)) {
+                                                   // The ICU data directory lives inside a mounted pak; a
+                                                   // directory stat is the one query the pak index cannot
+                                                   // answer (kl_obbmap_icu_dir).
+                                                   memset(&s, 0, sizeof s); s.st_mode = S_IFDIR | 0755;
+                                                   r = 0;
+                                               }
+                                               if (r != 0 && errno == ENOENT && kl_can_dlopen(q)) {
+                                                   // A guest shared library with no file on disk: only its
+                                                   // translated framework is in the bundle (the ELF tree is
+                                                   // deliberately absent). An existence check on the guest's
+                                                   // behalf must answer what dlopen would — the Source
+                                                   // launcher stat()s "<libdir>/filesystem_stdio.so" BEFORE
+                                                   // dlopen'ing it, so a stat miss reads as "module not
+                                                   // found" even though the load would succeed.
+                                                   memset(&s, 0, sizeof s); s.st_mode = S_IFREG | 0555;
+                                                   s.st_size = 1; r = 0;
+                                               }
+                                               if (r != 0 && errno == ENOENT) {
+                                                   // hl2 synthesized autoexec.cfg / hl2quest_launcher_graphics.cfg:
+                                                   // report the real size so the engine's exec 1 MB cap check (a
+                                                   // stat) passes and it opens the file klb_fopen serves. See
+                                                   // kl_hl2_autoexec_cfg / kl_hl2_launcher_graphics_cfg.
+                                                   size_t clen;
+                                                   if (kl_hl2_autoexec_cfg(p, &clen) ||
+                                                       kl_hl2_launcher_graphics_cfg(p, &clen)) {
+                                                       memset(&s, 0, sizeof s);
+                                                       s.st_mode = S_IFREG | 0444;
+                                                       s.st_size = (off_t)clen; r = 0;
+                                                   }
+                                               }
                                                kl_fs_trace("stat", p, NULL, r != 0);
                                                if (!r) stat_to_bionic(&s, b); return r; }
 int klb_lstat(const char *p, bionic_stat *b) { char kp[1024]; const char *q = kl_guest_path(p, kp, sizeof kp);
                                                struct stat s; int r = lstat(q, &s);
                                                kl_fs_trace("lstat", p, NULL, r != 0);
                                                if (!r) stat_to_bionic(&s, b); return r; }
-int klb_fstat(int fd, bionic_stat *b)        { struct stat s; int r = fstat(fd, &s);
+int klb_fstat(int fd, bionic_stat *b)        { long long osz; int handled;
+                                               if (kl_obbmap_fstat_size(fd, &osz, &handled), handled) {
+                                                   struct stat s; memset(&s, 0, sizeof s);
+                                                   s.st_mode = S_IFREG | 0444; s.st_size = (off_t)osz;
+                                                   stat_to_bionic(&s, b); return 0;
+                                               }
+                                               struct stat s; int r = fstat(fd, &s);
                                                if (!r) stat_to_bionic(&s, b); return r; }
 // ---------- statfs ----------
 // bionic/LP64's struct statfs is 120 bytes of uint64_t; Darwin's is a different
@@ -384,6 +763,15 @@ ssize_t klb_getrandom(void *buf, size_t len, unsigned int flags) {
 // bionic's is the C89 double form — the guest's call site has already narrowed
 // to double, so this is not the generic macro's job.
 int klb_isnan(double x) { return __builtin_isnan(x); }
+// bionic also exports the classic double-underscore classification helpers as real
+// symbols (Darwin makes them macros, so there is nothing to forward). Source/togl's
+// math paths import __isnanf when loading a map — hl2 aborts on "unresolved import
+// '__isnanf'" starting a new game without these.
+int klb_isnanf(float x)     { return __builtin_isnan(x); }
+int klb_isinf(double x)     { return __builtin_isinf(x); }
+int klb_isinff(float x)     { return __builtin_isinf(x); }
+int klb_isfinite(double x)  { return __builtin_isfinite(x); }
+int klb_isfinitef(float x)  { return __builtin_isfinite(x); }
 
 // ---------- sysconf ----------
 // Same names, different numbers, and it fails quietly: bionic's _SC_* numbers
@@ -455,6 +843,41 @@ long klb_sysconf(int guest_name) {
                 fprintf(stderr, "  [libc] sysconf(%s) -> %ld\n", g_sysconf[i].name, v);
             return v;
         }
+    // Cache geometry: bionic _SC_LEVEL{1..4}_{I,D,}CACHE_{SIZE,ASSOC,LINESIZE}
+    // occupy 0x8c..0x9a and have no Darwin _SC_ that answers on Apple silicon, so
+    // they used to fall through to -1. A -1 LINESIZE is NOT a harmless "unknown":
+    // a caller that aligns or sizes a buffer to the cache line (dynarmic, which
+    // a JIT guest embeds, reads the line size at startup) turns -1 into a ~SIZE_MAX
+    // allocation and the process is jetsam-killed — signal 9, no crash report,
+    // which is exactly where one such guest died (its last log line was this name, 0x94 =
+    // _SC_LEVEL2_CACHE_LINESIZE). Answer line sizes from hw.cachelinesize and cache
+    // sizes from the hw.* counterparts, and give associativity a plausible non-zero
+    // so nothing downstream divides by zero either.
+    switch (guest_name) {
+    case 0x8e: case 0x91: case 0x94: case 0x97: case 0x9a: {   // *_CACHE_LINESIZE
+        long v = 0; size_t s = sizeof v;
+        if (sysctlbyname("hw.cachelinesize", &v, &s, NULL, 0) != 0 || v <= 0) v = 128;
+        return v;
+    }
+    case 0x8c: case 0x8f: {                                    // L1 I / D CACHE_SIZE
+        long v = 0; size_t s = sizeof v;
+        const char *k = guest_name == 0x8c ? "hw.l1icachesize" : "hw.l1dcachesize";
+        if (sysctlbyname(k, &v, &s, NULL, 0) != 0 || v <= 0) v = 64 * 1024;
+        return v;
+    }
+    case 0x92: {                                               // _SC_LEVEL2_CACHE_SIZE
+        long v = 0; size_t s = sizeof v;
+        if (sysctlbyname("hw.l2cachesize", &v, &s, NULL, 0) != 0 || v <= 0) v = 4 * 1024 * 1024;
+        return v;
+    }
+    case 0x95: case 0x98: {                                    // L3 / L4 CACHE_SIZE
+        long v = 0; size_t s = sizeof v;
+        if (sysctlbyname("hw.l3cachesize", &v, &s, NULL, 0) != 0 || v <= 0) v = 0;
+        return v;                                              // 0 = "no such cache", a valid answer
+    }
+    case 0x8d: case 0x90: case 0x93: case 0x96: case 0x99:     // *_CACHE_ASSOC
+        return 8;                                             // plausible, never a divisor of 0
+    }
     // bionic's _SC_AVPHYS_PAGES (0x63) has no Darwin equivalent and lands here.
     // -1 is sysconf's own "no such name", which is the truthful answer; the log
     // line is what keeps it from being a silent zero.
@@ -505,6 +928,19 @@ static void proc_put(const char *rel, const char *text) {
 //
 // KL_MEM_TOTAL_MB overrides it; it is capped at the host's real memory so a
 // small machine is never told it has more.
+// os_proc_available_memory(): the bytes this process may still allocate before
+// jetsam kills it — the REAL per-app limit, which on visionOS is far below
+// hw.memsize and below the KL_MEM_TOTAL budget. Weak so a platform without it
+// links to NULL and we fall back to the budget math. Returns 0 when unknown.
+extern size_t os_proc_available_memory(void) __attribute__((weak_import));
+static uint64_t kl_proc_available(void) {
+    if (&os_proc_available_memory) {
+        size_t a = os_proc_available_memory();
+        return (uint64_t)a;
+    }
+    return 0;
+}
+
 static uint64_t kl_mem_total(void) {
     static uint64_t total;
     if (total) return total;
@@ -528,7 +964,9 @@ static uint64_t kl_mem_total(void) {
 // way, so the two modes agree at the end and diverge at the top.
 static _Atomic uint64_t g_mem_peak;
 
+static void kl_mem_log_maybe_start(void);
 static uint64_t kl_mem_footprint(void) {
+    kl_mem_log_maybe_start();
     task_vm_info_data_t    ti;
     mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&ti, &cnt) != KERN_SUCCESS)
@@ -536,6 +974,34 @@ static uint64_t kl_mem_footprint(void) {
     uint64_t now = (uint64_t)ti.phys_footprint, peak = atomic_load(&g_mem_peak);
     while (now > peak && !atomic_compare_exchange_weak(&g_mem_peak, &peak, now)) { }
     return now;
+}
+
+// KL_MEM_LOG=1: a footprint heartbeat, for the kill that leaves no note. A
+// jetsam SIGKILL produces no app-named .ips (it files a JetsamEvent-*), so a run
+// that just says "signal 9" is ambiguous between memory and the watchdog. Two
+// seconds of cadence is enough to see the shape: a climb to the budget then
+// silence is jetsam; a flat line then silence is not. Started lazily from the
+// first footprint query so no init-order plumbing is needed.
+static void *kl_mem_log_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        task_vm_info_data_t    ti;
+        mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&ti, &cnt) == KERN_SUCCESS)
+            fprintf(stderr, "  [mem] footprint %llu MiB (peak %llu)\n",
+                    (unsigned long long)(ti.phys_footprint >> 20),
+                    (unsigned long long)(atomic_load(&g_mem_peak) >> 20));
+        usleep(2000000);
+    }
+    return NULL;
+}
+static void kl_mem_log_maybe_start(void) {
+    static _Atomic int started;
+    if (atomic_exchange(&started, 1)) return;
+    if (!kl_env_on("KL_MEM_LOG", 0)) return;
+    pthread_t t;
+    pthread_create(&t, NULL, kl_mem_log_thread, NULL);
+    pthread_detach(t);
 }
 
 static uint64_t proc_free_bytes(void) {
@@ -657,6 +1123,25 @@ void kl_mem_pressure_poll(void) {
     int at = kl_env_int("KL_LOWMEM_AT", 80);
     if (at <= 0) return;
     int clear = kl_env_int("KL_LOWMEM_CLEAR", 70);
+
+    // The real limit first: os_proc_available_memory() is the headroom before
+    // jetsam, and on visionOS the app is killed at a phys_footprint well under
+    // the KL_MEM_TOTAL budget — so the percentage test below (fraction of a
+    // 6 GB budget) never trips and the guest is never told to shed. Fire when
+    // the OS says fewer than KL_LOWMEM_FREE_MB (default 384) bytes remain, so
+    // Unity runs UnloadUnusedAssets before the kill rather than after it.
+    uint64_t avail = kl_proc_available();
+    if (avail) {
+        uint64_t floor = (uint64_t)kl_env_int("KL_LOWMEM_FREE_MB", 384) << 20;
+        uint64_t clearf = floor + (floor >> 1);          // re-arm at 1.5x the floor
+        if (avail <= floor) {
+            if (atomic_exchange(&g_lowmem_armed, 0)) kl_mem_pressure_fire("headroom");
+        } else if (avail >= clearf) {
+            atomic_store(&g_lowmem_armed, 1);
+        }
+        return;
+    }
+
     uint64_t total = kl_mem_total(), used = kl_mem_footprint();
     if (!total || !used) return;
     int pct = (int)((used * 100) / total);
@@ -698,7 +1183,10 @@ void kl_mem_report(void) {
 }
 
 uint64_t kl_mem_budget_bytes(void)    { return kl_mem_total(); }
-uint64_t kl_mem_available_bytes(void) { return proc_free_bytes(); }
+uint64_t kl_mem_available_bytes(void) {
+    uint64_t a = kl_proc_available();      // real jetsam headroom when available
+    return a ? a : proc_free_bytes();
+}
 
 // meminfo, statm and status are rebuilt on every read. They were written once
 // at startup, so anything polling "how much room is left" got a constant and
@@ -797,13 +1285,41 @@ static void proc_build(void) {
     // machine rather than a big.LITTLE one. Apple silicon does have P and E
     // cores, but nothing here can tell them apart from userspace, so no split
     // is declared rather than an invented one.
-    for (long i = 0; i < ncpu; i++) {
+    // The whole cpufreq quartet, not just cpuinfo_max_freq. A guest that reads
+    // cpuinfo_MIN_freq per core (Wrath2 does, to build a frequency range / detect
+    // throttling) and finds it missing spins re-reading it forever — the
+    // "compiling shaders" screen never advances because the load thread is stuck
+    // polling /sys. Present a plausible SDM865-like range (300 MHz min, 2.84 GHz
+    // max, running at max) uniformly, with scaling_* alongside cpuinfo_* because
+    // guests read either.
+    //
+    // Served across a FIXED MAX, not just the online-core count: Wrath2 iterates
+    // cpu0..cpu15 regardless of what /possible reports (a compiled-in MAX_CPUS,
+    // not a read of the count), so serving only cpu0..cpu9 left cpu10..15 missing
+    // and it looped on those instead. cpufreq nodes exist for every POSSIBLE core
+    // on real hardware anyway, so a slot per possible core is faithful; the online
+    // count that sizes thread pools stays `ncpu` via /possible + /proc/cpuinfo.
+    long nfreq = ncpu < 16 ? 16 : ncpu;
+    for (long i = 0; i < nfreq; i++) {
         char rel[256];
         snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", i);
+        proc_put(rel, "2840000\n");
+        snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_min_freq", i);
+        proc_put(rel, "300000\n");
+        snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpufreq/scaling_max_freq", i);
+        proc_put(rel, "2840000\n");
+        snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpufreq/scaling_min_freq", i);
+        proc_put(rel, "300000\n");
+        snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpufreq/scaling_cur_freq", i);
         proc_put(rel, "2840000\n");
         snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpu_capacity", i);
         proc_put(rel, "1024\n");
     }
+    // Some guests size their core loop from kernel_max (highest possible CPU
+    // index) rather than from /possible. Pin it to the last slot we serve so the
+    // loop's upper bound and the nodes that exist agree.
+    snprintf(buf, sizeof buf, "%ld\n", nfreq - 1);
+    proc_put("/sys/devices/system/cpu/kernel_max", buf);
     fprintf(stderr, "[proc] synthetic /proc and /sys at %s (%ld cpus, %llu MB budget)\n",
             g_procroot, ncpu, (unsigned long long)(kl_mem_total() >> 20));
 }
@@ -858,8 +1374,108 @@ void kl_guest_extstorage_map(const char *dir) {
 // picking any of them means the same place and has to land in the same place.
 static const char *const g_ext_prefix[] = { "/sdcard", "/storage/emulated/0", "/mnt/sdcard" };
 
-const char *kl_guest_path(const char *path, char *buf, size_t cap) {
-    if (!path || path[0] != '/') return path;
+// Resolve `path` case-insensitively in place, over the REAL tree, starting after
+// `prefix` bytes (a known-correct-case container prefix — g_ext_target). iOS
+// APFS is CASE-SENSITIVE, but Android games (ext4 heritage) freely mix case:
+// GTA Vice City chdir's "DATA/" and opens "TEXT/AMERICAN.GXT" while the on-disk
+// tree is "data"/"TEXT". The game's own casepath() exists to bridge that, but it
+// walks from "/" and cannot see through our virtual /sdcard, so it fails and the
+// unresolved uppercase path reaches chdir/fopen. We do the walk here instead. For
+// each component past the prefix that has no exact match, substitute the on-disk
+// entry that matches case-insensitively; stop at the first with no match, leaving
+// the tail verbatim so creating a new file/dir still works. Case-insensitive
+// matches are the same length, so the result never grows past the input.
+static void kl_casefix(char *path, size_t prefix) {
+    struct stat st;
+    if (stat(path, &st) == 0) return;              // exact spelling already exists
+    char out[1024];
+    if (prefix >= sizeof out) return;
+    memcpy(out, path, prefix); out[prefix] = '\0';
+    while (prefix > 1 && out[prefix - 1] == '/') out[--prefix] = '\0';
+    const char *p = path + prefix;
+    for (;;) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *slash = strchr(p, '/');
+        size_t clen = slash ? (size_t)(slash - p) : strlen(p);
+        char comp[512];
+        if (clen >= sizeof comp) clen = sizeof comp - 1;
+        memcpy(comp, p, clen); comp[clen] = '\0';
+        char cand[1024];
+        snprintf(cand, sizeof cand, "%s/%s", out, comp);
+        if (stat(cand, &st) == 0) {
+            snprintf(out, sizeof out, "%s", cand);
+        } else {
+            DIR *d = opendir(out[0] ? out : "/");
+            int found = 0;
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d))) {
+                    if (strcasecmp(e->d_name, comp) == 0) {
+                        snprintf(out + strlen(out), sizeof out - strlen(out), "/%s", e->d_name);
+                        found = 1; break;
+                    }
+                }
+                closedir(d);
+            }
+            if (!found) {   // no match here: keep this component and the rest as-is
+                snprintf(out + strlen(out), sizeof out - strlen(out), "/%s", p);
+                break;
+            }
+        }
+        p += clen;
+    }
+    size_t n = strlen(out);
+    memcpy(path, out, n + 1);
+}
+
+static const char *kl_guest_path_inner(const char *path, char *buf, size_t cap) {
+    if (!path) return path;
+    // Windows-heritage guests (reVC / GTA Vice City) build paths with '\'
+    // separators — "gamedata\TEXT\american.gxt". The POSIX host never opens
+    // those, so every asset load fails and the game reads garbage lengths into
+    // fixed buffers (a __strncpy_chk abort). Normalize '\' -> '/' first, into a
+    // stack copy, and operate on that. `tmp` is stack-local, so any passthrough
+    // return of the normalized string must be copied into the caller's `buf`
+    // (KL_GP_PASS); remaps snprintf into `buf` and read from `tmp` — no overlap.
+    char tmp[1024];
+    if (strchr(path, '\\')) {
+        size_t i = 0;
+        for (; path[i] && i + 1 < sizeof tmp; i++) tmp[i] = path[i] == '\\' ? '/' : path[i];
+        tmp[i] = '\0';
+        path = tmp;
+    }
+    #define KL_GP_PASS() (path == tmp ? (snprintf(buf, cap, "%s", tmp), (const char *)buf) : path)
+    // hl2 world-model gamedir fallback. The HL2Q3VR *server* loads maps/*.bsp from
+    // "<data>/srceng/maps/" — the game ROOT, with the gamedir dropped — but the
+    // maps are staged (correctly) in the hl2 gamedir "<data>/srceng/hl2/maps/",
+    // which is exactly where the CLIENT's .lmp/.nav/.res loaders look. So the data
+    // is complete; only the server's world-model search path is one segment short,
+    // and background01.bsp is never found -> "BSP box query returned no leaves" ->
+    // black menu. Serve the root path from the gamedir when the root is absent and
+    // the gamedir copy exists — a fallback, never an invented success, no mutation.
+    {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        const char *m;
+        if (t && strcmp(t, "hl2") == 0 && (m = strstr(path, "/srceng/maps/"))) {
+            struct stat st;
+            if (stat(path, &st) != 0) {
+                int pre = (int)(m - path) + 7; /* through "/srceng" */
+                snprintf(buf, cap, "%.*s/hl2%s", pre, path, m + 7);
+                if (stat(buf, &st) == 0) return buf;
+            }
+        }
+    }
+    // NOTE: a former "/Source/portal2" -> "/Source/portal" alias was REMOVED. It
+    // was meant to read the launcher's hardcoded portal2 paths through to the staged
+    // portal folder, but it backfired: the HL2Q3VR launcher's GetSourceGameDirectory
+    // probes access("<root>/portal2/gameinfo.txt") to choose portal-vs-portal2, and
+    // the alias made that probe succeed (via the real portal/gameinfo.txt) — so it
+    // picked "portal2" and force-loaded the Portal 2 map sp_a1_intro2, which is
+    // absent from Portal 1 data -> black. There is no portal2 content; letting the
+    // probe fail makes the launcher honor SOURCE_GAME=portal and load Portal 1.
+    if (path[0] != '/') return KL_GP_PASS();
     size_t alen = strlen(g_apk_prefix);
     if (alen && strncmp(path, g_apk_prefix, alen) == 0 && path[alen] == '/') {
         snprintf(buf, cap, "%s%s", g_apk_target, path + alen);
@@ -867,7 +1483,7 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap) {
         if (stat(buf, &st) == 0) return buf;
         // Not in the unpacked tree: fall through to the raw path, which will
         // fail the same way it always did — no invented successes.
-        return path;
+        return KL_GP_PASS();
     }
     if (g_ext_target[0]) {
         for (size_t i = 0; i < sizeof g_ext_prefix / sizeof *g_ext_prefix; i++) {
@@ -877,14 +1493,17 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap) {
             // /sdcard nor under it.
             if (path[n] != '/' && path[n] != '\0') continue;
             snprintf(buf, cap, "%s%s", g_ext_target, path + n);
+            // iOS is case-sensitive; the guest mixes case (DATA vs data). Rewrite
+            // the suffix to the on-disk spelling, past the known-good target prefix.
+            kl_casefix(buf, strlen(g_ext_target));
             return buf;
         }
     }
     if (strncmp(path, "/proc/", 6) != 0 &&
-        strncmp(path, "/sys/devices/system/cpu", 23) != 0) return path;
+        strncmp(path, "/sys/devices/system/cpu", 23) != 0) return KL_GP_PASS();
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, proc_build);
-    if (!g_procroot[0]) return path;
+    if (!g_procroot[0]) return KL_GP_PASS();
     // The memory files are rebuilt at the moment they are named. Everything
     // else in the tree is static configuration; these three are the only ones
     // whose whole point is that they change, and serving a startup snapshot of
@@ -894,7 +1513,91 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap) {
         strcmp(path, "/proc/self/status") == 0) proc_refresh_mem();
     snprintf(buf, cap, "%s%s", g_procroot, path);
     struct stat st;
-    return stat(buf, &st) == 0 ? buf : path;
+    return stat(buf, &st) == 0 ? buf : KL_GP_PASS();
+    #undef KL_GP_PASS
+}
+
+// Synthesize a missing gameinfo.txt. Xash3D-FWGS won't register a mod (cstrike)
+// without one, and classic CS ships liblist.gam, not gameinfo.txt — so cstrike/
+// has none, the engine silently falls back to the valve base game, and all CS
+// content (scope-arc sprites, maps) becomes invisible (Host_Error at map load).
+// When the guest asks for a "<gamedir>/gameinfo.txt" that is not on disk, write a
+// minimal valid one to a temp file (per gamedir) and redirect the path to it —
+// VFS-style, with zero mutation of the game data. Because the redirect happens in
+// the one path resolver, stat()/open()/fopen()/access() all see the same file.
+// Returns the temp path (in buf) or NULL to leave the resolved path untouched.
+static const char *kl_gameinfo_synth(const char *resolved, char *buf, size_t cap) {
+    if (!resolved) return NULL;
+    const char *base = strrchr(resolved, '/');
+    base = base ? base + 1 : resolved;
+    if (strcmp(base, "gameinfo.txt") != 0) return NULL;
+    // Only cs1 (Xash) needs this: its cstrike mod has no gameinfo.txt on disk and
+    // won't register without one. It must NOT fire for the Source-VR launcher games
+    // (portal/hl2): their launcher probes access("<root>/portal2/gameinfo.txt") to
+    // choose portal vs portal2, and fabricating that missing file makes it pick
+    // portal2 -> "+map sp_a1_intro2" (a Portal 2 map absent from Portal 1 data) ->
+    // map load fails -> black. Those engines ship a real gameinfo.txt where they
+    // actually need one, so a MISSING probe must read as missing. Whitelist cs1.
+    {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (!t || strcmp(t, "cs1") != 0) return NULL;
+    }
+    struct stat st;
+    if (stat(resolved, &st) == 0) return NULL;             // a real one exists — use it
+    // A gamedir that already ships liblist.gam (the classic HL/CS mod manifest —
+    // BOTH valve and cstrike do) is registered by Xash from THAT. Synthesizing a
+    // minimal gameinfo.txt on top SHADOWS it and strips the real config — which
+    // blanked cs1's menu background (valve loaded from the stripped synth instead
+    // of its liblist.gam). Only synthesize when there is no manifest at all.
+    {
+        char lib[1024];
+        size_t pfx = (size_t)(base - resolved);            // "<...>/gamedir/"
+        if (pfx + 12 < sizeof lib) {
+            snprintf(lib, sizeof lib, "%.*sliblist.gam", (int)pfx, resolved);
+            if (stat(lib, &st) == 0) return NULL;
+        }
+    }
+    // gamedir = the directory component just above gameinfo.txt
+    char dir[256];
+    size_t dlen = (size_t)(base - resolved);
+    if (dlen == 0 || dlen >= sizeof dir) return NULL;
+    snprintf(dir, sizeof dir, "%.*s", (int)(dlen - 1), resolved);   // strip trailing '/'
+    const char *gamedir = strrchr(dir, '/');
+    gamedir = gamedir ? gamedir + 1 : dir;
+    if (!*gamedir) return NULL;
+    const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
+    snprintf(buf, cap, "%s/klepton_gameinfo_%s.txt", tmp, gamedir);
+    FILE *f = fopen(buf, "wb");
+    if (!f) return NULL;
+    fprintf(f, "\"GameInfo\"\n{\n\tgame\t\t\"%s\"\n\tgamedir\t\t%s\n", gamedir, gamedir);
+    if (strcmp(gamedir, "valve") != 0) fprintf(f, "\tfallback_dir\t\"valve\"\n");
+    fprintf(f, "\ttype\t\tmultiplayer\n\tnomodels\t0\n\tmax_edicts\t2048\n}\n");
+    fclose(f);
+    fprintf(stderr, "  [fs] synthesized %s/gameinfo.txt -> %s (mod not registered "
+                    "otherwise)\n", gamedir, buf);
+    return buf;
+}
+
+const char *kl_guest_path(const char *path, char *buf, size_t cap) {
+    const char *r = kl_guest_path_inner(path, buf, cap);
+    // A gameinfo.txt the guest names but that isn't staged: serve a synthetic one
+    // so an Xash mod (cstrike) registers instead of falling back to valve. Cheap:
+    // only fires for paths ending in "gameinfo.txt", which is a handful per boot.
+    if (r) {
+        const char *base = strrchr(r, '/');
+        if (base && strcmp(base + 1, "gameinfo.txt") == 0) {
+            char syn[1024];
+            const char *g = kl_gameinfo_synth(r, syn, sizeof syn);
+            if (g) { snprintf(buf, cap, "%s", g); return buf; }
+        }
+    }
+    // (hl1's HL_Gold_HD assets used to be served here by a valve->HD overlay, back
+    // when the engine ran base valve because the mod was nested too deep to mount.
+    // The mod is now promoted to the rootdir at boot — kl_xash_promote_nested_mods
+    // in kl_native.c — so the engine mounts HL_Gold_HD directly with valve as its
+    // basedir fallback, and no per-path overlay is needed.)
+    return r;
 }
 
 #define KL_GUEST_PATH(p) char _kp[1024]; const char *_p = kl_guest_path((p), _kp, sizeof _kp)
@@ -923,8 +1626,104 @@ static void kl_fs_trace(const char *op, const char *path, const char *extra, int
 
 void kl_file_note(void *f, const char *path);
 FILE *klb_fopen(const char *path, const char *mode) {
+    // hl1/cs1: the launcher UI lets the player edit commandline.txt, but the picked
+    // game folder can be read-only. When KL_XASH_COMMANDLINE_FILE points at a writable
+    // in-app copy, serve the engine's own commandline.txt read from there (matched by
+    // basename), so the edited launch args take effect without writing into the folder.
+    if (path && mode && mode[0] == 'r') {
+        const char *clf = getenv("KL_XASH_COMMANDLINE_FILE");
+        if (clf && *clf) {
+            static const char tail[] = "commandline.txt";
+            size_t n = strlen(path), tn = sizeof tail - 1;
+            if (n >= tn && !strcmp(path + n - tn, tail) &&
+                (n == tn || path[n - tn - 1] == '/')) {
+                FILE *cf = fopen(clf, "rb");
+                if (cf) {
+                    static int said;
+                    if (!said++) fprintf(stderr, "  [xash] commandline.txt <- %s\n", clf);
+                    kl_file_note(cf, path);
+                    return cf;
+                }
+            }
+        }
+    }
+    // Xash's console log (-log → engine.log, con_logfile → qconsole.log) is opened
+    // for WRITE against a relative name / a CWD that is not writable here, so the
+    // open fails and the whole engine console goes nowhere — leaving gameplay bugs
+    // (an NPC that won't path, a missing precache) undiagnosable. Force any *.log
+    // write to the writable basedir (only for the Xash guests, which are the ones
+    // that set XASH3D_BASEDIR), where kl_xash_tail_enginelog streams it into our log.
+    if (mode && (mode[0] == 'w' || mode[0] == 'a') && path) {
+        const char *base = getenv("XASH3D_BASEDIR");
+        size_t n = strlen(path);
+        if (base && *base && n >= 4 && !strcmp(path + n - 4, ".log")) {
+            const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+            char rp[1200];
+            snprintf(rp, sizeof rp, "%s/%s", base, bn);
+            FILE *lf = fopen(rp, mode);
+            if (lf) {
+                static int said;
+                if (!said++) fprintf(stderr, "  [xash] log write %s -> %s\n", path, rp);
+                kl_file_note(lf, path);
+                return lf;
+            }
+        }
+    }
     KL_GUEST_PATH(path);
     FILE *f = fopen(_p, mode);
+    // A sound engine that reads its banks through stdio (Wwise fopen(<files>/
+    // Init.bnk)) will miss them: the banks live only inside the OBB, not on disk.
+    // Serve them from the OBB by basename when the real open fails. Read-only.
+    if (!f && errno == ENOENT && mode && mode[0] == 'r') {
+        f = kl_obbmap_fopen(_p, mode);
+        if (f) { kl_file_note(f, path); return f; }
+    }
+    // The Source-VR menus (portal, hl2) draw their labels from the Android system
+    // font /system/fonts/*.ttf, which visionOS has no equivalent of — so every
+    // font load fails and the menu shows no text (a panel with a cursor, nothing
+    // to click). Serve the baked-in DejaVu Sans (kl_menu_font.S) for any missing
+    // /system/fonts/*.ttf; the engine falls all its faces back to this one and the
+    // labels appear. Read-only, from memory, so nothing is written or staged.
+    if (!f && errno == ENOENT && mode && mode[0] == 'r' &&
+        strncmp(path, "/system/fonts/", 14) == 0) {
+        size_t n = strlen(path);
+        if (n > 4 && strcmp(path + n - 4, ".ttf") == 0) {
+            extern const unsigned char kl_menu_font[] __asm__("_kl_menu_font");
+            extern const unsigned char kl_menu_font_end[] __asm__("_kl_menu_font_end");
+            FILE *ff = fmemopen((void *)kl_menu_font,
+                                (size_t)(kl_menu_font_end - kl_menu_font), "rb");
+            if (ff) {
+                static int said;
+                if (!said++)
+                    fprintf(stderr, "  [font] serving %s from the baked-in menu font "
+                            "(%zu bytes)\n", path,
+                            (size_t)(kl_menu_font_end - kl_menu_font));
+                kl_file_note(ff, path);
+                return ff;
+            }
+        }
+    }
+    // hl2 (HL2Q3VR) renders the world single-pass MULTIVIEW; libtogl then fails to
+    // generate a usable vertex shader variant and the scene is black, with no
+    // fallback. The port's per-category single-pass cvars force two-pass per-eye
+    // (portal's working path) — but SDL argv never reaches the engine's cvar
+    // system, whereas it DOES exec autoexec.cfg at startup. That file isn't staged,
+    // so synthesize it: serve these cvars for any missing hl2 */cfg/autoexec.cfg.
+    // Env KL_HL2_MULTIVIEW=1 disables the synth (keep the port's own attempt).
+    if (!f && errno == ENOENT && mode && mode[0] == 'r') {
+        size_t clen;
+        const char *cfg = kl_hl2_autoexec_cfg(path, &clen);
+        const char *what = "two-pass autoexec";
+        if (!cfg) { cfg = kl_hl2_launcher_graphics_cfg(path, &clen); what = "launcher graphics (real Quest cfg)"; }
+        if (cfg) {
+            FILE *cf = fmemopen((void *)cfg, clen, "rb");
+            if (cf) {
+                fprintf(stderr, "  [cfg] synthesized %s (%s)\n", path, what);
+                kl_file_note(cf, path);
+                return cf;
+            }
+        }
+    }
     kl_fs_trace("fopen", path, mode, f == NULL);
     if (f) kl_file_note(f, path);
     // /proc/cpuinfo gets re-read ~150x/s during the loading crawl — log the
@@ -956,6 +1755,17 @@ const char *kl_file_path(void *f) {
 int klb_access(const char *path, int mode) {
     KL_GUEST_PATH(path);
     int r = access(_p, mode);
+    // UE4 enumerates its paks with access() before opening them; a pak has no
+    // file on disk (read-through serves it from the OBB), so answer its virtual
+    // presence here. Only the existence bit (F_OK) / readability is meaningful.
+    if (r != 0 && errno == ENOENT && kl_obbmap_stat(_p, NULL)) r = 0;
+    // ...and the ICU data directory, which exists inside a mounted pak the
+    // guest's directory query cannot see into (kl_obbmap_icu_dir).
+    if (r != 0 && errno == ENOENT && kl_obbmap_icu_dir(_p)) r = 0;
+    // A guest shared library with no file on disk (translated framework only):
+    // answer the existence check the way dlopen would. The Source launcher
+    // access()/stat()s "<libdir>/filesystem_stdio.so" before loading it.
+    if (r != 0 && errno == ENOENT && (mode == F_OK || mode == R_OK) && kl_can_dlopen(_p)) r = 0;
     kl_fs_trace("access", path, NULL, r != 0);
     return r;
 }
@@ -1019,6 +1829,68 @@ int klb_chdir(const char *path) {
     kl_fs_trace("chdir", path, NULL, r != 0);
     return r;
 }
+
+// getcwd, reverse-mapped. klb_chdir sends /sdcard/... to the real container path
+// (g_ext_target, ~90 chars on device), so an unshimmed getcwd hands the guest that
+// full path back — and a guest that sizes its path buffers for a Quest's short
+// /sdcard (GTA Vice City VR's casepath uses fixed 128-byte buffers) then overflows
+// building <cwd>/<file> and FORTIFY-aborts. Return the guest's own short spelling:
+// when the real cwd is inside g_ext_target, present it as /sdcard/<rest>. A cwd
+// anywhere else is handed back unchanged.
+// Reverse the extstorage map: a real path under g_ext_target becomes its short
+// /sdcard spelling. g_ext_target is stored UNRESOLVED (/var/mobile/...), but
+// getcwd/realpath return the CANONICAL form (/private/var/mobile/... — /var is a
+// symlink), so match against both. Returns 1 and fills `out` (cap bytes) on a
+// hit, 0 otherwise. Without the canonical form the reverse-map silently misses
+// and a guest that sizes Quest-length path buffers overflows on the container path.
+static int kl_ext_unmap(const char *real, char *out, size_t cap) {
+    static char canon[1024]; static int canon_done;
+    if (!canon_done) { canon_done = 1;
+        if (!realpath(g_ext_target, canon)) canon[0] = '\0';
+    }
+    const char *bases[2] = { canon[0] ? canon : NULL, g_ext_target };
+    for (int i = 0; i < 2; i++) {
+        const char *b = bases[i];
+        if (!b || !*b) continue;
+        size_t n = strlen(b);
+        if (strncmp(real, b, n) == 0 && (real[n] == '/' || real[n] == '\0')) {
+            snprintf(out, cap, "/sdcard%s", real + n);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+char *klb_getcwd(char *buf, size_t size) {
+    char real[1024];
+    if (!getcwd(real, sizeof real)) return NULL;
+    char alias[1024];
+    const char *out = kl_ext_unmap(real, alias, sizeof alias) ? alias : real;
+    size_t len = strlen(out);
+    if (!buf) return strdup(out);            // glibc-style allocate (bionic lacks it, but be safe)
+    if (len + 1 > size) { errno = ERANGE; return NULL; }
+    memcpy(buf, out, len + 1);
+    return buf;
+}
+
+// realpath, reverse-mapped. The guest resolves a path (its data root) and gets a
+// canonical absolute one; unshimmed that is the ~90-char container path, which the
+// same Quest-sized buffers overflow (vicecity: getcwd()+"/gamedata" then +"TEXT").
+// Map the INPUT through kl_guest_path (so /sdcard/... resolves), resolve it, then
+// map the OUTPUT back to the short /sdcard spelling.
+char *klb_realpath(const char *path, char *resolved) {
+    KL_GUEST_PATH(path);
+    char real[1024];
+    if (!realpath(_p, real)) return NULL;
+    char alias[1024];
+    const char *out = kl_ext_unmap(real, alias, sizeof alias) ? alias : real;
+    // POSIX: resolved==NULL means allocate (PATH_MAX); a bionic guest passes a
+    // PATH_MAX buffer. Honour both.
+    if (!resolved) return strdup(out);
+    size_t len = strlen(out);
+    memcpy(resolved, out, len + 1);
+    return resolved;
+}
 int klb_rename(const char *a, const char *b) {
     // Two paths, so two buffers: KL_GUEST_PATH names one pair, and a rename
     // whose halves land in different trees must fail rather than half-succeed.
@@ -1034,10 +1906,37 @@ int klb_rename(const char *a, const char *b) {
 typedef struct { uint64_t d_ino; int64_t d_off; uint16_t d_reclen;
                  uint8_t d_type; char d_name[256]; } bionic_dirent;
 
-void *klb_opendir(const char *p) { KL_GUEST_PATH(p); return opendir(_p); }
-int   klb_closedir(void *d)      { return closedir((DIR *)d); }
+void *klb_opendir(const char *p) {
+    KL_GUEST_PATH(p);
+    // A UE4 guest lists Content/Paks to discover its paks; those files are
+    // virtual (served from the OBBs), so a synthetic handle merges them into
+    // the listing. NULL means "not ours" — fall back to a real opendir.
+    void *syn = kl_obbmap_opendir(_p);
+    if (syn) { kl_fs_trace("opendir", _p, "obb", 0); return syn; }
+    void *d = opendir(_p);
+    // Traced (KL_TRACE_FS=all) because an engine builds its file INDEX by
+    // scanning directories, and a file that never shows up in a listing is
+    // reported "missing" with no open() to catch — cs1's "Cannot load Sniper
+    // Scope arcs" is exactly that, and this is the only place it is visible.
+    kl_fs_trace("opendir", _p, NULL, !d);
+    return d;
+}
+int   klb_closedir(void *d)      {
+    if (kl_obbmap_closedir(d) >= 0) return 0;
+    return closedir((DIR *)d);
+}
 void *klb_readdir(void *d) {
     static _Thread_local bionic_dirent out;    // matches readdir's per-stream lifetime
+    char name[256]; int is_dir;
+    int r = kl_obbmap_readdir(d, name, sizeof name, &is_dir);
+    if (r >= 0) {                              // one of our synthetic handles
+        if (r == 0) return NULL;               // end of the merged listing
+        memset(&out, 0, sizeof out);
+        out.d_ino = 1; out.d_off = 0; out.d_reclen = sizeof out;
+        out.d_type = is_dir ? DT_DIR : DT_REG;
+        snprintf(out.d_name, sizeof out.d_name, "%s", name);
+        return &out;
+    }
     struct dirent *e = readdir((DIR *)d);
     if (!e) return NULL;
     memset(&out, 0, sizeof out);
@@ -1046,7 +1945,47 @@ void *klb_readdir(void *d) {
     out.d_reclen = sizeof out;
     out.d_type = e->d_type;
     snprintf(out.d_name, sizeof out.d_name, "%s", e->d_name);
+    kl_fs_trace("readdir", out.d_name, NULL, 0);   // KL_TRACE_FS=all: names the index sees
     return &out;
+}
+
+// scandir over the same bionic_dirent the guest's readdir hands back — NOT the
+// host's (Darwin's struct dirent has a different layout, and the guest's filter/
+// compar callbacks read d_name at the bionic offset). Source's tier0 uses it to
+// enumerate directories. Entries and the array are plain malloc'd so the guest's
+// free() (host free) releases them; qsort/compar match scandir's contract.
+int klb_scandir(const char *p, bionic_dirent ***namelist,
+                int (*filter)(const bionic_dirent *),
+                int (*compar)(const bionic_dirent **, const bionic_dirent **)) {
+    void *d = klb_opendir(p);
+    if (!d) return -1;
+    bionic_dirent **list = NULL;
+    size_t count = 0, cap = 0;
+    for (bionic_dirent *e; (e = (bionic_dirent *)klb_readdir(d)) != NULL; ) {
+        if (filter && !filter(e)) continue;          // e is the per-stream static: copy now
+        bionic_dirent *copy = malloc(sizeof *copy);
+        if (!copy) continue;
+        *copy = *e;
+        if (count == cap) {
+            size_t ncap = cap ? cap * 2 : 32;
+            bionic_dirent **grown = realloc(list, ncap * sizeof *grown);
+            if (!grown) { free(copy); break; }
+            list = grown; cap = ncap;
+        }
+        list[count++] = copy;
+    }
+    klb_closedir(d);
+    if (compar && count > 1)
+        qsort(list, count, sizeof *list, (int (*)(const void *, const void *))compar);
+    *namelist = list;
+    return (int)count;
+}
+
+// alphasort, the compar tier0 passes to scandir. Must read d_name at the bionic
+// offset (the entries are the bionic_dirent klb_scandir built), so it cannot be
+// KL_FWD'd to the host's alphasort (Darwin dirent layout).
+int klb_alphasort(const bionic_dirent **a, const bionic_dirent **b) {
+    return strcoll((*a)->d_name, (*b)->d_name);
 }
 
 // ---------- sigaction ----------
@@ -1111,6 +2050,55 @@ static int klb_fatal_signal(int sig) {
     }
 }
 
+// x18-veneer repair for guest signal handlers. Darwin zeroes x18 (the reserved
+// platform register) on every exception return; a guest signal landing in the
+// `mrs;ldr;br x18` veneer (kl_x18.c, KLX_HZ_TERMBR) resumes with x18=0 and, at a
+// `br x18`, branches to 0 — an UNCATCHABLE AMFI SIGKILL on visionOS that
+// kl_fault.c's window-2 recovery can never see (no SIGSEGV is delivered). The
+// dominant driver is Unity/Boehm stop-the-world GC signals (SIGPWR/SIGXCPU),
+// fired every GC cycle on every managed thread; heavy in-map allocation hits the
+// one-instruction window within seconds (liminalvr). PREVENT it: wrap each
+// non-fatal guest handler and, on return, restore x18 = tsd[KLX_TSD_SLOT] (the
+// veneer's live target) into the resume context — exactly kl_fault.c:158 moved to
+// the non-fault signal-return path. Safe: the guest never reads architectural x18
+// (every access is veneered) and the next veneer reloads it. Gated to Unity kind
+// (where the GC trigger lives); KL_SIG_X18_REPAIR overrides.
+static int kl_sig_x18_repair_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern kl_guest_kind kl_driver_kind(void);
+        v = kl_env_on("KL_SIG_X18_REPAIR", kl_driver_kind() == KL_GUEST_UNITY);
+    }
+    return v;
+}
+#define KL_NSIG 65
+static struct { void *handler; int siginfo; } g_guest_sig[KL_NSIG];
+static void kl_sig_x18_tramp(int sig, siginfo_t *info, void *uctx) {
+    void *h  = (sig > 0 && sig < KL_NSIG) ? g_guest_sig[sig].handler : NULL;
+    int   si = (sig > 0 && sig < KL_NSIG) ? g_guest_sig[sig].siginfo : 0;
+    if (h) {
+        if (si) ((void (*)(int, siginfo_t *, void *))h)(sig, info, uctx);
+        else    ((void (*)(int))h)(sig);
+    }
+    if (uctx) {
+        ucontext_t *uc = (ucontext_t *)uctx;
+        void *tgt = pthread_getspecific(KLX_TSD_SLOT);
+        // Restore a zeroed x18 only. (An earlier PC-redirect variant that read the
+        // resume instruction to detect `br x18` regressed liminalvr — crashed
+        // SOONER, the *pc read is not safe on an arbitrary resume context — so it
+        // was reverted. This conditional set is the version that survived longest.)
+        if (tgt && uc->uc_mcontext->__ss.__x[18] == 0) {
+            static unsigned long n;
+            unsigned long k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+            if (k <= 8) {
+                const char *m = "  [x18] signal repaired zeroed x18 (prevented branch-to-0)\n";
+                (void)write(2, m, strlen(m));
+            }
+            uc->uc_mcontext->__ss.__x[18] = (uint64_t)(uintptr_t)tgt;
+        }
+    }
+}
+
 int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
     struct sigaction d, o;
     if (kl_env_on("KL_TRACE_SIG", 0))
@@ -1127,14 +2115,28 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
     }
     if (in) {
         memset(&d, 0, sizeof d);
-        d.sa_handler = (void (*)(int))in->handler;
-        d.sa_flags   = kl_sa_flags((uint32_t)in->flags);
-        d.sa_mask    = (sigset_t)(in->mask & 0xFFFFFFFFu);
+        int is_guest = in->handler && in->handler != (void *)SIG_DFL &&
+                       in->handler != (void *)SIG_IGN;
+        if (is_guest && !klb_fatal_signal(sig) && sig > 0 && sig < KL_NSIG &&
+            kl_sig_x18_repair_on()) {
+            g_guest_sig[sig].handler = (void *)in->handler;
+            g_guest_sig[sig].siginfo = (in->flags & KL_SA_SIGINFO) ? 1 : 0;
+            d.sa_sigaction = kl_sig_x18_tramp;
+            d.sa_flags     = kl_sa_flags((uint32_t)in->flags) | SA_SIGINFO;
+            d.sa_mask      = (sigset_t)(in->mask & 0xFFFFFFFFu);
+        } else {
+            d.sa_handler = (void (*)(int))in->handler;
+            d.sa_flags   = kl_sa_flags((uint32_t)in->flags);
+            d.sa_mask    = (sigset_t)(in->mask & 0xFFFFFFFFu);
+        }
     }
     int r = sigaction(sig, in ? &d : NULL, old ? &o : NULL);
     if (!r && old) {
         memset(old, 0, sizeof *old);
-        old->handler = (void *)o.sa_handler;
+        void *oh = (void *)o.sa_handler;
+        if (oh == (void *)kl_sig_x18_tramp && sig > 0 && sig < KL_NSIG)
+            oh = g_guest_sig[sig].handler;      // unwrap our trampoline
+        old->handler = oh;
         old->flags   = (int32_t)kl_sa_flags_back(o.sa_flags);
         old->mask    = o.sa_mask;
     }
@@ -1183,7 +2185,20 @@ void klb__exit(int status) { klb_exit_report("_exit", status); _exit(status); }
 int    klb_FD_ISSET_chk(int fd, void *set) { return FD_ISSET(fd, (fd_set *)set); }
 void   klb_FD_SET_chk(int fd, void *set)   { FD_SET(fd, (fd_set *)set); }
 size_t klb_ctype_mb_cur_max(void)          { return MB_CUR_MAX; }
-off_t  klb_lseek64(int fd, off_t o, int w) { return lseek(fd, o, w); }
+off_t  klb_lseek64(int fd, off_t o, int w) { int handled; off_t r = kl_obbmap_lseek(fd, o, w, &handled);
+                                             return handled ? r : lseek(fd, o, w); }
+// The bare-name lseek (a guest without FORTIFY, e.g. libUE4) reaches this.
+off_t  klb_lseek(int fd, off_t o, int w)   { int handled; off_t r = kl_obbmap_lseek(fd, o, w, &handled);
+                                             return handled ? r : lseek(fd, o, w); }
+// ...and close, so an OBB read-through fd is unregistered before its number can
+// be recycled by an unrelated open (or the table would misroute that open).
+int    klb_close(int fd)                   { int handled; int r = kl_obbmap_close(fd, &handled);
+                                             return handled ? r : close(fd); }
+// bare-name pread (libUE4 uses it): interpose the read-through window.
+ssize_t klb_pread(int fd, void *buf, size_t n, off_t off) {
+    int handled; ssize_t r = kl_obbmap_pread(fd, buf, n, off, &handled);
+    return handled ? r : pread(fd, buf, n, off);
+}
 // The stdio half of the same family: 32-bit Linux needed a second spelling for
 // every off_t call and bionic keeps both, while Darwin's off_t has always been
 // 64-bit. OpenJK is a 2003 codebase and reaches for the explicit names.
@@ -1687,6 +2702,15 @@ static int klb_refuse_exec(const char *what, int anon, int prot) {
 
 void *klb_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     int df = kl_mmap_flags(flags);
+    // A memory-map of an OBB read-through fd cannot be served: the pak's bytes
+    // start at an arbitrary (non-page-aligned) offset inside the archive, so
+    // there is no page boundary to map from. Fail it; UE4's FPakPlatformFile
+    // falls back to ordinary pread when a pak cannot be mmap'd, which the
+    // read-through path serves. (No guest reaches here for an anon map.)
+    if (!(df & MAP_ANON) && fd >= 0 && kl_obbmap_is_vfd(fd)) {
+        errno = ENODEV;
+        return MAP_FAILED;
+    }
     if (df & MAP_ANON) fd = -1;                  // Darwin insists on -1 for anonymous
     if (klb_refuse_exec("mmap", (df & MAP_ANON) != 0, prot)) return MAP_FAILED;
     void *p = mmap(addr, len, prot, df, fd, off); // PROT_* match on both sides
@@ -1696,6 +2720,39 @@ void *klb_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
         kl_file_watch("mmap", NULL, fd, p, len, (long long)off,
                       __builtin_return_address(0));
     return p;
+}
+
+// sbrk — the old data-segment allocator. Darwin's is deprecated and never grew
+// a heap, so there is no symbol to forward; a guest library still uses it as its
+// allocator (AC Nexus's libfacebuilderbridgedll calls it during face-builder
+// init), so back it with a private mmap arena and hand chunks out of it. sbrk(0)
+// queries the current break, a positive increment advances it, a negative one
+// releases (bookkeeping only — the arena stays mapped). Returns the PREVIOUS
+// break, or (void*)-1 with errno on exhaustion, which is what a caller that can
+// fall back to mmap tests for.
+void *klb_sbrk(intptr_t incr) {
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    static uintptr_t base, cur, end;
+    pthread_mutex_lock(&lk);
+    if (!base) {
+        size_t sz = (size_t)1024 * 1024 * 1024;   /* 1 GiB reserved arena */
+        void *pg = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+                        MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (pg == MAP_FAILED) { pthread_mutex_unlock(&lk); errno = ENOMEM; return (void *)-1; }
+        base = cur = (uintptr_t)pg;
+        end = base + sz;
+    }
+    uintptr_t old = cur;
+    if (incr > 0) {
+        if ((uintptr_t)incr > end - cur) { pthread_mutex_unlock(&lk); errno = ENOMEM; return (void *)-1; }
+        cur += (uintptr_t)incr;
+    } else if (incr < 0) {
+        uintptr_t dec = (uintptr_t)(-incr);
+        if (dec > cur - base) { pthread_mutex_unlock(&lk); errno = ENOMEM; return (void *)-1; }
+        cur -= dec;
+    }
+    pthread_mutex_unlock(&lk);
+    return (void *)old;
 }
 
 // ...and the other half, which is how a JIT usually asks: map RW, write, then

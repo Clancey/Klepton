@@ -391,6 +391,13 @@ Built for the loading-pace investigation; all default off.
 - `KL_TRACE_THREADS=1` — one line per guest `pthread_create`: entry, arg, stack
   size, detached, result. The entry pointer symbolises against the load
   addresses phase 1 prints, so it names which subsystem the thread belongs to.
+- `KL_TRACE_TSD=1` — one line per guest `pthread_key_create`: index handed out,
+  destructor, and how many keys are live. The guest TSD table is Klepton's own
+  (512 keys, indices recycled on delete) rather than one Darwin key apiece, and
+  this is how you see a guest approaching the ceiling BEFORE it gets EAGAIN —
+  which guests do not handle: Asgard's Wrath 2 stored the failed key as -1 and
+  faulted on the resulting NULL `getspecific` a map load later. The high-water
+  number is in every fault dump without setting this.
 - `KL_TRACE_FUTEX=1` — once a second: futex waits split timeout-vs-woken, and
   wakes. The loading crawl came with zero timeouts — the wake path is healthy.
 - `KL_USLEEP_CAP=<usec>` — clamp every guest usleep. Proved the ~5 ms polling
@@ -2120,6 +2127,15 @@ vendored the whole path refuses by name and none of these do anything.
   and an empty output directory there is the wrong instrument rather than an
   empty frame. Use `KL_GLFB_OUT=<dir>`, which makes m_boot's end-of-run P5
   readback write `mtl_eye0.png` / `mtl_eye1.png` from the same storage.
+- `KL_VK_OUT_ALL=1` — capture EVERY stage that has an image, not only the one
+  the association named; the named one gets a `_named` filename suffix. This is
+  the all-views-at-once debugger for the Vulkan stage association, which runs
+  on the frame-counter fallback ("eye stage NOT observed") on every Vulkan
+  guest: a capture of only the named stage cannot show a wrong guess, where a
+  grid of `s0/s1/s2 × eye0/eye1` from one frame shows exactly which stage holds
+  the fresh picture and which one was about to be sampled. Pair with
+  `KL_VK_EYE_TINT=1` to also separate "never drawn" (tint survives) from
+  "drawn but stale".
 - `KL_VK_OUT_EVERY=N` — capture every Nth frame (default 1). A full eye pair is
   ~21 MB of readback, so 1 is only for short runs.
 - `KL_VK_EYE_TINT=1` — pre-clear every eye image before the guest ever sees it:
@@ -2197,6 +2213,17 @@ except its own control vars (next section).
 - `KL_AUTOBOOT=0` — autoboot is the default too; `=0` restores the
   Boot-button-only shape, for attaching a debugger or starting a GPU capture
   before the guest runs.
+- `KL_CUSTOM_LAUNCHER=1` — **build-time** flag (set when generating the Xcode
+  project, e.g. `KL_CUSTOM_LAUNCHER=1 ./build_run_vpro.sh hl1`), NOT a runtime env
+  var. It bakes the "configure, then Start" launcher into the game builds
+  (hl1/hl2/portal): a window title of the game's name, a folder picker for the game
+  files (on-device or iCloud), hl1's commandline.txt + VR/controls/perf panel, and a
+  "Boot" button in place of autoboot — so a shipping build ships with it and no
+  runtime env is needed. **Off by default** — the game builds otherwise behave the
+  original way (autoboot honouring `KL_AUTOBOOT`, a plain "Boot" button, no picker),
+  so existing scripts (`visionos/run.sh`) are unchanged. Mechanism:
+  `visionos/gen_xcodeproj.py` adds the `KL_CUSTOM_LAUNCHER` Swift active-compilation
+  condition, which `klLauncherTitle()` in KleptonLauncher.swift gates on.
 - `KL_EXIT_ON_BACKGROUND=0` — stay alive when the app is backgrounded. The
   **default is to `exit(0)`**, ALVR's shape: everything the guest holds across a
   suspend (the ARKit session, the Compositor Services layer, ANGLE's context and

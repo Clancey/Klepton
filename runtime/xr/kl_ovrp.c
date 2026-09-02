@@ -12,8 +12,10 @@
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#include <mach/mach.h>   // vm_read_overwrite — probe a guest pointer without faulting
 #include "klepton.h"
 #include "kl_ovrp.h"
+#include "../guest/kl_driver.h"
 // kl_glfb_note_eye_texture (the capture's eye-FBO seam) and
 // kl_glfb_last_render_stage (which stage the guest actually drew into — see
 // klovrp_EndFrame). Up here rather than beside SetupEyeTexture2 now that the
@@ -174,9 +176,23 @@ static void ovrp_trace(const char *name, void *caller) {
 // while this function has a frame of its own. A handler must also not TAIL-call
 // it — none do; every one records the hit and then goes on to answer.
 __attribute__((noinline))
+// KL_OVRP_VERBOSE=1: log every OVRPlugin call's first 20 hits plus a periodic
+// heartbeat (every 120th) — comprehensive XR-side tracing (frame loop, app-state
+// polls, layer lifecycle, input) in ONE build, toggled per-run by the env var so
+// no rebuild is needed to expose or silence it. =2 also drops the periodic cap.
+static int kl_ovrp_verbose(void) {
+    static int v = -1;
+    if (v < 0) v = (int)kl_env_uint("KL_OVRP_VERBOSE", 0);
+    return v;
+}
 static void ovrp_hit(const char *name) {
     int s = ovrp_slot(name);
     if (s >= 0) g_ovrp[s].calls++;
+    if (kl_ovrp_verbose() && s >= 0) {
+        unsigned c = g_ovrp[s].calls;
+        if (c <= 20 || kl_ovrp_verbose() >= 2 || (c % 120) == 0)
+            fprintf(stderr, "  [ovrp-v] %s #%u\n", name, c);
+    }
     // -Wframe-address fires on any nonzero level. It is warning about exactly the
     // assumption stated above, which the noinline and the no-tail-call rule are
     // what make good; the fault reporter walks the same chain for the same reason.
@@ -236,6 +252,15 @@ static uint64_t klovrp_no(const char *name) {
     return 0;
 }
 
+// Returns ovrpResult: -1004 UNSUPPORTED. For whole subsystems that genuinely do
+// not exist on this host (Insight Passthrough has no compositor path wired yet),
+// this is the honest answer and it prunes the entire follow-on subtree — the
+// guest sees init fail and never calls CreatePassthroughLayer et al.
+static uint64_t klovrp_unsupported(const char *name) {
+    ovrp_hit(name);
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
 // ---------------------------------------------------------------------------
 // Has the guest initialised the plugin yet?
 //
@@ -286,7 +311,59 @@ static uint64_t klovrp_Initialize(const char *name) {
     g_ovrp_initialized = 1;
     return OVRP_SUCCESS;
 }
+// Audio/display device-id getters, the `ovrpResult f(void **out)` shape.
+// ieytd2's libOculusXRPlugin (OculusSystem::Initialize, guest va 0xd2c0/0xd2f4)
+// calls each with a ZEROED stack slot as out, checks only the result sign, then
+// copies 16 bytes from *out — so success MUST come with a pointer to at least
+// 16 readable bytes. A zeroed buffer is the truthful answer ("no Android audio
+// device — output is CoreAudio"): it reads as an empty wide string / null GUID.
+static uint64_t klovrp_GetDeviceId2(const char *name, const void **out) {
+    ovrp_hit(name);
+    static const uint8_t empty_id[32];
+    if (out) *out = empty_id;
+    return OVRP_SUCCESS;
+}
+// A recenter REQUEST from the guest (menu button long-press UX). On visionOS
+// the system owns recentering (crown long-press); acknowledging with success
+// and doing nothing is what the guest's UX expects from a platform that
+// recenters elsewhere — the recenter-count getter above never increments, so
+// the guest sees "requested, nothing changed", which is also what a real Quest
+// answers when recentering is deferred. ieytd2 calls it during session setup.
+static uint64_t klovrp_RecenterTrackingOrigin2(int flags) {
+    (void)flags;
+    ovrp_hit("ovrp_RecenterTrackingOrigin2");
+    return OVRP_SUCCESS;
+}
+
+static uint64_t klovrp_GetAudioOutId2(const void **out)      { return klovrp_GetDeviceId2("ovrp_GetAudioOutId2", out); }
+static uint64_t klovrp_GetAudioInId2(const void **out)       { return klovrp_GetDeviceId2("ovrp_GetAudioInId2", out); }
+
+// The display adapter id is NOT an audio device — it is the GPU, and a Vulkan
+// guest USES it. Unity's OculusXR (acnexusvr, a Unity+Vulkan title) asks here
+// which physical device is the VR one, then walks vkEnumeratePhysicalDevices
+// matching each device's VkPhysicalDeviceIDProperties.deviceLUID against this
+// answer and hands the MATCH to vkGetPhysicalDeviceQueueFamilyProperties. The
+// old zeroed answer (via GetDeviceId2) matched nothing once MoltenVK 1.4.2 began
+// reporting a real, non-zero LUID, so Unity selected a NULL VkPhysicalDevice and
+// crashed in MVKPhysicalDevice::getQueueFamilies. Report the real LUID (first 8
+// bytes of the 32-byte id) so the match lands. A GLES guest has no Vulkan
+// instance; kl_vulkan_display_luid leaves the id empty, the prior behaviour.
+static uint64_t klovrp_GetDisplayAdapterId2(const void **out) {
+    ovrp_hit("ovrp_GetDisplayAdapterId2");
+    static uint8_t id[32];
+    memset(id, 0, sizeof id);
+    if (kl_vulkan_display_luid(id))
+        fprintf(stderr, "  [ovrp] display adapter LUID %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]);
+    if (out) *out = id;
+    return OVRP_SUCCESS;
+}
+
 static uint64_t klovrp_Initialize5(void) { return klovrp_Initialize("ovrp_Initialize5"); }
+// The 6 revision sits between the two we already answer; ieytd2's
+// libOculusXRPlugin calls it and the unimplemented-entry abort was its whole
+// boot. Same answer as 5 and 7 — the revisions differ in arguments we ignore.
+static uint64_t klovrp_Initialize6(void) { return klovrp_Initialize("ovrp_Initialize6"); }
 static uint64_t klovrp_Initialize7(void) { return klovrp_Initialize("ovrp_Initialize7"); }
 
 // ...and the other end: the guest saying the plugin is down. ovrp_Shutdown is
@@ -300,6 +377,18 @@ static uint64_t klovrp_Shutdown(void) {
     ovrp_hit("ovrp_Shutdown");
     g_ovrp_initialized = 0;
     return OVRP_TRUE;
+}
+
+// ovrp_Shutdown2, the ovrpResult form. TWD2 (a UE4 DoubleWide title) reaches it
+// when its eye layer cannot be served — but a Shutdown call is the guest tearing
+// the plugin down, and aborting on it turns an orderly teardown into signal 6 on
+// the game thread. Answer OVRP_SUCCESS and clear the flag, exactly as the
+// ovrpBool form does. (Whatever drove the guest to shut down is a separate
+// question — for TWD2 that is DoubleWide eye layers; see klovrp_GetLayerTexture2.)
+static uint64_t klovrp_Shutdown2(void) {
+    ovrp_hit("ovrp_Shutdown2");
+    g_ovrp_initialized = 0;
+    return OVRP_SUCCESS;
 }
 
 // Who is driving. UE4's OculusHMD calls this immediately after Initialize5 with
@@ -370,6 +459,16 @@ static uint64_t klovrp_GetAppShouldRecreateDistortionWindow2(int *out) {
 // guest's own number. KL_OVRP_MSAA overrides it, because the first thing to try
 // if a multisampled eye layer turns out to be a problem is 1, and that is a
 // measurement rather than a redefinition of the headset.
+// The un-suffixed form returns the level DIRECTLY (the ...2 shape below writes
+// it through an out-param and returns ovrpResult). Liminal's Unity 2019 OVRPlugin
+// calls this one from its quality/settings pass after the loading intro; without
+// it the run aborted mid-render on the unimplemented entry point. Same answer as
+// the ...2 sibling — KL_OVRP_MSAA, default 4.
+static int klovrp_GetSystemRecommendedMSAALevel(void) {
+    ovrp_hit("ovrp_GetSystemRecommendedMSAALevel");
+    return (int)kl_env_int("KL_OVRP_MSAA", 4);
+}
+
 static uint64_t klovrp_GetSystemRecommendedMSAALevel2(int *out) {
     ovrp_hit("ovrp_GetSystemRecommendedMSAALevel2");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
@@ -504,10 +603,39 @@ static uint64_t klovrp_GetNativeSDKVersion2(const char **out) {
 //
 // Quest 2 for the same reason Build.MODEL says Quest 2: it is the device this
 // title is written for, and the answer has to agree with the one JNI already gave.
+#define OVRP_HEADSET_OCULUS_QUEST   8
 #define OVRP_HEADSET_OCULUS_QUEST_2 9
+// KL_OVRP_HEADSET=<n> overrides the reported ovrpSystemHeadset. Default is
+// Quest 2 (9). Liminal (Oculus Utilities 1.40, an SDK that predates Quest 2)
+// keys its Touch-vs-3DoF-remote controller mapping on headset == Oculus_Quest
+// (8): an unknown 9 falls to the remote branch and its hands read as never
+// connected. Running it with KL_OVRP_HEADSET=8 presents the headset the app
+// knows uses Touch, so hands map to LTouch/RTouch.
+static int klovrp_headset_type(void) {
+    static int v = -1;
+    if (v < 0) {
+        // Liminal (Oculus Utilities 1.40) maps hands to Touch only when the
+        // headset reports Oculus_Quest (8); a 9 (Quest 2) leaves its hands on
+        // the 3DoF-remote branch and they read as never connected. So the
+        // liminalvr target defaults to 8 with no env needed; everything else
+        // keeps the Quest 2 default. KL_OVRP_HEADSET still overrides either.
+        // missioniss (same OVRPlugin-1.40 era) shows the identical connected=0x0
+        // symptom, BUT presenting headset==8 makes it engage the Touch input path
+        // that then CRASHES on a guest worker thread (signal 11) — an
+        // unimplemented Touch-path ovrp call, not yet isolated. So missioniss stays
+        // on the Quest-2 default (stuck-at-menu but stable) until that crash is
+        // named; test the Touch path on demand with KL_OVRP_HEADSET=8.
+        const char *tgt = kl_driver_target_name();
+        int dflt = (tgt && strcmp(tgt, "liminalvr") == 0)
+                     ? OVRP_HEADSET_OCULUS_QUEST
+                     : OVRP_HEADSET_OCULUS_QUEST_2;
+        v = (int)kl_env_int("KL_OVRP_HEADSET", dflt);
+    }
+    return v;
+}
 static uint64_t klovrp_GetSystemHeadsetType(void) {
     ovrp_hit("ovrp_GetSystemHeadsetType");
-    return OVRP_HEADSET_OCULUS_QUEST_2;
+    return (uint64_t)(uint32_t)klovrp_headset_type();
 }
 
 static uint64_t klovrp_GetSystemHeadsetType2(int *out) {
@@ -520,7 +648,7 @@ static uint64_t klovrp_GetSystemHeadsetType2(int *out) {
     // the real plugin checks first is already satisfied, so only the NULL
     // guard is reachable.
     if (!out) return -1001;
-    *out = OVRP_HEADSET_OCULUS_QUEST_2;
+    *out = klovrp_headset_type();
     return OVRP_SUCCESS;
 }
 
@@ -570,7 +698,32 @@ static uint64_t klovrp_GetFoveationEyeTrackedSupported(int *out) {
 //
 // The two forms must not disagree: ovrp_GetEyeTextureArraySupported is the same
 // question and reads this.
+//
+// Per-target DEFAULT, mirroring klovrp_unify_default's precedent. olar and
+// wanderer are UE5/Vulkan titles that set up a correct multiview render pass —
+// a viewType_2D_ARRAY colour view over both eye layers plus a 2-layer D32S8
+// depth, targeting the very eye VkImage GetLayerTexture2 hands out — and yet the
+// eye comes back GENUINELY BLACK at the guest-queue copy point (KL_VK_OUT: "0
+// lit", both eyes, every frame, after a vkQueueWaitIdle). The render executes
+// but MoltenVK's VK_KHR_multiview -> Metal translation of the UE5 world shaders
+// produces nothing (olar additionally shows torn garbage geometry; its crisp
+// menu is a SEPARATE Quad overlay layer the host composites, not eye content).
+// Defaulting these off puts the guest in per-eye MultiPass, which does not go
+// through the multiview path at all. KL_OVRP_MULTIVIEW overrides in either
+// direction, so a rebuild is not needed to A/B it.
+// Multiview defaults ON. Turning it off is NOT a usable A/B for olar/wanderer:
+// UE5's Meta-XR eye layer is Array-only (it keeps requesting ovrpLayout_Array
+// even when we report no multiview), and GetLayerTexture2 then refuses the Array
+// layer (multiview off) — olar spun ~86k CalculateEyeLayerDesc retries and the
+// watchdog killed it. So these titles MUST have multiview to boot at all; the
+// black-world fix has to live inside the multiview path, not by disabling it.
 int kl_ovrp_multiview(void) {
+    // GLES (ANGLE) guests have NO multiview and their eye layer is served only as
+    // Stereo/DoubleWide — so multiview MUST read false for them, or a UE guest
+    // (twd2) requests an Array eye layout that GetLayerTexture2 refuses on the GL
+    // path, and the guest spins forever recalculating the layer it can never get.
+    // Only the Vulkan path serves Array. (Dropping this guard once regressed twd2
+    // into exactly that non-booting CalculateLayerDesc loop.)
     if (!kl_vulkan_guest_active()) return 0;
     return kl_env_on("KL_OVRP_MULTIVIEW", 1);
 }
@@ -596,6 +749,15 @@ static uint64_t klovrp_GetEyeTextureArraySupported2(int *out) {
     ovrp_hit("ovrp_GetEyeTextureArraySupported2");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
     *out = kl_ovrp_multiview();
+    return OVRP_SUCCESS;
+}
+
+// ovrp_GetTrackingPositionSupported2(ovrpBool* out) — Red Matter 2. Positional
+// tracking IS supported (visionOS gives a full 6DoF head pose), so answer true.
+static uint64_t klovrp_GetTrackingPositionSupported2(int *out) {
+    ovrp_hit("ovrp_GetTrackingPositionSupported2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 1;
     return OVRP_SUCCESS;
 }
 
@@ -1068,6 +1230,25 @@ static const float *klovrp_forced_tan(void) {
     return state == 2 ? &t[0][0] : NULL;
 }
 
+// Titles that read the frustum ONCE and render both eyes with that single cone,
+// then submit each eye full-width (no per-eye ViewportRect) — the "collapses the
+// cones WITHOUT submitting per-eye rects" case KL_OVRP_UNIFY_FRUSTUM exists for.
+// On the canted Vision Pro display the composite otherwise reprojects the right
+// eye through the right cone while the picture in it was rendered with the left
+// cone, and the two eyes shear apart into crossed stereo. Into The Radius reads
+// ovrp_GetNodeFrustum2 exactly once and submits eye0/eye1 both at 0,0 full-width
+// (measured). Defaulting unify on for it makes the guest render, and the
+// composite reproject, one symmetric union cone per eye — they agree, the cross
+// is gone, at the known cost of the union's slightly lower angular density. The
+// env still overrides in either direction.
+static int klovrp_unify_default(void) {
+    static const char *on[] = { "intotheradius" };
+    const char *t = kl_driver_target_name();
+    if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
+        if (strcmp(t, on[i]) == 0) return 1;
+    return 0;
+}
+
 static const float *klovrp_eye_tan(int eye) {
     // Written by whichever thread reads first and rewritten with identical
     // values by any other — the inputs are the display's, fixed for the run.
@@ -1079,7 +1260,7 @@ static const float *klovrp_eye_tan(int eye) {
     // Read once: this is on the frame path (every ovrp_GetNodeFrustum2, every
     // layer desc, every frame record) and the answer cannot change mid-run.
     static int on = -1;
-    if (on < 0) on = kl_env_on("KL_OVRP_UNIFY_FRUSTUM", 0);
+    if (on < 0) on = kl_env_on("KL_OVRP_UNIFY_FRUSTUM", klovrp_unify_default());
     if (!on) return src[eye];
     for (int i = 0; i < 4; i++)
         u[0][i] = u[1][i] = src[0][i] > src[1][i] ? src[0][i] : src[1][i];
@@ -1197,6 +1378,23 @@ static float klovrp_GetUserIPD(void) {
     float ipd = 0.0f;
     if ((int64_t)klovrp_GetUserIPD2(&ipd) < 0) return 0.0f;
     return ipd;
+}
+
+// ovrp_GetUserEyeHeight2(float* height) — the standing eye height, metres. Unlike
+// the neck-eye distance (which is safely 0), a zero here is NOT survivable under a
+// FloorLevel tracking origin: the guest adds it to y=0 to place the camera, so 0
+// puts the head on the floor. wanderer (UE5) polls it once per frame right before
+// EndFrame4 and aborted on the unimplemented trampoline. Answer the standard
+// average standing eye height; the guest's own SetTrackingOriginType decides
+// whether it is applied (EyeLevel ignores it). Honours a KL_OVRP_EYE_HEIGHT
+// override for tuning.
+static uint64_t klovrp_GetUserEyeHeight2(float *out) {
+    ovrp_hit("ovrp_GetUserEyeHeight2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    float h = kl_env_float("KL_OVRP_EYE_HEIGHT", 1.6f);
+    if (!(h > 0.0f && h < 3.0f)) h = 1.6f;
+    *out = h;
+    return OVRP_SUCCESS;
 }
 
 // Fills four f32 fov tangents at out+0x08..+0x14 (0x9bcbd4). libunity divides
@@ -1323,6 +1521,21 @@ static uint64_t klovrp_GetTrackingOriginType2(int *out) {
     ovrp_hit("ovrp_GetTrackingOriginType2");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
     *out = g_tracking_origin;
+    return OVRP_SUCCESS;
+}
+
+// The pose of a tracking origin relative to the current tracking transform.
+// Real signature: (ovrpPosef* out, ovrpTrackingOrigin origin). Nothing has been
+// recentered here and there is one origin, so the honest answer is identity —
+// orientation (0,0,0,1), position (0,0,0). Liminal reaches this during Touch
+// controller/avatar setup once it recognises the Quest, and an unimplemented
+// entry point aborts.
+static uint64_t klovrp_GetTrackingTransformRelativePose(float *out, int origin) {
+    ovrp_hit("ovrp_GetTrackingTransformRelativePose");
+    (void)origin;
+    if (!out) return -1001;
+    out[0] = 0.0f; out[1] = 0.0f; out[2] = 0.0f; out[3] = 1.0f;  // orientation
+    out[4] = 0.0f; out[5] = 0.0f; out[6] = 0.0f;                 // position
     return OVRP_SUCCESS;
 }
 
@@ -1820,6 +2033,19 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     klovrp_derive_motion(&v, &g_head_hist, g_head_pose_time);
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
+    // Pose trace, once a second: the pushed head Y + tracking-origin frame
+    // (liminal's "floor drops" bug) and the head YAW (missioniss "can't look
+    // around" bug — if yaw does not move as the user turns, the rotation we feed
+    // the guest is frozen). Yaw from the quaternion, in degrees.
+    { static unsigned n; if (n == 0 || n % 90 == 0) {
+        float yaw = atan2f(2.0f*(qw*qy + qx*qz), 1.0f - 2.0f*(qy*qy + qz*qz))
+                    * (180.0f/3.14159265358979f);
+        float pitch = asinf(2.0f*(qw*qx - qy*qz)) * (180.0f/3.14159265358979f);
+        fprintf(stderr, "  [ovrp] head Y=%.3f yaw=%.1f pitch=%.1f  origin=%d "
+                        "(0=eye,1=floor,2=stage) eye_height=%.3f\n",
+                py, yaw, pitch, kl_ovrp_tracking_origin(), kl_ovrp_eye_height());
+        n++;
+    } else n++; }
 }
 
 // The frontend's question — "where is the head NOW" — so it reads the published
@@ -1867,6 +2093,8 @@ static klovrp_pose g_render_sample;
 
 static uint64_t klovrp_Update2(int step, int frame_index, double prediction) {
     ovrp_hit("ovrp_Update2");
+    { static unsigned n; if (n < 48 || n % 600 == 0)
+        fprintf(stderr, "  [ovrp] frameloop Update2 #%u step=%d\n", n, step); n++; }
     (void)frame_index; (void)prediction;
     int ix = klovrp_step_ix(step);
 
@@ -2175,6 +2403,11 @@ static uint64_t klovrp_BeginFrame(int guest_frame_index) {
 static uint64_t klovrp_BeginFrame4(int guest_frame_index, uint64_t extra) {
     ovrp_hit("ovrp_BeginFrame4");
     (void)extra;
+    { static unsigned n; if (n < 48 || n % 300 == 0) {
+        uint64_t tid=0; pthread_threadid_np(NULL,&tid);
+        fprintf(stderr, "  [ovrp] frameloop BeginFrame4 #%u frameIdx=%d tid=%llu\n",
+                n, guest_frame_index, (unsigned long long)tid);
+      } n++; }
     return klovrp_begin_frame_impl(guest_frame_index);
 }
 
@@ -2457,7 +2690,23 @@ static unsigned g_vk_frame;
 static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submits,
                                  int layer_submit_count, void *sync) {
     ovrp_hit("ovrp_EndFrame4");
-    (void)sync;
+    { static unsigned n; if (n < 48 || n % 300 == 0) {
+        uint64_t tid=0; pthread_threadid_np(NULL,&tid);
+        fprintf(stderr, "  [ovrp] frameloop EndFrame4 #%u frameIdx=%d layers=%d "
+                "sync=%p tid=%llu\n",
+                n, guest_frame_index, layer_submit_count, sync,
+                (unsigned long long)tid);
+        // Phase Sync: AC Nexus logs "Phase sync hack is on", and under it the
+        // NEXT frame's start can wait on state this call is expected to service.
+        // Dump the object's first words once so the wait, if that is what it
+        // is, has a shape we can identify.
+        if (sync && n == 0) {
+            const uint64_t *w = (const uint64_t *)sync;
+            for (int i = 0; i < 8; i++)
+                fprintf(stderr, "  [ovrp]   sync[+%2d] %#018llx\n", i*8,
+                        (unsigned long long)w[i]);
+        }
+      } n++; }
     if (!layer_submits && layer_submit_count) return OVRP_FAIL_INVALID_PARAM;
     klovrp_census_submits(layer_submits, layer_submit_count);
 // The list of everything that is NOT the eye layer, for the compositors.
@@ -2818,6 +3067,18 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
                                   float index_trigger, float hand_trigger,
                                   float stick_x, float stick_y) {
     if ((unsigned)hand > 1) return;
+    // Bounded change-log: every button-word TRANSITION, so "I pressed A and
+    // nothing happened" splits into "the bit never arrived" (frontend mapping)
+    // vs "it arrived and the guest ignored it" (guest-side read). Always on -
+    // presses are rare, so this is a handful of lines per session.
+    { static uint32_t last[2] = { 0xffffffffu, 0xffffffffu };
+      static unsigned n;
+      if (buttons != last[hand] && n < 400) { n++;
+          fprintf(stderr, "  [input] hand %d buttons %#x -> %#x (trig %.2f grip %.2f)\n",
+                  hand, last[hand] == 0xffffffffu ? 0 : last[hand], buttons,
+                  (double)index_trigger, (double)hand_trigger);
+          last[hand] = buttons;
+      } }
     g_input[hand].buttons = buttons;
     g_input[hand].touches = touches;
     g_input[hand].neartouches = touches;   // capacitive proximity ~ touch
@@ -2825,6 +3086,43 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
     g_input[hand].hand_trigger = hand_trigger;
     g_input[hand].stick_x = stick_x;
     g_input[hand].stick_y = stick_y;
+
+    // RIGHT Options button (PSVR2 Sense) -> a console command, on the press edge.
+    // Reaches us as the BACK bit on the right hand (system/click). Default (hl1)
+    // skips past the broken intro to the first real level, c1a0 (Anomalous
+    // Materials): the intro guard's Sector C door is stuck (its scripted chain
+    // never fires on the seamless transition) and this build has no working escape
+    // from it — ent_fire is unregistered and noclip isn't honored by the VR
+    // locomotion; changelevel is. KL_XASH_GRIP_CMD overrides the whole command.
+    if (hand == 1) {
+        static int prev = 0;
+        int now = (buttons & KL_OVRP_RAW_BACK) ? 1 : 0;
+        if (now && !prev) {
+            extern const char *kl_driver_target_name(void);
+            extern void        kl_xash_console_cmd(const char *);
+            const char *t = kl_driver_target_name();
+            const char *cmd = getenv("KL_XASH_GRIP_CMD");
+            if (!cmd && t && !strcmp(t, "hl1")) cmd = "changelevel c1a0\n";
+            if (cmd) kl_xash_console_cmd(cmd);
+        }
+        prev = now;
+    }
+    // LEFT Create button (menu/click -> START, left hand): open/close the game menu.
+    // The guest's own START->menu path isn't surfacing the menu here, so inject
+    // `escape` (CL_Escape_f toggles it). KL_XASH_MENU_CMD overrides.
+    if (hand == 0) {
+        static int mprev = 0;
+        int mnow = (buttons & KL_OVRP_RAW_START) ? 1 : 0;
+        if (mnow && !mprev) {
+            extern const char *kl_driver_target_name(void);
+            extern void        kl_xash_console_cmd(const char *);
+            const char *t = kl_driver_target_name();
+            const char *cmd = getenv("KL_XASH_MENU_CMD");
+            if (!cmd && t && !strcmp(t, "hl1")) cmd = "escape\n";
+            if (cmd) kl_xash_console_cmd(cmd);
+        }
+        mprev = mnow;
+    }
 }
 
 // --- KL_OVRP_POKE: a scripted controller sequence ---------------------------
@@ -3052,17 +3350,32 @@ static void klovrp_dump_vrdevice(void) {
     void *obj = *(void **)(base + 0x127a000 + 1728);
     if (!obj) return;                    // not built yet — try again next frame
     done = 1;
-    const uint32_t *w = obj;
+    // The 0x127a000+1728 offset is HARDCODED for one specific libunity build. On
+    // any other build it reads a garbage `obj`, and walking it faults (this is
+    // exactly what crashed AC Nexus when KL_FULL wrongly armed this diagnostic).
+    // So probe every read through vm_read_overwrite, which returns an error rather
+    // than faulting on an unmapped address — the diagnostic degrades to a one-line
+    // "not this build" note instead of taking the process down.
+    uint32_t hdr[3];
+    vm_size_t got = 0;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)obj, sizeof hdr,
+                          (vm_address_t)hdr, &got) != KERN_SUCCESS || got != sizeof hdr) {
+        fprintf(stderr, "  [ovrp] VRDevice %p: unreadable — not this libunity build\n", obj);
+        return;
+    }
     fprintf(stderr, "  [ovrp] VRDevice %p: idLeft=%u idRight=%u idHmd=%u\n",
-            obj, w[0], w[1], w[2]);
+            obj, hdr[0], hdr[1], hdr[2]);
 // Name every function-pointer slot by matching it against what we handed
     // back from kl_ovrp_sym. This is the VRDevice's whole contract with the
     // plugin in one place: which entry point sits behind each `ldr x8, [x?,
     // #N] / blr x8` in the disassembly, so a status predicate we answer wrong
     // can be found by name instead of by chasing offsets.
-    void *const *slot = (void *const *)obj;
+    void *slots[768 / 8];
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)obj, sizeof slots,
+                          (vm_address_t)slots, &got) != KERN_SUCCESS || got != sizeof slots)
+        return;
     for (size_t off = 0; off + 8 <= 768; off += 8) {
-        void *fn = slot[off / 8];
+        void *fn = slots[off / 8];
         if (!fn) continue;
         for (unsigned i = 0; i < g_nsym; i++)
             if (g_sym[i].ptr == fn) {
@@ -3135,8 +3448,16 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
         eye = klovrp_eye_cant() ? klovrp_qmul(&head, g_eye_rot[node]) : head;
         eye.px = head.px + ox; eye.py = head.py + oy; eye.pz = head.pz + oz;
         p = &eye;
-    } else if (node == 3 || node == 4) {
-        int h = node - 3;
+    } else if (node == 3 || node == 4 || node == 12 || node == 13) {
+        // HandLeft/HandRight (3/4) AND ControllerLeft/ControllerRight (12/13).
+        // Both name the same physical thing on this platform: the controller we
+        // synthesise from hand tracking (or a Sense accessory). A Unity title
+        // reads its controller pose from the HAND nodes; UE5's Meta XR plugin
+        // (olar) reads it from the CONTROLLER nodes. When only 3/4 were mapped,
+        // node 12/13 fell through to `p = &head` below — so olar's controllers
+        // were pinned to the head pose and moved only when the head moved,
+        // while the aim/select the guest built on them never tracked the hands.
+        int h = (node == 3 || node == 12) ? 0 : 1;
         // KL_OVRP_HANDS_IN_VIEW=1: park both hands at a fixed spot well inside
         // the *current head's* frustum, overriding whatever the frontend last
         // wrote. Answers one question and only one — does the guest draw
@@ -3227,8 +3548,13 @@ static uint64_t klovrp_GetNodePoseState3(int a, int b, int c, void *out) {
 static void (*g_frame_pacer)(void);
 void kl_ovrp_set_frame_pacer(void (*wait)(void)) { g_frame_pacer = wait; }
 
-static uint64_t klovrp_WaitToBeginFrame(void) {
+static uint64_t klovrp_WaitToBeginFrame(long frame_index) {
     ovrp_hit("ovrp_WaitToBeginFrame");
+    { static unsigned n; if (n < 48 || n % 300 == 0) {
+        uint64_t tid=0; pthread_threadid_np(NULL,&tid);
+        fprintf(stderr, "  [ovrp] frameloop WaitToBeginFrame #%u frameIdx=%ld tid=%llu\n",
+                n, frame_index, (unsigned long long)tid);
+      } n++; }
     if (g_frame_pacer) {
         g_frame_pacer();
 // Here rather than at BeginFrame, and for the reason kl_ovrp_frame_latch
@@ -3238,8 +3564,10 @@ static uint64_t klovrp_WaitToBeginFrame(void) {
         // from a pose the record does not carry.
         kl_ovrp_frame_latch();
     }
-    static uint64_t next;   // first issued id is 1 — the caller's 0 is identity
-    return next++;
+    // The CAPI return is an ovrpResult, not a frame id — the frame index is the
+    // CALLER's input. Returning a counter here read as success only by luck
+    // (positive ovrpResults are success variants); say success plainly.
+    return OVRP_SUCCESS;
 }
 
         // ovrpVector3f by value — a 12-byte HFA, so the floats go home in s0..s2,
@@ -3324,7 +3652,7 @@ static float klovrp_fake_trigger(void) {
 }
 
 static void fill_controller_state(int mask, void *out, int version) {
-    memset(out, 0, version == 4 ? 0x60 : version == 2 ? 0x40 : 0x30);
+    memset(out, 0, version >= 4 ? 0x60 : version == 2 ? 0x40 : 0x30);
     uint32_t m = (uint32_t)mask;
     if (m & OVRP_CTRL_ACTIVE) m |= OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH;
     uint32_t conn = m & (OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH);
@@ -3359,6 +3687,16 @@ static void fill_controller_state(int mask, void *out, int version) {
         if (version >= 2) { f[14] = in[1].stick_x; f[15] = in[1].stick_y; }
         if (version >= 4) b[0x41] = 100;                // RBatteryPercentRemaining
     }
+    // Thumbstick values, logged when non-zero (no flag) so a turning problem is
+    // visible: the guest reads the RIGHT stick (f[10]=x, f[11]=y) for turning.
+    // Throttled to one line per ~90 non-zero polls.
+    if (f[8] != 0.0f || f[9] != 0.0f || f[10] != 0.0f || f[11] != 0.0f) {
+        static unsigned tn;
+        if ((tn++ % 90) == 0)
+            fprintf(stderr, "  [ctrl] thumbstick L(%.2f,%.2f) R(%.2f,%.2f) "
+                    "buttons=0x%x\n", (double)f[8], (double)f[9],
+                    (double)f[10], (double)f[11], w[1]);
+    }
     w[1] |= fake;                                       // Buttons
     w[2] |= fake;                                       // Touches
     if (fake_trig > 0.0f) {
@@ -3367,12 +3705,34 @@ static void fill_controller_state(int mask, void *out, int version) {
     }
 }
 
+// KL_OVRP_VERBOSE: trace controller-state polls so a single run shows whether
+// OVRInput polls per-frame or once, and exactly what ConnectedControllers we
+// hand back for each mask. The connection bug hunt (Liminal falls to its GearVR
+// gaze profile because it reads no hands connected) needs the frequency AND the
+// value, and the guest's own log only shows first-seen.
+static void ctrl_state_log(const char *name, int mask, void *out) {
+    static int verbose = -1;
+    if (verbose < 0) verbose = (int)kl_env_uint("KL_OVRP_VERBOSE", 0);
+    if (!verbose) return;
+    static unsigned total;
+    unsigned n = __atomic_add_fetch(&total, 1, __ATOMIC_RELAXED);
+    const uint32_t *w = (const uint32_t *)out;
+    // First 24 calls in full, then one line every 600 so a per-frame poll shows
+    // as a rising counter without flooding.
+    if (n <= 24 || (n % 600) == 0)
+        fprintf(stderr, "  [ctrl] #%u %s(mask=0x%x) -> Connected=0x%x Buttons=0x%x "
+                "LIdxTrig=%.2f RIdxTrig=%.2f\n",
+                n, name, (unsigned)mask, w[0], w[1],
+                (double)((const float *)out)[4], (double)((const float *)out)[5]);
+}
+
     // 64-byte ovrpControllerState2 by value via x8 (real plugin: stp q0..q3 of
 // zeros on the failure path).
 uint64_t klovrp_GetControllerState2_impl(int mask, void *out) {
     ovrp_hit("ovrp_GetControllerState2");
     ovrp_log_arg("ovrp_GetControllerState2", mask, __builtin_return_address(0));
     fill_controller_state(mask, out, 2);
+    ctrl_state_log("GetControllerState2", mask, out);
     return OVRP_SUCCESS;
 }
 
@@ -3383,6 +3743,33 @@ static uint64_t klovrp_GetControllerState4(int mask, void *out) {
     ovrp_hit("ovrp_GetControllerState4");
     ovrp_log_arg("ovrp_GetControllerState4", mask, __builtin_return_address(0));
     fill_controller_state(mask, out, 4);
+    ctrl_state_log("GetControllerState4", mask, out);
+    return OVRP_SUCCESS;
+}
+
+// Newest shape: ovrpControllerState5, (mask=w0, out=x1), plain ovrpResult. It is
+// ovrpControllerState4 with a longer tail (thumb-rest / stylus force, index
+// trigger curl/slide/force) used only by Touch Pro / stylus hardware. We share
+// the v4 fill: it zeroes and fills the common 0x60 prefix, and the v5-only tail
+// past 0x60 stays 0 — which is exactly right (no force, no curl on a plain Touch
+// mapping). The guest marshals the struct as a zero-initialised value type, so
+// leaving the tail untouched is safe and needs no assumption about its exact
+// size beyond it being >= 0x60. wrath2 / UE4 polls this one.
+static uint64_t klovrp_GetControllerState5(int mask, void *out) {
+    ovrp_hit("ovrp_GetControllerState5");
+    ovrp_log_arg("ovrp_GetControllerState5", mask, __builtin_return_address(0));
+    fill_controller_state(mask, out, 5);
+    ctrl_state_log("GetControllerState5", mask, out);
+    return OVRP_SUCCESS;
+}
+
+// ovrp_GetControllerState6 — the current OVRPlugin form (Red Matter 2). Same
+// call shape as 5; fill_controller_state's version arg selects the struct size.
+static uint64_t klovrp_GetControllerState6(int mask, void *out) {
+    ovrp_hit("ovrp_GetControllerState6");
+    ovrp_log_arg("ovrp_GetControllerState6", mask, __builtin_return_address(0));
+    fill_controller_state(mask, out, 6);
+    ctrl_state_log("GetControllerState6", mask, out);
     return OVRP_SUCCESS;
 }
 
@@ -3392,6 +3779,7 @@ uint64_t klovrp_GetControllerState_impl(int mask, void *out) {
     ovrp_hit("ovrp_GetControllerState");
     ovrp_log_arg("ovrp_GetControllerState", mask, __builtin_return_address(0));
     fill_controller_state(mask, out, 1);
+    ctrl_state_log("GetControllerState", mask, out);
     return OVRP_SUCCESS;
 }
 
@@ -4221,19 +4609,31 @@ static uint32_t klovrp_gl_format(int ovrp_fmt, const char **name) {
 // passes only 0 (separate 2D textures per eye) or 3 (one 2D array, two slices);
 // this title asks for 0, measured.
 #define KLOVRP_SHAPE_EYEFOV   3
-#define KLOVRP_LAYOUT_STEREO  0
-#define KLOVRP_LAYOUT_ARRAY   3
+#define KLOVRP_LAYOUT_STEREO     0
+#define KLOVRP_LAYOUT_DOUBLEWIDE 2
+#define KLOVRP_LAYOUT_ARRAY      3
 
-// One entry per layer the provider sets up: the eye layer, and the 1x1 dummy
-// layer it makes afterwards on GLES. Four slots for two layers, because a
-// display-subsystem restart destroys and recreates both.
-#define KLOVRP_MAX_LAYERS 4
+// One entry per layer the provider sets up. Warmup guests (Beat Saber, RE4)
+// make just an eye layer and a 1x1 dummy, so four slots were plenty. AC Nexus
+// is the other shape: at the MENU it builds a whole set of OVROverlay UI panels
+// (measured: ~11 concurrent quad sizes plus two Equirect layers), and with only
+// four slots ovrp_SetupLayer failed from the third onward, returning
+// OVRP_FAIL_INVALID_PARAM. The guest never got layer ids for its menu, retried
+// SetupLayer every frame (thousands of times), and never reached a real
+// ovrp_EndFrame4 - the render loop stalled on one submitted frame and the eye
+// stayed frozen black. Real Quest OVRPlugin allows ~15; 32 gives headroom so
+// the geometry-keyed reuse below does not thrash.
+#define KLOVRP_MAX_LAYERS 64
 static struct klovrp_layer {
     int      id;                                  // 0 = free; ids start at 1
     ovrp_layer_desc_eyefov desc;                  // as ovrp_SetupLayer received it
     uint32_t tex[KLOVRP_MAX_STAGES][2];           // GL names, per stage per eye
     int      is_eye;                              // eye layer, or the dummy
     int      used;                                // this slot has been set up before
+    int      prev_id;                             // the id this slot answered to
+                                                  // before its last destroy — what
+                                                  // lets a Vulkan reuse find the
+                                                  // old id's images (see SetupLayer)
 } g_layers[KLOVRP_MAX_LAYERS];
 static int g_next_layer_id = 1;
 // The size the eye storage currently IS, as opposed to what any layer's desc
@@ -4248,6 +4648,51 @@ static struct klovrp_layer *klovrp_layer(int id) {
     for (int i = 0; i < KLOVRP_MAX_LAYERS; i++)
         if (g_layers[i].id == id) return &g_layers[i];
     return NULL;
+}
+
+// --- Loading-video skybox (AC Nexus) -------------------------------------
+// AC Nexus paints its loading environment as a looping VIDEO on an OVROverlay
+// Equirect layer (shape 5), fed by an Android MediaPlayer Surface that does
+// not exist on visionOS - so the guest's own texture for it is the wild handle
+// the kl_vulkan guard refuses, and the background renders as nothing. We cannot
+// reproduce the Android decode, so the HOST plays the same mp4 itself
+// (KleptonCompositor's LoadingVideoPlayer) onto the equirect the compositor
+// already knows how to draw. The trigger is simply whether an Equirect layer is
+// currently live: while the guest is loading (or stuck in shader warmup) the
+// layer stays and the loading screen stays, and when the guest finishes it
+// destroys the layer, g_loadvid_active clears, and the world shows through.
+static int g_loadvid_active;
+static int g_loadvid_suppressed;   // the guest asked to hide the loading screen
+static void kl_loadvid_recount(void) {
+    int any = 0;
+    for (int i = 0; i < KLOVRP_MAX_LAYERS; i++)
+        if (g_layers[i].id && !g_layers[i].is_eye && g_layers[i].desc.shape == 5) {
+            any = 1; break;
+        }
+    if (any != g_loadvid_active)
+        fprintf(stderr, "  [ovrp] loading-video skybox %s (an Equirect layer is %s)\n",
+                any ? "ON" : "OFF", any ? "live" : "gone");
+    g_loadvid_active = any;
+}
+// Swift-facing: 1 while the guest has a live Equirect loading layer.
+int kl_loadingvideo_active(void) {
+    // KL_LOADVID_OFF=1: force the loading skybox OFF regardless of whether the
+    // Equirect loading layer is still live. AC Nexus never destroys that layer
+    // once the menu is up, so the skybox stays painted over the (working) menu
+    // overlays. This knob lets a run reveal the menu behind it without a rebuild;
+    // the proper fix is to deactivate the skybox when the menu is being submitted.
+    if (kl_env_on("KL_LOADVID_OFF", 0)) return 0;
+    return g_loadvid_active;
+}
+// The guest's LoadingScreen.stopUpdatingLoadingScreen() - it wants the loading
+// screen gone, so hide the skybox and reveal whatever the eye now holds (the
+// menu, if it renders). A later show - a fresh Equirect SetupLayer - lifts this.
+void kl_loadingvideo_stop(void) {
+    // Deliberately a no-op for the skybox: AC Nexus calls this on every
+    // loading-phase transition, not once at the end, so acting on it hid the
+    // backdrop mid-load and uncovered the still-black eye. The skybox stays
+    // tied to the Equirect layer's lifetime instead. (void)g_loadvid_suppressed.
+    (void)g_loadvid_suppressed;
 }
 
 // ---------------------------------------------------------------------------
@@ -4361,10 +4806,56 @@ _Static_assert(sizeof(ovrp_recti) == 0x10, "recti");
 // submit the guest built as a union is in bounds. Printed rather than acted on:
 // nothing composites overlay layers yet, and a pose without a size cannot place
 // a quad, so this is what the next step is built from.
+//
+// ...and 0xb0 is only where RE4's union arm starts. The header grew: the
+// OVRPlugin wrath2's UE4 was built against carries the blend-factor triple
+// (OverrideBlendFactors, Src, Dst — the has_blend_factors/src/dst fields our
+// own struct got from libOculusXRPlugin's DWARF) INSIDE the common header, so
+// its Quad.Size lands at +0xbc. Read out of wrath2's own
+// FLayer::UpdateLayer_RHIThread (0x9c6137c): the Quad arm stores at
+// submit+0xbc/+0xc0, the Cylinder arm at +0xbc/+0xc0/+0xc4, where RE4's
+// ImportLayerSubmit reads +0xb0. Nothing in the submit SAYS which build wrote
+// it, so it is told apart by what the bytes can be: a real quad size is a pair
+// of plausible positive floats, and the blend triple is a bool and two small
+// enums — bit patterns that read as denormals (~1e-44), never as metres. The
+// verdict is latched for the run (the layout is a compile-time property of the
+// guest), and until a submit decides it, a zero size is handed on — which is
+// exactly what the undecidable submit carries at both offsets anyway.
+static int klovrp_quad_size_off;    // 0 = undecided; else 0xb0 or 0xbc
+
+static int klovrp_plausible_metres(float v) {
+    return v > 1e-3f && v < 1e5f;   // NaN/inf fail both compares
+}
+static void klovrp_quad_size(const ovrp_layer_submit *s, float out[2]) {
+    const unsigned char *base = (const unsigned char *)s;
+    float b0[2], bc[2];
+    unsigned int w0[3];
+    memcpy(b0, base + 0xb0, sizeof b0);
+    memcpy(bc, base + 0xbc, sizeof bc);
+    memcpy(w0, base + 0xb0, sizeof w0);
+    if (!klovrp_quad_size_off) {
+        int old_fits = klovrp_plausible_metres(b0[0]) && klovrp_plausible_metres(b0[1]);
+        int new_fits = klovrp_plausible_metres(bc[0]) && klovrp_plausible_metres(bc[1])
+                       && w0[0] <= 1 && w0[1] <= 32 && w0[2] <= 32;
+        if (old_fits == new_fits) { out[0] = out[1] = 0.0f; return; }   // undecidable
+        klovrp_quad_size_off = old_fits ? 0xb0 : 0xbc;
+        fprintf(stderr, "  [ovrp] layer submit union starts at +0x%x — the guest's "
+                        "OVRPlugin header %s the blend-factor triple (quad size "
+                        "%.3fx%.3f m)\n",
+                klovrp_quad_size_off, old_fits ? "predates" : "carries",
+                old_fits ? b0[0] : bc[0], old_fits ? b0[1] : bc[1]);
+    }
+    const float *q = klovrp_quad_size_off == 0xb0 ? b0 : bc;
+    out[0] = q[0]; out[1] = q[1];
+}
 static void klovrp_probe_submit_tail(const ovrp_layer_submit *s) {
-    const float *q = (const float *)((const unsigned char *)s + 0xb0);
-    fprintf(stderr, "          union +0xb0: %.4f %.4f  "
-                    "(ovrpLayerSubmitQuad.Size, metres)\n", q[0], q[1]);
+    const float *q0 = (const float *)((const unsigned char *)s + 0xb0);
+    const float *q1 = (const float *)((const unsigned char *)s + 0xbc);
+    fprintf(stderr, "          union +0xb0: %.4f %.4f  +0xbc: %.4f %.4f  "
+                    "(ovrpLayerSubmitQuad.Size, metres; layout latched %s)\n",
+            q0[0], q0[1], q1[0], q1[1],
+            klovrp_quad_size_off == 0xb0 ? "+0xb0"
+            : klovrp_quad_size_off == 0xbc ? "+0xbc" : "undecided");
 }
 
 // ovrpShape, from the guest's own enum. The names are in libOculusXRPlugin's
@@ -4464,11 +4955,62 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
     for (int i = 0; list && i < count && n < KLOVRP_MAX_LAYERS; i++) {
         const ovrp_layer_submit *s = list[i];
         if (!s) continue;
+        // Raw submit dump (KL_OVRP_SUBMIT_DUMP, default on): overlays land at
+        // impossible positions on some guests (wrath2: 0,-9.5,-25) while others
+        // read fine (olar: 0,1.48,-0.9) from the SAME +0x28 pose / +0xbc size
+        // offsets — so those guests' ovrpLayerSubmit has a different field layout.
+        // Print the first 0xd0 bytes of a NON-eye submit once per layer as words
+        // + floats so the real pose(quat+xyz) and Quad size offsets are readable.
+        {
+            static int dumped, on = -1;
+            if (on < 0) on = kl_env_on("KL_OVRP_SUBMIT_DUMP", 1);
+            struct klovrp_layer *dl = klovrp_layer(s->layer_id);
+            if (on && dumped < 6 && dl && !dl->is_eye) {
+                dumped++;
+                const unsigned char *b = (const unsigned char *)s;
+                fprintf(stderr, "  [ovrp] SUBMIT DUMP layer %d (%d bytes shown):\n",
+                        s->layer_id, 0xd0);
+                for (int off = 0; off < 0xd0; off += 16) {
+                    unsigned int w[4]; float f[4];
+                    memcpy(w, b + off, sizeof w); memcpy(f, b + off, sizeof f);
+                    fprintf(stderr, "    +0x%02x: %08x %08x %08x %08x | "
+                            "%.4g %.4g %.4g %.4g\n", off,
+                            w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]);
+                }
+            }
+        }
         struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        int effective_id = s->layer_id;
+        if (!l) {
+            // A submit can outlive its layer. UE4 destroys the toast layer and
+            // sets up its replacement on the game thread while the RHI thread
+            // goes on submitting the OLD id for a few more frames — wrath2's
+            // "compiling shaders" toast does this once a second, and dropping
+            // those submits blinked the toast off for exactly those frames.
+            // The slot remembers the id it answered to (prev_id, kept for the
+            // Vulkan rekey), so the stale submit is filed against the slot's
+            // storage instead of the floor. Which id reaches the compositor
+            // follows the rekey: once the slot is set up again its images
+            // answer to the NEW id; between destroy and setup they still
+            // answer to the old one.
+            for (int k = 0; k < KLOVRP_MAX_LAYERS; k++)
+                if (g_layers[k].used && g_layers[k].prev_id == s->layer_id) {
+                    l = &g_layers[k];
+                    if (l->id) effective_id = l->id;
+                    break;
+                }
+            if (l) {
+                static unsigned bridged;
+                if (bridged++ % 128 == 0)
+                    fprintf(stderr, "  [ovrp] overlay submit for destroyed layer %d "
+                                    "bridged to its slot (now layer %d, %u so far)\n",
+                            s->layer_id, l->id, bridged);
+            }
+        }
         if (!l || l->is_eye) continue;
         kl_ovrp_overlay *o = &tmp[n++];
         memset(o, 0, sizeof *o);
-        o->layer_id = s->layer_id;
+        o->layer_id = effective_id;
         o->shape    = l->desc.shape;
         o->stage    = s->texture_stage;
         o->tex_w    = l->desc.texture_size.w;
@@ -4488,18 +5030,60 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
         // backs a non-eye layer with anything a compositor can sample today
         // (kl_vulkan_layer_mtl_texture), and Vulkan's origin is the top left.
         o->origin_top_left = kl_vulkan_guest_active();
-// The quad's world size, out of the union's own arm. The OFFSET is read
-// from Compositor::ImportLayerSubmit rather than from our struct's end
-        // — see klovrp_probe_submit_tail, which is where that measurement lives.
-        if (o->shape == 0) {
-            const float *q = (const float *)((const unsigned char *)s + 0xb0);
-            o->size[0] = q[0];
-            o->size[1] = q[1];
+// The quad's world size, out of the union's own arm — which starts at
+        // +0xb0 or +0xbc depending on which OVRPlugin the guest was built
+        // against. klovrp_quad_size tells them apart and latches; see it.
+        if (o->shape == 0)
+            klovrp_quad_size(s, o->size);
+        // Back a GLES non-eye layer with something a compositor can sample.
+        // The Vulkan half is already handled — o is read back through
+        // kl_vulkan_layer_mtl_texture in encodeOverlays — but on GLES nothing
+        // here ever gave the quad's guest texture MTLTexture storage, so
+        // kl_glfb_layer_mtl_texture answered NULL and the panel was dropped
+        // ("no MTLTexture — not composited"): twd2's entire menu. COPY the
+        // guest's presented texture into storage of ours (kl_glfb_mirror_layer),
+        // NOT the eye path's re-point — re-pointing a live-attached quad texture
+        // broke a guest's rendering outright (see kl_glfb.h). This runs on the
+        // guest's own RHI/submit thread, so its GL context is current for the
+        // blit, exactly as the OpenXR path's klxr_back_layer_images relies on.
+        if (!kl_vulkan_guest_active() && kl_glfb_has_mtl_layer_provider() &&
+            (unsigned)o->stage < KLOVRP_MAX_STAGES) {
+            uint32_t gtex = l->tex[o->stage][0];
+            if (gtex) {
+                const char *fn = NULL;
+                uint32_t gf = klovrp_gl_format(l->desc.format, &fn);
+                if (!gf) gf = KL_OVRP_TEXFMT_EYE;
+                kl_glfb_mirror_layer(effective_id, o->stage, gtex, -1,
+                                     l->desc.texture_size.w,
+                                     l->desc.texture_size.h, gf);
+            }
         }
     }
+    // Overlay PERSISTENCE. The guest submits its overlay layers intermittently:
+    // wrath2's "compiling shaders" toast is destroyed+recreated about once a
+    // second and only ~1 frame in 4 carries it (EndFrame4 alternates layers=1 /
+    // layers=2), and olar's menu does the same. Replacing the set wholesale each
+    // frame therefore blinks the panel off on every gap — the "flashing". So when
+    // a frame carries FEWER overlays than the set we are already showing, keep the
+    // fuller set for a short TTL instead of dropping to the smaller one; a
+    // transient drop (recreation, half-rate submit) then never reaches the screen,
+    // while a real removal still clears once the TTL lapses. The bridging above
+    // handles a submit that NAMES a destroyed layer; this handles a frame that
+    // omits it entirely. KL_OVRP_OVERLAY_PERSIST=0 restores strict per-frame.
+    static int persist = -1;
+    if (persist < 0) persist = kl_env_on("KL_OVRP_OVERLAY_PERSIST", 1);
+    enum { KLOVRP_OVERLAY_TTL = 12 };   // frames a dropped overlay is held for
     pthread_mutex_lock(&g_frames.mu);
-    memcpy(g_overlays.v, tmp, sizeof tmp);
-    g_overlays.n = n;
+    static unsigned rec_frame, last_take;
+    rec_frame++;
+    if (persist && n < g_overlays.n && (rec_frame - last_take) < KLOVRP_OVERLAY_TTL) {
+        // Keep the fuller set we are already showing — this frame's drop is
+        // transient. g_overlays is left untouched.
+    } else {
+        memcpy(g_overlays.v, tmp, sizeof tmp);
+        g_overlays.n = n;
+        last_take = rec_frame;
+    }
     pthread_mutex_unlock(&g_frames.mu);
 }
 
@@ -4517,6 +5101,23 @@ void kl_ovrp_overlays_external(const kl_ovrp_overlay *v, int n) {
                     n, KLOVRP_MAX_LAYERS);
         }
         n = KLOVRP_MAX_LAYERS;
+    }
+    // KL_OVERLAY_PERSIST: while the guest cycles its loading screen it submits
+    // frames of only Equirect (shape 5) layers, which the compositor skips -
+    // leaving the view black between the brief menu frames (flash-then-black).
+    // Keep the last set that HAD a compositable Quad instead of replacing it with
+    // an all-equirect or empty one, so the menu stays up. Off by default so no
+    // other target regresses.
+    static int persist = -1;
+    if (persist < 0) persist = kl_env_on("KL_OVERLAY_PERSIST", 0);
+    if (persist) {
+        int quads = 0;
+        // Non-head-locked, because layer 3 is a head-locked full-view cover the
+        // guest keeps submitting during loading; the compositor skips it under
+        // KL_OVERLAY_SKIP_HEADLOCKED, so counting it as "has content" would let
+        // an all-cover frame blank the real world-locked menu behind it.
+        for (int i = 0; i < n; i++) if (v && v[i].shape == 0 && !v[i].head_locked) { quads = 1; break; }
+        if (!quads) return;   // keep whatever is already published
     }
     pthread_mutex_lock(&g_frames.mu);
     if (n && v) memcpy(g_overlays.v, v, (size_t)n * sizeof *v);
@@ -4892,10 +5493,32 @@ static uint64_t klovrp_SetupLayer(void *device, const ovrp_layer_desc_eyefov *de
     for (int i = 0; i < KLOVRP_MAX_LAYERS && !l; i++)
         if (!g_layers[i].id) { l = &g_layers[i]; memset(l, 0, sizeof *l); }
     if (!l) {
-        fprintf(stderr, "  [ovrp] SetupLayer: all %d layer slots are live — this "
-                        "guest creates two (an eye layer and a 1x1 dummy)\n",
-                KLOVRP_MAX_LAYERS);
-        return OVRP_FAIL_INVALID_PARAM;
+        // Table full and nothing freed. AC Nexus re-creates its overlay set on
+        // every loading phase without ever destroying the old layers (measured:
+        // zero DestroyLayer/EnqueueDestroyLayer calls), so a hard failure here
+        // meant the guest could not finish setting up and the render loop never
+        // reached ovrp_EndFrame4 - the eye froze on frame 1. Recycle the OLDEST
+        // non-eye layer (the earliest phase's orphans go first; the current
+        // menu's newest layers are kept) so SetupLayer never fails. The eye
+        // layer is never evicted.
+        struct klovrp_layer *oldest = NULL;
+        for (int i = 0; i < KLOVRP_MAX_LAYERS; i++) {
+            struct klovrp_layer *c = &g_layers[i];
+            if (c->is_eye || !c->id) continue;
+            if (!oldest || c->id < oldest->id) oldest = c;
+        }
+        if (!oldest) {
+            fprintf(stderr, "  [ovrp] SetupLayer: all %d slots are eye layers - "
+                            "cannot recycle\n", KLOVRP_MAX_LAYERS);
+            return OVRP_FAIL_INVALID_PARAM;
+        }
+        static unsigned evicted;
+        if (evicted++ % 64 == 0)
+            fprintf(stderr, "  [ovrp] SetupLayer: table full, recycling oldest "
+                            "non-eye layer %d (%u evictions so far)\n",
+                    oldest->id, evicted);
+        l = oldest;
+        memset(l, 0, sizeof *l);
     }
     // Ids start at 1 and never repeat: 0 is what an out-slot the guest zeroed
     // already holds, so an id indistinguishable from "never set" is a class of
@@ -4906,6 +5529,17 @@ static uint64_t klovrp_SetupLayer(void *device, const ovrp_layer_desc_eyefov *de
     l->is_eye = is_eye;
     l->used   = 1;
     *layer_id = l->id;
+    // Make the reuse REAL on the Vulkan path. The slot's GL names survive in
+    // l->tex, but a Vulkan guest's storage lives in kl_vulkan's layer-image
+    // table, keyed by the id — which just changed. Left alone, the new id
+    // allocates a fresh, empty VkImage, the guest submits it before it has
+    // drawn a pixel, and the compositor faithfully composites nothing: wrath2
+    // recreates its "compiling shaders" toast on every text update, and each
+    // recreate blinked the toast off for the frames the new image spent empty.
+    // Re-keying hands the new id the old id's image — still holding the
+    // previous picture, which is the exact behaviour the GL half already has.
+    if (reused && !is_eye && l->prev_id && kl_vulkan_guest_active())
+        kl_vulkan_layer_rekey(l->prev_id, l->id);
     // Named by its SHAPE rather than as "dummy". Unity's one non-eye layer
     // really is a placeholder, and calling every other guest's overlays that
     // read as a spare: RE4's splash is a 900x900 Quad and the line said
@@ -4917,7 +5551,120 @@ static uint64_t klovrp_SetupLayer(void *device, const ovrp_layer_desc_eyefov *de
             desc->texture_size.w, desc->texture_size.h, desc->layout,
             desc->format, desc->sample_count,
             reused ? " (reusing the previous layer's textures)" : "");
+    kl_loadvid_recount();
     return OVRP_SUCCESS;
+}
+
+// ovrp_EnqueueSetupLayer2(desc, compositionDepth, layerId) - the older-ABI
+// sibling of ovrp_SetupLayer: the same job (turn a layer desc into an id and a
+// slot), with no device handle and a compositionDepth ordering hint this
+// compositor does not need - there is one eye layer and one dummy, and their
+// z-order is fixed here. AC Nexus's OVRPlugin build enqueues its layers this way
+// instead of calling ovrp_SetupLayer. It delegates to the same allocator so the
+// two entry points cannot end up describing a layer differently; the device arg
+// is only used for SetupLayer's log line, so NULL is fine.
+static uint64_t klovrp_EnqueueSetupLayer2(const ovrp_layer_desc_eyefov *desc,
+                                          int composition_depth, int *layer_id) {
+    ovrp_hit("ovrp_EnqueueSetupLayer2");
+    (void)composition_depth;
+    // ENABLED again, so AC Nexus's UI/menu OVROverlays (Quad layers) get a real
+    // swapchain and composite. Its video-background overlays still end up with
+    // uninitialised VkImage handles (no Android Surface here), but those no longer
+    // crash: the kl_vulkan image registry refuses any command handed a handle no
+    // create produced. So the UI shows and the video background is simply absent.
+    return klovrp_SetupLayer(NULL, desc, layer_id);
+}
+
+// ovrp_EnqueueSubmitLayer2 - THE per-frame overlay submit AC Nexus uses (~28k
+// calls/run, ~7-8 layers every frame). It was a benign no-op, so every overlay
+// the guest drew - its entire menu - was silently dropped and never composited,
+// which is why the eye stayed black while the game ran fine. Signature is
+// OVRPlugin 1.x, all args in x0-x7 on arm64:
+//   (uint flags, void* texL, void* texR, int layerId, int frameIndex,
+//    const ovrpPosef* pose, const ovrpVector3f* scale, int layerIndex)
+// Record each submitted non-eye layer into a per-frame set and publish it to the
+// compositor at the frame boundary. The boundary is detected two ways (a changed
+// frameIndex, or the same layer id appearing again) so it is robust even if the
+// frameIndex arg is not what this ABI guess assumes.
+static kl_ovrp_overlay g_enq[KLOVRP_MAX_LAYERS];
+static int g_enq_n;
+static int g_enq_frame = -0x7fffffff;
+static void klovrp_enq_flush(void) {
+    if (g_enq_n) kl_ovrp_overlays_external(g_enq, g_enq_n);
+    g_enq_n = 0;
+}
+static uint64_t klovrp_EnqueueSubmitLayer2(uint32_t flags, void *texL, void *texR,
+                                           int layer_id, int frame_index,
+                                           const float *pose, const float *scale,
+                                           int layer_index) {
+    ovrp_hit("ovrp_EnqueueSubmitLayer2");
+    // Log the SUBMITTED texture handles per layer (once each): if texL differs
+    // from the VkImage we handed out via GetLayerTexture2 for this layer, the
+    // guest is drawing its UI into ITS OWN texture and we are sampling an empty
+    // swapchain image — which would leave every panel composited black.
+    { static int seen[128]; static int nseen;
+      int known = 0; for (int i=0;i<nseen;i++) if (seen[i]==layer_id) { known=1; break; }
+      if (!known && nseen < 128) { seen[nseen++]=layer_id;
+        fprintf(stderr, "  [ovrp] EnqueueSubmit texL: layer=%d texL=%#llx texR=%#llx\n",
+                layer_id, (unsigned long long)(uintptr_t)texL,
+                (unsigned long long)(uintptr_t)texR); } }
+    (void)texL; (void)texR;
+    static int logged;
+    if (logged < 24) {
+        logged++;
+        struct klovrp_layer *ll = klovrp_layer(layer_id);
+        fprintf(stderr, "  [ovrp] EnqueueSubmitLayer2: layer=%d (%s) frame=%d "
+                "idx=%d flags=%#x pos=[%.2f %.2f %.2f] scale=[%.2f %.2f %.2f]\n",
+                layer_id, ll ? klovrp_shape_name(ll->desc.shape) : "?",
+                frame_index, layer_index, flags,
+                pose ? pose[4] : 0.f, pose ? pose[5] : 0.f, pose ? pose[6] : 0.f,
+                scale ? scale[0] : 0.f, scale ? scale[1] : 0.f, scale ? scale[2] : 0.f);
+    }
+    int dup = 0;
+    for (int i = 0; i < g_enq_n; i++) if (g_enq[i].layer_id == layer_id) { dup = 1; break; }
+    if (dup || frame_index != g_enq_frame) {
+        klovrp_enq_flush();
+        g_enq_frame = frame_index;
+    }
+    struct klovrp_layer *l = klovrp_layer(layer_id);
+    if (l && !l->is_eye && g_enq_n < KLOVRP_MAX_LAYERS) {
+        kl_ovrp_overlay *o = &g_enq[g_enq_n++];
+        memset(o, 0, sizeof *o);
+        o->layer_id = layer_id;
+        o->shape    = l->desc.shape;
+        o->stage    = 0;   // these layers are set up single-buffered at stage 0
+        o->tex_w    = l->desc.texture_size.w;
+        o->tex_h    = l->desc.texture_size.h;
+        if (pose)  memcpy(o->pose, pose, sizeof o->pose);
+        if (scale) { o->size[0] = scale[0]; o->size[1] = scale[1]; }
+        o->flags       = (int)flags;
+        o->head_locked = ((int)flags & KLOVRP_SUBMIT_HEAD_LOCKED) != 0;
+        o->origin_top_left = kl_vulkan_guest_active();
+        o->tex = (unsigned long long)(uintptr_t)texL;
+    }
+    // Diagnostic: every ~600 submits, dump the layer images' lit counts so we
+    // can see if the guest is drawing UI into them or submitting empties.
+    static unsigned cap;
+    if (++cap % 600 == 0) kl_vulkan_capture_layers();
+    return OVRP_SUCCESS;
+}
+
+// ovrp_SetOverlayQuad3 - the LEGACY per-frame quad-overlay submit from before
+// the Enqueue* ABI. Its CAPI return is ovrpBool, so 1 is "overlay applied". AC
+// Nexus reaches it once; with no handler the synthetic plugin aborts by name,
+// which is the signal-6 crash in this run. We deliberately do NOT decode its
+// arguments: the classic signature passes an ovrpPosef (28 bytes, > 16 so passed
+// indirectly) and an ovrpVector3f BY VALUE, and the exact packing is version-
+// sensitive - reading it wrong is its own crash. A no-argument handler leaves
+// every incoming arg untouched in its register and answers success, so the
+// guest's OVROverlay path does not disable itself. If a later full-menu run
+// shows this quad carries a panel we need, it can be routed into g_enq then.
+static uint64_t klovrp_SetOverlayQuad3(void) {
+    ovrp_hit("ovrp_SetOverlayQuad3");
+    static int once; if (!once) { once = 1;
+        fprintf(stderr, "  [ovrp] SetOverlayQuad3: legacy quad overlay acknowledged "
+                "(args not decoded) -> ovrpBool true\n"); }
+    return OVRP_TRUE;                       // ovrpBool
 }
 
 static uint64_t klovrp_DestroyLayer(int layer_id) {
@@ -4929,12 +5676,43 @@ static uint64_t klovrp_DestroyLayer(int layer_id) {
     // deleting a name the compositor is sampling is a worse failure than holding
     // it across a restart that is about to ask for the same layer again.
     // klovrp_SetupLayer above is the other half — it hands the same textures back.
-    if (l) l->id = 0;
+    if (l) { l->prev_id = l->id; l->id = 0; }
+    kl_loadvid_recount();
     return OVRP_SUCCESS;
+}
+
+// ovrp_EnqueueDestroyLayer(layerId) - the Enqueue-ABI sibling of DestroyLayer,
+// the teardown half of ovrp_EnqueueSetupLayer2. AC Nexus's menu drives its
+// OVROverlay panels this way: EnqueueSetupLayer2 to make one, EnqueueDestroyLayer
+// to free it. Without this handler the destroy was an unimplemented no-op, so
+// every panel the game freed kept its slot forever and the 32-slot table filled
+// in seconds - SetupLayer then failed for the rest of the run and the render
+// loop stalled. Frees the slot the same careful way DestroyLayer does (the
+// textures are kept for reuse, only the id is cleared).
+static uint64_t klovrp_EnqueueDestroyLayer(int layer_id) {
+    ovrp_hit("ovrp_EnqueueDestroyLayer");
+    return klovrp_DestroyLayer(layer_id);
 }
 
     // ovrp_GetLayerTextureStageCount(layerId, int* out) — real 0x16e160,
     // -1001 on a NULL second argument.
+// ovrp_GetLayerRecommendedResolution(int layerId, ovrpSizei* out) — signature
+// read from redmatter2's libOVRPlugin (x0=layerId, x1=out). The recommended
+// resolution IS the size we already put in the layer's desc; eye layers fall
+// back to the eye texture size. Red Matter 2 aborts on the missing entry point.
+static uint64_t klovrp_GetLayerRecommendedResolution(int layer_id, ovrp_sizei *out) {
+    ovrp_hit("ovrp_GetLayerRecommendedResolution");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    struct klovrp_layer *l = klovrp_layer(layer_id);
+    if (l && l->desc.texture_size.w > 0) {
+        *out = l->desc.texture_size;
+    } else {
+        int w = 0, h = 0; kl_ovrp_eye_texture_size(&w, &h);
+        out->w = w; out->h = h;
+    }
+    return OVRP_SUCCESS;
+}
+
 static uint64_t klovrp_GetLayerTextureStageCount(int layer_id, int *out) {
     ovrp_hit("ovrp_GetLayerTextureStageCount");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
@@ -4982,16 +5760,16 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
     if (l->is_eye && l->desc.layout == KLOVRP_LAYOUT_ARRAY &&
         kl_vulkan_guest_active() && kl_ovrp_multiview()) {
         /* served below */
-    } else if (l->is_eye && l->desc.layout != KLOVRP_LAYOUT_STEREO) {
+    } else if (l->is_eye && l->desc.layout != KLOVRP_LAYOUT_STEREO &&
+               l->desc.layout != KLOVRP_LAYOUT_DOUBLEWIDE) {
         static int said;
         if (!said) {
             said = 1;
             fprintf(stderr, "  [ovrp] GetLayerTexture2: layer %d asks for layout %d "
-                            "(%s); only %d (Stereo, one texture per eye) is "
+                            "(%s); only Stereo, DoubleWide and (Vulkan) Array are "
                             "implemented — refusing rather than binding the wrong "
                             "storage\n", layer_id, l->desc.layout,
-                    l->desc.layout == KLOVRP_LAYOUT_ARRAY ? "Array" : "?",
-                    KLOVRP_LAYOUT_STEREO);
+                    l->desc.layout == KLOVRP_LAYOUT_ARRAY ? "Array" : "?");
         }
         return OVRP_FAIL_UNSUPPORTED;
     }
@@ -5052,7 +5830,13 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
         return OVRP_SUCCESS;
     }
 
-    uint32_t *slot = &l->tex[stage][eye];
+    // DoubleWide (TWD2, UE4 GLES): both eyes are halves of ONE wide texture. Key
+    // the storage on a canonical eye (0) so a single texture is allocated, then
+    // register it under BOTH (eye, stage) keys below — the compositor already
+    // crops each eye by its own submit viewport (left half / right half), so a
+    // shared image plus the per-eye viewports it receives is the whole of it.
+    int canon = (l->is_eye && l->desc.layout == KLOVRP_LAYOUT_DOUBLEWIDE) ? 0 : eye;
+    uint32_t *slot = &l->tex[stage][canon];
     if (!*slot) {
         static void (*gl_GenTextures)(int32_t, uint32_t *);
         static void (*gl_BindTexture)(uint32_t, uint32_t);
@@ -5103,9 +5887,20 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
         // host run without one stays correct, so it reads as a compositor bug).
         int mtl_backed = 0;
         if (l->is_eye) {
-            kl_glfb_note_eye_texture(eye, stage, name);
+            kl_glfb_note_eye_texture(canon, stage, name);
             mtl_backed = kl_glfb_has_mtl_provider() &&
-                         kl_glfb_bind_eye_mtl_texture(eye, stage, name, w, h, glfmt);
+                         kl_glfb_bind_eye_mtl_texture(canon, stage, name, w, h, glfmt);
+            // DoubleWide: the guest fetches ONLY eye 0 (one wide texture holds both
+            // eyes), so eye 1 is never requested and the compositor would bind
+            // nothing for the right eye — which shows through as passthrough. Register
+            // the same wide texture for eye 1 now; the per-eye submit viewport crops
+            // each eye to its half.
+            if (l->desc.layout == KLOVRP_LAYOUT_DOUBLEWIDE) {
+                l->tex[stage][1] = name;
+                kl_glfb_note_eye_texture(1, stage, name);
+                if (kl_glfb_has_mtl_provider())
+                    kl_glfb_bind_eye_mtl_texture(1, stage, name, w, h, glfmt);
+            }
         }
         if (!mtl_backed && gl_BindTexture && gl_TexStorage2D) {
             gl_BindTexture(0x0DE1 /* GL_TEXTURE_2D */, name);
@@ -5121,6 +5916,22 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
                 l->is_eye ? "eye" : "dummy layer", eye, stage, name, w, h,
                 fname ? fname : "?", glfmt,
                 mtl_backed ? ", MTLTexture-backed" : "");
+    }
+    // DoubleWide: the requested eye differs from the canonical storage eye — make
+    // (eye, stage) point at the same wide texture so the compositor binds it for
+    // this eye too and crops it by this eye's viewport.
+    if (canon != eye) {
+        l->tex[stage][eye] = *slot;
+        kl_glfb_note_eye_texture(eye, stage, *slot);
+        if (kl_glfb_has_mtl_provider()) {
+            const char *fn = NULL;
+            uint32_t gf = klovrp_gl_format(l->desc.format, &fn);
+            if (!gf) gf = KL_OVRP_TEXFMT_EYE;
+            kl_glfb_bind_eye_mtl_texture(eye, stage, *slot,
+                l->desc.texture_size.w, l->desc.texture_size.h, gf);
+        }
+        fprintf(stderr, "  [ovrp] GetLayerTexture2: DoubleWide eye %d stage %d shares "
+                        "wide texture %u with eye 0\n", eye, stage, *slot);
     }
     *color = *slot;
     return OVRP_SUCCESS;
@@ -5152,6 +5963,66 @@ static uint64_t klovrp_GetLayerTextureFoveation(int layer_id, int stage, int eye
     if (!tex || !size) return OVRP_FAIL_INVALID_PARAM;
     *tex = 0;
     *size = 0;
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+// ovrp_GetLayerTextureSpaceWarp(layerId, stage, eye, uint64_t* motion,
+//                               uint64_t* depth) - the Application SpaceWarp
+// motion-vector + depth textures, GetLayerTextureFoveation's exact shape and
+// exact answer. ASW is frame extrapolation driven by motion vectors the GUEST
+// renders; nothing on this host consumes them - the reprojection here is the
+// visionOS compositor's, below the guest - so there is no texture to hand out.
+// The caller tests the result (cbnz w0) and, on failure, does not enable
+// SpaceWarp and carries on; SUCCESS with zero handles would be the damaging
+// answer, flagging the descriptor as space-warped against texture id 0. Same
+// story we already tell for foveation and ovrp_GetTiledMultiResSupported.
+static uint64_t klovrp_GetLayerTextureSpaceWarp(int layer_id, int stage, int eye,
+                                                uint64_t *motion, uint64_t *depth) {
+    ovrp_hit("ovrp_GetLayerTextureSpaceWarp");
+    (void)layer_id; (void)stage; (void)eye;
+    if (!motion || !depth) return OVRP_FAIL_INVALID_PARAM;
+    *motion = 0;
+    *depth = 0;
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+// ovrp_GetLayerTexturePtr(layerId, stage, eye, uint64_t* texturePtr) - the
+// legacy single-handle getter the guest uses for its non-eye layers (AC Nexus's
+// Equirect background). It is ovrp_GetLayerTexture2 with one out-param instead
+// of a colour/depth pair, so it delegates: GetLayerTexture2 already keys non-eye
+// layers by layer_id (not the shared eye storage), so this allocates the layer's
+// own image and cannot disturb the eyes. The handle it hands back is the same
+// 64-bit value - a GL name on the GLES path, a VkImage on Vulkan.
+static uint64_t klovrp_GetLayerTexturePtr(int layer_id, int stage, int eye,
+                                          uint64_t *texture_ptr) {
+    ovrp_hit("ovrp_GetLayerTexturePtr");
+    uint64_t color = 0, depth = 0;
+    uint64_t r = klovrp_GetLayerTexture2(layer_id, stage, eye, &color, &depth);
+    if (texture_ptr) *texture_ptr = color;
+    // TEMP diagnostic: the guest was seen creating an image view on a wild
+    // pointer right after this call - if these args do not read as a plausible
+    // (layer, stage, eye, ptr) then the signature is wrong and the real texture
+    // out-param is being left uninitialised.
+    fprintf(stderr, "  [ovrp] GetLayerTexturePtr(layer=%d stage=%d eye=%d ptr=%p) "
+                    "wrote color=%#llx depth=%#llx result=%llu\n",
+            layer_id, stage, eye, (void *)texture_ptr,
+            (unsigned long long)color, (unsigned long long)depth,
+            (unsigned long long)r);
+    return r;
+}
+
+// ovrp_GetLayerAndroidSurfaceObject(layerId, void** surfaceObject) - hands back
+// a Java Surface for an ANDROID SURFACE layer, which is how a title renders a
+// video straight onto an OVROverlay (AC Nexus's looping background). There is no
+// Android Surface / MediaPlayer surface path here, so it is refused - and the
+// out-param is ZEROED, not left alone: an unwritten jobject is the exact wild
+// pointer the kl_vulkan image-view guard now catches, one layer up. The caller
+// tests the result and, on failure, simply does not attach a video surface and
+// carries on; the background is dropped, the scene is not.
+static uint64_t klovrp_GetLayerAndroidSurfaceObject(int layer_id, void **surface) {
+    ovrp_hit("ovrp_GetLayerAndroidSurfaceObject");
+    (void)layer_id;
+    if (surface) *surface = NULL;
     return OVRP_FAIL_UNSUPPORTED;
 }
 
@@ -5206,6 +6077,18 @@ static uint64_t klovrp_GetSystemGpuLevel2(int *out) {
     if (!out) return OVRP_FAIL_INVALID_PARAM;
     *out = g_gpu_level;
     return OVRP_SUCCESS;
+}
+
+// The un-suffixed CPU/GPU level getters return the level DIRECTLY (the ...2 form
+// writes it through an out-param). Liminal's Oculus Utilities 1.40 calls these
+// on content load; without them the run aborted on the unimplemented entry.
+static uint64_t klovrp_GetSystemCpuLevel(void) {
+    ovrp_hit("ovrp_GetSystemCpuLevel");
+    return (uint64_t)(uint32_t)g_cpu_level;
+}
+static uint64_t klovrp_GetSystemGpuLevel(void) {
+    ovrp_hit("ovrp_GetSystemGpuLevel");
+    return (uint64_t)(uint32_t)g_gpu_level;
 }
 
 // ---------------------------------------------------------------------------
@@ -5434,6 +6317,23 @@ static uint64_t klovrp_GetDepthCompositingSupported(int *out) {
     return 0;
 }
 
+// Eye tracking: the guest asks whether the runtime can hand it a per-eye gaze
+// vector. Vision Pro deliberately never exposes gaze to a guest process, so the
+// honest and safe answer is "not supported" — the guest then skips its
+// eye-tracked foveation / gaze paths entirely instead of calling
+// ovrp_GetEyeGazesState and dereferencing a struct we never fill. Takes an
+// ovrpBool* out and returns ovrpResult (0 = success), so *out=0 is FALSE.
+static uint64_t klovrp_GetEyeTrackingSupported(int *out) {
+    ovrp_hit("ovrp_GetEyeTrackingSupported");
+    if (out) *out = 0;
+    return 0;
+}
+static uint64_t klovrp_GetEyeTrackingEnabled(int *out) {
+    ovrp_hit("ovrp_GetEyeTrackingEnabled");
+    if (out) *out = 0;
+    return 0;
+}
+
 // Mixed-reality capture — the camera composite an Oculus device does for
 // spectators. It takes no arguments and returns `ovrpBool`, not `ovrpResult`, so
 // 0 is FALSE and is the intended answer — worth saying out loud, because the two
@@ -5605,9 +6505,15 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetDeviceExtensionsVk",   (void *)klovrp_GetDeviceExtensionsVk},
     // The init state and everything that reads it. See klovrp_GetInitialized.
     {"ovrp_Initialize5",   (void *)klovrp_Initialize5},
+    {"ovrp_Initialize6",   (void *)klovrp_Initialize6},
+    {"ovrp_RecenterTrackingOrigin2", (void *)klovrp_RecenterTrackingOrigin2},
+    {"ovrp_GetAudioOutId2",       (void *)klovrp_GetAudioOutId2},
+    {"ovrp_GetAudioInId2",        (void *)klovrp_GetAudioInId2},
+    {"ovrp_GetDisplayAdapterId2", (void *)klovrp_GetDisplayAdapterId2},
     {"ovrp_Initialize7",   (void *)klovrp_Initialize7},
     {"ovrp_GetInitialized", (void *)klovrp_GetInitialized},
     {"ovrp_Shutdown",      (void *)klovrp_Shutdown},
+    {"ovrp_Shutdown2",     (void *)klovrp_Shutdown2},
     {"ovrp_GetAppChromaticCorrection", (void *)klovrp_GetAppChromaticCorrection},
     {"ovrp_SetAppChromaticCorrection", (void *)klovrp_SetAppChromaticCorrection},
     {"ovrp_SetAppEngineInfo",  (void *)klovrp_SetAppEngineInfo},
@@ -5615,6 +6521,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetAppShouldQuit2", (void *)klovrp_GetAppShouldQuit2},
     {"ovrp_GetAppShouldRecreateDistortionWindow2",
      (void *)klovrp_GetAppShouldRecreateDistortionWindow2},
+    {"ovrp_GetSystemRecommendedMSAALevel", (void *)klovrp_GetSystemRecommendedMSAALevel},
     {"ovrp_GetSystemRecommendedMSAALevel2", (void *)klovrp_GetSystemRecommendedMSAALevel2},
     {"ovrp_GetGPUFrameTime",   (void *)klovrp_GetGPUFrameTime},
     {"ovrp_InitializeMixedReality", (void *)klovrp_InitializeMixedReality},
@@ -5632,6 +6539,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetSystemMultiViewSupported2", (void *)klovrp_GetSystemMultiViewSupported2},
     {"ovrp_GetSystemMultiViewSupported",  (void *)klovrp_GetSystemMultiViewSupported},
     {"ovrp_GetEyeTextureArraySupported2", (void *)klovrp_GetEyeTextureArraySupported2},
+    {"ovrp_GetTrackingPositionSupported2", (void *)klovrp_GetTrackingPositionSupported2},
     {"ovrp_GetEyeTextureArraySupported",  (void *)klovrp_GetEyeTextureArraySupported},
     {"ovrp_GetBoundaryConfigured2", (void *)klovrp_GetBoundaryConfigured2},
     {"ovrp_GetAppHasVrFocus2", (void *)klovrp_GetAppHasVrFocus2},
@@ -5656,6 +6564,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_SetTrackingOriginType2", (void *)klovrp_SetTrackingOriginType2},
     {"ovrp_GetTrackingOriginType", (void *)klovrp_GetTrackingOriginType},
     {"ovrp_GetTrackingOriginType2", (void *)klovrp_GetTrackingOriginType2},
+    {"ovrp_GetTrackingTransformRelativePose", (void *)klovrp_GetTrackingTransformRelativePose},
     {"ovrp_PollEvent",  (void *)klovrp_PollEvent},
     {"ovrp_PollEvent2", (void *)klovrp_PollEvent2},
     {"ovrp_GetNodeFrustum2", (void *)klovrp_GetNodeFrustum2},
@@ -5677,14 +6586,23 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_CalculateEyeLayerDesc3", (void *)klovrp_CalculateEyeLayerDesc3},
     {"ovrp_CalculateLayerDesc", (void *)klovrp_CalculateLayerDesc},
     {"ovrp_SetupLayer", (void *)klovrp_SetupLayer},
+    {"ovrp_EnqueueSetupLayer2", (void *)klovrp_EnqueueSetupLayer2},
+    {"ovrp_EnqueueSubmitLayer2", (void *)klovrp_EnqueueSubmitLayer2},
+    {"ovrp_SetOverlayQuad3", (void *)klovrp_SetOverlayQuad3},
     {"ovrp_DestroyLayer", (void *)klovrp_DestroyLayer},
+    {"ovrp_EnqueueDestroyLayer", (void *)klovrp_EnqueueDestroyLayer},
     {"ovrp_GetLayerTextureStageCount", (void *)klovrp_GetLayerTextureStageCount},
+    {"ovrp_GetLayerRecommendedResolution", (void *)klovrp_GetLayerRecommendedResolution},
     {"ovrp_GetLayerTexture2", (void *)klovrp_GetLayerTexture2},
+    {"ovrp_GetLayerTexturePtr", (void *)klovrp_GetLayerTexturePtr},
+    {"ovrp_GetLayerAndroidSurfaceObject", (void *)klovrp_GetLayerAndroidSurfaceObject},
     {"ovrp_GetLayerTextureFoveation", (void *)klovrp_GetLayerTextureFoveation},
+    {"ovrp_GetLayerTextureSpaceWarp", (void *)klovrp_GetLayerTextureSpaceWarp},
     {"ovrp_GetViewportStencil", (void *)klovrp_GetViewportStencil},
     {"ovrp_EndFrame4", (void *)klovrp_EndFrame4},
     {"ovrp_Update3", (void *)klovrp_Update3},
     {"ovrp_GetUserIPD2", (void *)klovrp_GetUserIPD2},
+    {"ovrp_GetUserEyeHeight2", (void *)klovrp_GetUserEyeHeight2},
     {"ovrp_GetUserIPD", (void *)klovrp_GetUserIPD},
     {"ovrp_GetAppCpuStartToGpuEndTime2", (void *)klovrp_GetAppCpuStartToGpuEndTime2},
     {"ovrp_GetAdaptiveGpuPerformanceScale2", (void *)klovrp_GetAdaptiveGpuPerformanceScale2},
@@ -5698,6 +6616,8 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_SetSystemGpuLevel", (void *)klovrp_SetSystemGpuLevel},
     {"ovrp_SetSystemGpuLevel2", (void *)klovrp_SetSystemGpuLevel2},
     {"ovrp_GetSystemGpuLevel2", (void *)klovrp_GetSystemGpuLevel2},
+    {"ovrp_GetSystemCpuLevel", (void *)klovrp_GetSystemCpuLevel},
+    {"ovrp_GetSystemGpuLevel", (void *)klovrp_GetSystemGpuLevel},
     {"ovrp_CalculateEyeViewportRect", (void *)klovrp_CalculateEyeViewportRect},
     {"ovrp_CalculateEyePreviewRect", (void *)klovrp_CalculateEyePreviewRect},
     {"ovrp_GetAppPerfStats", (void *)klovrp_GetAppPerfStats},
@@ -5705,6 +6625,8 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetControllerState2", (void *)klovrp_GetControllerState2_entry},
     {"ovrp_GetControllerState", (void *)klovrp_GetControllerState_entry},
     {"ovrp_GetControllerState4", (void *)klovrp_GetControllerState4},
+    {"ovrp_GetControllerState5", (void *)klovrp_GetControllerState5},
+    {"ovrp_GetControllerState6", (void *)klovrp_GetControllerState6},
     {"ovrp_GetAppAsymmetricFov", (void *)klovrp_GetAppAsymmetricFov},
     {"ovrp_GetAppHasInputFocus", (void *)klovrp_GetAppHasInputFocus},
     {"ovrp_GetNativeXrApiType", (void *)klovrp_GetNativeXrApiType},
@@ -5727,6 +6649,8 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetControllerSampleRateHz", (void *)klovrp_GetControllerSampleRateHz},
     {"ovrp_SetControllerHapticsPcm", (void *)klovrp_SetControllerHapticsPcm},
     {"ovrp_GetDepthCompositingSupported", (void *)klovrp_GetDepthCompositingSupported},
+    {"ovrp_GetEyeTrackingSupported", (void *)klovrp_GetEyeTrackingSupported},
+    {"ovrp_GetEyeTrackingEnabled", (void *)klovrp_GetEyeTrackingEnabled},
     {"ovrp_GetMixedRealityInitialized", (void *)klovrp_GetMixedRealityInitialized},
 };
 
@@ -5741,6 +6665,8 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
 // the moment an entry point has an *out-parameter* — those must know where the
 // pointer is and what shape it points at, so they get real implementations.
 static const char *const g_ovrp_result_ok[] = {
+    // Tearing down a passthrough that never initialised trivially succeeds.
+    "ovrp_ShutdownInsightPassthrough",
 // Unity's native plugin interface. All void.
     "UnitySetGraphicsDevice", "UnitySetEventQueue", "UnityShaderCompilerExtEvent",
     "UnityRenderingExtEvent",
@@ -5763,9 +6689,91 @@ static const char *const g_ovrp_result_ok[] = {
     // ovrp_Initialize5 and ovrp_Initialize7 answer the same success but need
     // real implementations, because the answer has to be RECORDED — see
     // klovrp_GetInitialized.
-    "ovrp_PreInitialize", "ovrp_PreInitialize3",
+    // Every PreInitialize arity answers the same success no-op — the numbered
+    // variants are just which OVRPlugin build the guest was linked against
+    // (TWD2 dlsyms PreInitialize4, others 3/5). Listed by name rather than by
+    // prefix so a variant that ever returns something different is not silently
+    // swept in here.
+    "ovrp_PreInitialize", "ovrp_PreInitialize3", "ovrp_PreInitialize4",
+    "ovrp_PreInitialize5",
+    // Quest Performance Logging (QPL) markers — Meta telemetry. wanderer/UE5
+    // instruments frames with these; nothing logs here, so each is a success
+    // no-op (returns ignored by the guest).
+    "ovrp_QplMarkerStart", "ovrp_QplMarkerEnd", "ovrp_QplMarkerPoint",
+    "ovrp_QplMarkerPointCached", "ovrp_QplMarkerAnnotation",
+    "ovrp_QplCreateMarkerHandle", "ovrp_QplDestroyMarkerHandle",
+    "ovrp_QplSetConsent", "ovrp_QplMarkerAnnotationWithType",
+    // Unified telemetry-consent flow (Meta's data-collection opt-in). UE5's
+    // Meta XR plugin queries ovrp_GetUnifiedConsent at startup, before any
+    // rendering — olar aborted here on the unimplemented trampoline (signal 6).
+    // There is no telemetry pipe on this host (the Qpl* markers above are
+    // no-ops), so the whole family answers ovrpResult success and touches no
+    // out-param: for GetUnifiedConsent / the ShouldShow* predicates that means
+    // the guest's pre-zeroed consent/should-show local stays false ("no consent
+    // recorded, nothing to show"), which suppresses the consent dialog rather
+    // than driving it into the buffer-filling GetConsent*Text getters. The
+    // Save*/Set* half are pure setters — success is unambiguously safe. Return 0
+    // and read nothing is safe under either ABI (ovrpResult+outparam or a bare
+    // ovrpBool), so no argument is dereferenced.
+    "ovrp_GetUnifiedConsent", "ovrp_SaveUnifiedConsent",
+    "ovrp_SaveUnifiedConsentWithOlderVersion", "ovrp_SetDeveloperTelemetryConsent",
+    "ovrp_ShouldShowTelemetryConsentWindow", "ovrp_ShouldShowTelemetryNotification",
+    "ovrp_SetNotificationShown",
+    // ...and the consent-TEXT getters. olar calls ovrp_GetConsentSettingsChangeText
+    // even though the ShouldShow* predicates answered "nothing to show" — it aborted
+    // on the unimplemented trampoline (signal 6). Answering success and touching no
+    // out-param leaves the guest's text buffer as it found it (empty on the common
+    // pre-zeroed path); there is no consent dialog to populate on this host anyway.
+    // Names cover the Meta XR consent-text family; unused ones are harmless.
+    "ovrp_GetConsentSettingsChangeText", "ovrp_GetConsentTitleText",
+    "ovrp_GetConsentMarkdownText", "ovrp_GetConsentNotificationText",
+    "ovrp_GetConsentText", "ovrp_GetConsentTitle",
+    "ovrp_GetConsentNotificationMarkdownText",
+    // Telemetry event sink (olar) — there is no telemetry pipe here; accept and drop.
+    "ovrp_SendEvent2", "ovrp_SendEvent",
+    // Per-eye buffer sharpening hint (wanderer, UE5). Advisory image post; nothing
+    // to configure on the visionOS compositor path, so accept the set as a no-op.
+    "ovrp_SetEyeBufferSharpenType",
+    // wanderer polls the active interaction profile per frame. Success + a pre-zeroed
+    // out reads as "profile 0"; controllers still flow through GetControllerState6, so
+    // this only gates a binding-string lookup the guest does not need on this path.
+    "ovrp_GetCurrentInteractionProfile",
+    // Environment depth (Quest 3 passthrough occlusion) — wanderer probes the frame
+    // descriptor. No depth pipe on visionOS; success + a zeroed desc reads as an
+    // empty/absent depth frame, which the guest treats as "no occlusion this frame".
+    "ovrp_GetEnvironmentDepthFrameDesc",
+    // Controller haptics — wanderer fires it the frame after it starts submitting
+    // eye layers. No haptics sink on visionOS controllers here; accept and drop.
+    "ovrp_SetControllerLocalizedVibration",
+    // Eye tracking (Quest Pro) — wanderer starts/stops it per session. No eye
+    // tracker on this path; accept the start/stop, and gaze reads stay zeroed.
+    "ovrp_StartEyeTracking", "ovrp_StopEyeTracking",
+    // Per-frame eye-gaze poll (wanderer, right after StartEyeTracking). Success +
+    // a pre-zeroed EyeGazesState reads as "no gaze this frame", which the guest
+    // treats as gaze unavailable rather than a fault.
+    "ovrp_GetEyeGazesState",
+    // wanderer (UE5) polls ovrp_GetUserNeckEyeDistance2 from its per-frame path
+    // (right before EndFrame4) and aborted on the unimplemented trampoline
+    // (signal 6). It is the OVR neck-model arm length; answering success and
+    // touching no out-param leaves the guest's pre-zeroed local at 0, i.e. NO
+    // neck-model offset — the head pose we already supply is used directly, which
+    // is correct here (we hand a real tracked head pose, not a neck-pivoted one).
+    // The paired setter is a pure sink. ABI-safe under result+outparam or bare
+    // ovrpBool, same as the consent family above.
+    "ovrp_GetUserNeckEyeDistance2", "ovrp_SetUserNeckEyeDistance2",
     // Configuration the guest sets and never reads back.
     "ovrp_SetAppAsymmetricFov",
+    // Performance-level hints (CPU/GPU). Advisory on real hardware and there is
+    // nothing to set here; answer success so the guest's tuning path completes.
+    "ovrp_SetSuggestedCpuPerformanceLevel", "ovrp_SetSuggestedGpuPerformanceLevel",
+    "ovrp_GetSuggestedCpuPerformanceLevel", "ovrp_GetSuggestedGpuPerformanceLevel",
+    // Eye-tracked foveation hint. No eye-tracked foveation here; accept the set
+    // so the guest's foveation setup proceeds (a "supported" query left unfilled
+    // reads as its pre-zeroed false, i.e. not supported).
+    "ovrp_SetFoveationEyeTracked", "ovrp_GetFoveationEyeTracked",
+    // HDR/local-dimming panel control; Vision Pro has no such knob, so
+    // acknowledge the set as a successful no-op (wrath2 / UE4 VR renderer).
+    "ovrp_SetLocalDimming", "ovrp_GetLocalDimming",
     // Called with an out-pointer (void**) it may write; libunity pre-zeroes
     // the local and ignores the x0 return (0x9bb334-0x9bb414), and never
     // dereferences whatever lands in the slot — so leaving it untouched and
@@ -5812,11 +6820,26 @@ static const char *const g_ovrp_result_ok[] = {
     // to 0), so answering 0 is exactly what they do when no Android audio
     // device exists — and our output is CoreAudio, not an Android device.
     "ovrp_GetAudioOutId", "ovrp_GetAudioInId", "ovrp_GetDisplayAdapterId",
-    "ovrp_GetAudioOutId2", "ovrp_GetAudioInId2", "ovrp_GetDisplayAdapterId2",
+    // (the ...2 forms moved to real implementations: ieytd2's libOculusXRPlugin
+    // proved the guess above wrong — OculusSystem::Initialize treats them as
+    // `ovrpResult f(void **out)`, then COPIES 16 BYTES from the returned
+    // pointer. Success-without-write left the zeroed stack slot as the pointer
+    // and the copy read address 0: its boot crash. See klovrp_GetAudioOutId2.)
     // Managed-side Media facade init + MRC configuration; ovrpResult/void.
     "ovrp_Media_Initialize", "ovrp_Media_SetMrcAudioSampleRate",
     "ovrp_Media_SetMrcInputVideoBufferType", "ovrp_Media_GetMrcInputVideoBufferType",
     "ovrp_Media_SetMrcActivationMode",
+    // MRC's Vulkan queue-index handshake, pushed by OVRManager during init even
+    // when nothing is recording and the guest is on GLES (AC Nexus does this).
+    // ovrpResult/void like the rest of the Media facade: record and succeed. The
+    // encode entries stay off this list until a run proves one is actually
+    // called, the way every other entry here earned its place.
+    "ovrp_Media_SetAvailableQueueIndexVulkan",
+    // The MRC frame-format setters OVRManager pushes right after, in the same
+    // init block: image-flipped and inverse-alpha are always set as a pair.
+    // ovrpResult/void, record-and-succeed like the rest of the facade - MRC is
+    // a casting feature with no camera behind it here.
+    "ovrp_Media_SetMrcFrameImageFlipped", "ovrp_Media_SetMrcFrameInverseAlpha",
     // The display-object / distortion-window lifecycle, ovrpResult and not
     // ovrpBool. 1.40 READS the value: `OculusDisplayProvider::
     // CreateMobileDisplayObjects` does `cbnz w0 -> "Failed Oculus context
@@ -5839,6 +6862,28 @@ static const char *const g_ovrp_result_ok[] = {
     "ovrp_SetupDistortionWindow", "ovrp_SetupDistortionWindow3",
     "ovrp_SetupDisplayObjects", "ovrp_SetupDisplayObjects2",
     "ovrp_DestroyDistortionWindow", "ovrp_DestroyDistortionWindow2",
+    // Per-layer colour scale/offset - the guest pushes it for fade-from-black on
+    // load (OVRManager / the game's own fader). ovrpResult, and record-and-
+    // succeed: the compositor here does not apply the transform, so the only
+    // visible effect of ignoring it is that a fade shows its end state at once
+    // (full brightness) rather than ramping - cosmetic, and never a failure the
+    // guest reads back. If a title turns out to REQUIRE the ramp, this graduates
+    // to a real body that hands the scale/offset to kl_glfb.
+    "ovrp_SetColorScaleAndOffset",
+    // The OVERLAY submit path. AC Nexus drives its main eye layer through
+    // BeginFrame4/EndFrame4 (implemented, and where the eye texture is captured)
+    // but submits its Equirect background OVROverlay through the older enqueue
+    // model. Accepting it as a no-op drops only that background layer - the eye
+    // projection still reaches the compositor through EndFrame4 - so it is
+    // record-and-succeed rather than a real per-layer submit. If the background
+    // turns out to matter, it graduates to a real body that records the overlay.
+    // Premultiplied-alpha mode for the eye-FOV layer. Some guests push it
+    // during OVRPlugin setup. ovrpResult/record-and-succeed: the compositor
+    // here composites the eye projection through EndFrame4 and does not honour a
+    // per-layer alpha-blend mode, so accepting the push keeps the guest moving
+    // without changing what reaches the display. Graduates to a real body only
+    // if a title turns out to read the alpha mode back and require it.
+    "ovrp_SetEyeFovPremultipliedAlphaMode",
 };
 
 static const char *const g_ovrp_bool_yes[] = {
@@ -5900,6 +6945,8 @@ static const char *const g_ovrp_bool_yes[] = {
 };
 
 static const char *const g_ovrp_bool_no[] = {
+    // Passthrough never initialised (see g_ovrp_result_unsupported).
+    "ovrp_GetInsightPassthroughInitialized",
     // Unity asks OVRPlugin which rendering-extension hooks it wants (before/after
     // rendering events, etc.). Our replacement has no render-thread bookkeeping,
     // so "no" is the truthful answer — Unity then never issues the events.
@@ -5939,10 +6986,24 @@ static const char *const g_ovrp_bool_no[] = {
     "ovrp_GetTiledMultiResSupported",
 };
 
+static const char *const g_ovrp_result_unsupported[] = {
+    // Insight Passthrough: Meta's camera-composited MR. Vision Pro's passthrough
+    // is the real environment of a mixed immersive space, but Klepton has no seam
+    // that turns the guest's ovrpInsightPassthroughLayer into a transparent
+    // compositor background yet — so init HONESTLY fails and the guest keeps its
+    // non-passthrough (opaque skybox) path instead of building MR layers we
+    // cannot fill. Flip this to success and wire the compositor if a target
+    // turns out to REQUIRE passthrough.
+    "ovrp_InitializeInsightPassthrough",
+};
+
 static void *klovrp_shared(const char *name) {
     for (size_t i = 0; i < sizeof g_ovrp_result_ok / sizeof g_ovrp_result_ok[0]; i++)
         if (strcmp(g_ovrp_result_ok[i], name) == 0)
             return kl_named_stub(name, (void *)klovrp_ok);
+    for (size_t i = 0; i < sizeof g_ovrp_result_unsupported / sizeof g_ovrp_result_unsupported[0]; i++)
+        if (strcmp(g_ovrp_result_unsupported[i], name) == 0)
+            return kl_named_stub(name, (void *)klovrp_unsupported);
     for (size_t i = 0; i < sizeof g_ovrp_bool_yes / sizeof g_ovrp_bool_yes[0]; i++)
         if (g_ovrp_bool_yes[i] && strcmp(g_ovrp_bool_yes[i], name) == 0)
             return kl_named_stub(name, (void *)klovrp_yes);

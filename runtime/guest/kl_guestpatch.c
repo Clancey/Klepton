@@ -317,7 +317,171 @@ static const kl_gp_word k_vrc_ospstorm[] = {
     { 0x67a0e68, 0x97fff8de, 0x14000160, "bl AssignRaycastCallback -> b Update.epilogue" },
 };
 
+// ---------------------------------------------------------------------------
+// Liminal (`LiminalSdk.dll` inside libil2cpp.so, Unity 2019.1.10f1 / Oculus
+// Utilities 1.40).
+//
+// GearVRDevice.UpdateConnectedControllers decides whether to build the Touch
+// laser/reticle from OVRInput.IsControllerConnected, and that check reads
+// OVRInput's connectedControllers cache. It runs ONCE at startup (frame ~800),
+// BEFORE OVRManager is added and OVRInput first polls (frame ~1800), so the
+// cache is empty and both hands read as disconnected — the app commits to its
+// gaze profile and never re-checks, leaving no pointer to click with. The
+// controllers ARE present the whole time (our GetControllerState4 reports Touch
+// connected every poll); the only lie is the momentary empty cache.
+//
+// IsControllerConnected is (connectedControllers & mask) == mask, at 0x2dcdb14:
+//   0x2dcdb6c  ldr x8, [x0, #184]     ; the OVRInput state object
+//   0x2dcdb74  ldr w8, [x8, #20]      ; connectedControllers  <-- patched
+//   0x2dcdb78  bics wzr, w19, w8      ; mask & ~connected
+//   0x2dcdb7c  cset w0, eq            ; == mask ?
+// Replacing the load with `orr w8, wzr, #3` makes the check see LTouch|RTouch
+// as always connected and nothing else — true for the PSVR2-mapped Touch
+// controllers, and it leaves every non-Touch query (Go remotes) answering
+// false. Pair with KL_OVRP_HEADSET=8 so the hand->controller-type mapping
+// resolves to Touch rather than the 3DoF remote (see klovrp_headset_type).
+static const kl_gp_word k_liminal_touch[] = {
+    { 0x2dcdb74, 0xb9401508, 0x320007e8, "orr w8, wzr, #3  (Touch always connected)" },
+};
+
+// ---------------------------------------------------------------------------
+// Wrath2 (libUE4.so) — force the Vulkan-RHI gate open.
+//
+// FAndroidMisc::IsVulkanAvailable() (@0xc319344, confirmed by disassembly)
+// returns false, so UE4 puts up "This device does not support Vulkan but the app
+// was not packaged with ES 3.1 support" and quits (SIGKILL, no device ever
+// created). Its logic requires, among other things,
+// (bSupportsVulkan==1 || bSupportsVulkanSM5==1) read from the cooked
+// [/Script/AndroidRuntimeSettings.AndroidRuntimeSettings] section — both preset
+// FALSE — and ModuleExists("VulkanRHI"). A command-line
+// "-ini:…:bSupportsVulkan=True" override was applied (verified in the log) and
+// did NOT flip the verdict, so the failing gate is either that the -ini is read
+// after this early check or ModuleExists is false. Rather than keep guessing,
+// force the function itself: overwrite its prologue with `mov w0, #1; ret` so it
+// always answers "available". If wrath2 then proceeds into real Vulkan init
+// (vkCreateDevice / swapchain / shader compile), the gate WAS the only blocker;
+// if it fails past this, the next wall is named honestly. The `expect` words are
+// this build's prologue, so no other libUE4 title is touched. KL_GUEST_PATCH_OFF=
+// wrath2-force-vulkan-available disables it.
+//   0xc319344  sub sp, sp, #0x60          -> mov w0, #1
+//   0xc319348  stp x24, x23, [sp, #0x20]  -> ret
+static const kl_gp_word k_wrath2_forcevk[] = {
+    { 0xc319344, 0xd10183ff, 0x52800020, "mov w0, #1  (IsVulkanAvailable -> true)" },
+    { 0xc319348, 0xa9025ff8, 0xd65f03c0, "ret" },
+};
+
+// Wrath2 (libUE4.so) — force the "COMPILING SHADERS" title segment to complete.
+//
+// AAW_CompileShadersTitleScreenSegment gates on
+// FShaderPipelineCache::NumPrecompilesRemaining() reaching 0, but the precompile
+// stalls (~529 PSOs then never drains — the batched precompile stops making
+// progress), so the segment loops forever and never advances to Calibration.
+// Force NumPrecompilesRemaining() to return 0 so the segment finishes; the cache
+// still opens normally and PSOs compile on demand (first-use hitches, not a hang).
+//   0xcded830  str d8, [sp, #-0x50]!      -> mov w0, #0
+//   0xcded834  stp x24, x23, [sp, #0x10]  -> ret
+static const kl_gp_word k_wrath2_pso_done[] = {
+    { 0xcded830, 0xfc1b0fe8, 0x52800000, "mov w0, #0  (NumPrecompilesRemaining -> 0)" },
+    { 0xcded834, 0xa9015ff8, 0xd65f03c0, "ret" },
+};
+
+// NOTE (hl2/libtogl.so multiview): TWO reverted experiments now.
+// (1) Forcing the generate BIT on (0xa1788 `tbnz w23,#0` -> `b`) fired generation at
+//     precache and poisoned the "already tried" latch (vshader[0x64]=1).
+// (2) NOP the latch short-circuit at 0xa0878 so a poisoned shader retries — REVERTED.
+//     Confirmed on-device the retry DOES happen (each "no usable variant" now logs
+//     twice) but the generator (0xa0808) STILL returns 0 every time, AND it regressed
+//     boot (never reached the black screen). So the failure is NOT the latch:
+//     - the port IS requesting multiview variants at draw time (it logs "no usable
+//       variant for lightmappedgeneric_vs20/skin_vs20/..."), so the generate bit is set;
+//     - the marker `gl_Position = vTempPos;` IS present in the translated GLSL (dumped
+//       in the log), and the 0xa0aac "unsupported vertex shader layout" warning does
+//       NOT fire, so the generator passes the marker check;
+//     - there is NO ANGLE compile error logged either.
+//     => the generator fails DEEPER in its body (0xa0918+, past the marker), returning
+//     0 for a reason not yet traced. That is the real thing to chase — read the full
+//     generator body's return-0 paths. libtogl is per-title (portal's is a different
+//     binary), so a future fix can be fingerprint-keyed to hl2 safely.
+
+// hl2 multiview shader-gen: three patch experiments tried, all applied (mkguest.sh
+// re-translates every build; --quiet just hides klepton-ld's "[patch] ... applied"),
+// none fixed it: (1) 0xa1788 tbnz->b force; (2) 0xa0878 latch NOP; (3) 0xa1a48
+// `ldr w3` -> `mov w3,#1`. With (3) the generator STILL never reaches glCompileShader
+// (num_views/gl_ViewID_OVR count = 0 in the log) and no "compile failed"/"unsupported
+// layout" warning fires — so the generator (0xa0808) returns 0 at a SILENT path
+// (a082c [0x8]!=0, a0868 [0x18]==0, or a0890 [0x4c]==0), i.e. before it builds/compiles.
+// Likely the world shaders route through the OTHER caller 0xa1eec (w3=w20, from the
+// enclosing fn's w3 arg), which (3) did not force; or the shader object handed to the
+// generator has no translated GLSL ([0x18]==0) at that moment (an ordering issue).
+// NEXT: force w23 INSIDE the variant-select (a172c `mov w23,w3` -> `mov w23,#1`) to
+// cover BOTH callers, AND if num_views still 0, add a runtime probe on the generator's
+// silent return-0 paths (the guest generator can't be logged, so instrument via a
+// klepton-side hook on glCreateShader/glShaderSource to see if a multiview source ever
+// arrives). libtogl is per-title (portal's differs), so any force is fingerprint-safe.
+
+// Force w23=1 INSIDE the variant-select (0xa1704), covering BOTH callers (a1a48 and
+// a1eec) at once — the single-caller a1a48 force left num_views at 0, so the world
+// shaders likely route through a1eec. If the generator now reaches glCompileShader
+// (num_views appears) we learn whether ANGLE accepts the multiview GLSL; if it stays
+// 0, the generator fails at a SILENT pre-build gate ([0x18]==0 GLSL-not-ready) and the
+// fix is a timing/ordering one, not a force. Fingerprint-keyed (portal's a172c is
+// `mov x0,x19`).
+__attribute__((unused))  // disabled in k_patches[] (two-pass supersedes it); kept for Strategy-A revert
+static const kl_gp_word k_hl2_mv_force2[] = {
+    { 0xa172c, 0x2a0303f7, 0x52800037,
+      "mov w23, #1  (force multiview generate bit for BOTH variant-select callers)" },
+};
+
+// hl2 (HL2Q3VR): the mod gates VR eye render-target creation on "Queued Material System"
+// being ENABLED (HL2Q3 MatQueue allow=1). That decision (libmaterialsystem 0xe4998) computes
+// allow = (CommandLine("-threads",2) > 1) & arg1, but only after a CPUInfo[5] >= 2 gate; under
+// Klepton it lands allow=0 (ideal stays 0), so CreateRenderTargets (libsourcevr 0xec64) is
+// never called -> "Eye copy skipped: Source render target is unavailable" -> black (see
+// hl2-quest-reference-trace). Quest reaches allow=1 -> RTs -> renders. Force it: NOP the
+// CPUInfo<2 disable branch, and make the allow store unconditional 1. EXPERIMENT — this
+// enables the mod's queued (threaded-GL) path; on Quest it enables only to build the RTs then
+// forces off, so this may open the RT-creation window. If ANGLE-Metal can't do threaded GL it
+// may fault instead — that itself is the answer.
+__attribute__((unused))  // disabled in k_patches[] — confirmed a tangent (see registration)
+static const kl_gp_word k_hl2_matqueue_allow[] = {
+    { 0xe49f4, 0x54000223, 0xd503201f, "NOP the CPUInfo<2 'disable queued' branch" },
+    { 0xe49f8, 0x0a150308, 0x320003e8, "and w8,w24,w21 -> mov w8,#1  (allow=1 forced)" },
+};
+
 static const kl_gp_patch k_patches[] = {
+    // DISABLED: "hl2-multiview-force2" forced libtogl to generate a MULTIVIEW shader
+    // variant for every world shader — Strategy A (make ANGLE-Metal multiview work),
+    // which never got past "no usable vertex shader variant". We now commit to
+    // Strategy B: two-pass per-eye rendering (portal's working path) via the
+    // synthesized autoexec.cfg (hl2quest_vr_single_pass_* 0, kl_libc.c). Two-pass
+    // draws each eye with NORMAL shaders, so forcing multiview variants in libtogl
+    // actively BREAKS it (the engine asks for a normal shader, the patch makes a
+    // multiview one, mismatch -> black). Re-enable only if reverting to Strategy A;
+    // the two are mutually exclusive. (void)k_hl2_mv_force2 keeps it referenced.
+    // { "hl2-multiview-force2", "libtogl.so",
+    //   "force the multiview generate bit inside the variant-select (both callers)",
+    //   k_hl2_mv_force2, sizeof k_hl2_mv_force2 / sizeof *k_hl2_mv_force2 },
+    // DISABLED: confirmed a TANGENT. The Quest boot log shows CreateRenderTargets runs with
+    // "Material queued rendering allowed: mode 0 -> 0 (previouslyAllowed=0)" — i.e. it creates
+    // the eye RTs BEFORE the MatQueue ever enables queued mode, so MatQueue allow is IRRELEVANT
+    // to RT creation. This patch correctly made the MatQueue match Quest (allow=1/ideal=2) but
+    // did NOT trigger CreateRenderTargets, and enabling queued (threaded-GL) mode under
+    // ANGLE-Metal is unnecessary risk. Kept for reference. (void) keeps it referenced.
+    // { "hl2-matqueue-allow", "libmaterialsystem.so",
+    //   "force HL2Q3 Queued Material System allow=1 so VR render targets get created",
+    //   k_hl2_matqueue_allow, sizeof k_hl2_matqueue_allow / sizeof *k_hl2_matqueue_allow },
+
+    { "wrath2-force-vulkan-available", "libUE4.so",
+      "FAndroidMisc::IsVulkanAvailable() always returns true (the RHI gate)",
+      k_wrath2_forcevk, sizeof k_wrath2_forcevk / sizeof *k_wrath2_forcevk },
+    { "wrath2-pso-done", "libUE4.so",
+      "FShaderPipelineCache::NumPrecompilesRemaining() returns 0 (title segment completes)",
+      k_wrath2_pso_done, sizeof k_wrath2_pso_done / sizeof *k_wrath2_pso_done },
+
+    { "liminal-touch-connected", "libil2cpp.so",
+      "the Touch controllers read as connected at the startup device check",
+      k_liminal_touch, sizeof k_liminal_touch / sizeof *k_liminal_touch },
+
     { "vrchat-multipass", "libUnityOpenXR.so",
       "the stereo rendering mode is MultiPass, because there is no multiview",
       k_vrc_multipass, sizeof k_vrc_multipass / sizeof *k_vrc_multipass },

@@ -79,10 +79,21 @@ static klj_val klj_GA_getMetaDataInt(void *env, void *self, const klj_val *a, in
     // feature gets "This device does not support Vulkan but the app was not
     // packaged with ES 3.1 support" out of its own message box, which is the
     // engine reporting that the alternative does not exist in this build rather
-    // than a preference. So the answer is Vulkan 1.0.3 (`VK_MAKE_VERSION(1,0,3)`,
-    // what a Quest 2 reports) and level 1, and the guest reaches kl_vulkan.c —
-    // the path BONELAB already drives. `KL_UE4_VULKAN=0` restores the refusal
-    // exactly, which is the A/B for anything that suspects the API choice.
+    // than a preference. So the answer is a supported Vulkan feature version and
+    // level 1, and the guest reaches kl_vulkan.c — the path BONELAB already
+    // drives. `KL_UE4_VULKAN=0` restores the refusal exactly, which is the A/B
+    // for anything that suspects the API choice.
+    //
+    // The version reported here is the GATE, not the instance version: UE reads
+    // this feature (out of PackageManager.getSystemAvailableFeatures()) and
+    // compares it to its engine minimum BEFORE it ever calls a vk* entry point
+    // (the guest instance is still created at VK_API_VERSION_1_0 in kl_vulkan.c).
+    // UE4 accepts 1.0, so 1.0.3 ("what a Quest 2 reports") sufficed for BONELAB
+    // and RE4. UE5 raised the Android minimum to Vulkan 1.1: OLAR (UE5,
+    // Vulkan-only) queried this feature, got 1.0.3, and — with NO vk* call — put
+    // up exactly the message above and quit (SIGKILL). Report 1.1.0, which
+    // clears the UE5 gate and is still >= the UE4 minimum, so both engines keep
+    // taking the Vulkan path. MoltenVK backs 1.4 here, so 1.1 is safely serviced.
     // The two audio keys, and answering them is not optional: GameActivity
     // resolves them through `AudioManager.getProperty`, and
     // `FMixerPlatformAndroid::GetPlatformSettings` rounds its callback size up
@@ -103,7 +114,7 @@ static klj_val klj_GA_getMetaDataInt(void *env, void *self, const klj_val *a, in
         int level = strcmp(k, "android.hardware.vulkan.level") == 0;
         const char *env_v = getenv("KL_UE4_VULKAN");
         int on = env_v ? (int)strtol(env_v, NULL, 0) != 0 : 1;
-        int v = !on ? 0 : level ? 1 : ((1 << 22) | 3);
+        int v = !on ? 0 : level ? 1 : ((1 << 22) | (1 << 12));  /* VK_MAKE_VERSION(1,1,0) — UE5 minimum */
         KLJ_LOG("GetMetaDataInt(\"%s\") -> 0x%x%s", k, v,
                 on ? "" : " (no Vulkan feature presented — KL_UE4_VULKAN=0)");
         return (klj_val){.j = (uint64_t)(int64_t)v};
@@ -150,7 +161,13 @@ static klj_val klj_GA_getMetaDataString(void *env, void *self, const klj_val *a,
     // eight instructions later, on a guest worker thread, naming nothing.
     // Built from the same three constants DisplayMetrics' own fields are, so
     // the two doors onto the panel cannot disagree.
-    if (strcmp(k, "ue4.displaymetrics.dpi") == 0) {
+    //
+    // UE5 spells the key `unreal.displaymetrics.dpi` (the package moved from
+    // com.epicgames.ue4 to com.epicgames.unreal), so match either prefix — the
+    // literal is in libUnreal and Wanderer/OLAR die on exactly this dereference
+    // when the unreal spelling falls through to the empty manifest answer.
+    if (strcmp(k, "ue4.displaymetrics.dpi") == 0 ||
+        strcmp(k, "unreal.displaymetrics.dpi") == 0) {
         static char dpi[64];
         snprintf(dpi, sizeof dpi, "%.2f,%.2f,%d",
                  (double)KLJ_DISPLAY_XDPI, (double)KLJ_DISPLAY_YDPI, KLJ_DISPLAY_DPI);
@@ -179,10 +196,20 @@ void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol)) {
 // module list is consumed by the very next thing the game thread does.
 static klj_val klj_GA_initHMDs(void *env, void *self, const klj_val *a, int n) {
     (void)a; (void)n;
-    void (*fn)(void *, void *) = g_guest_native
-        ? (void (*)(void *, void *))g_guest_native(
-              "Java_com_epicgames_ue4_GameActivity_nativeInitHMDs")
-        : NULL;
+    // UE5 renamed the package and the exported-native prefix in the same release
+    // (com.epicgames.ue4 -> com.epicgames.unreal), and libUnreal exports
+    // `Java_com_epicgames_unreal_GameActivity_nativeInitHMDs`. Wanderer is UE5,
+    // so the ue4 spelling alone resolved to NULL and the whole XR path — the only
+    // thing that starts rendering — never began (0 frames, no ovrp, no swapchain).
+    // Try both families; the guest exports exactly one of them.
+    void (*fn)(void *, void *) = NULL;
+    if (g_guest_native) {
+        fn = (void (*)(void *, void *))g_guest_native(
+                 "Java_com_epicgames_ue4_GameActivity_nativeInitHMDs");
+        if (!fn)
+            fn = (void (*)(void *, void *))g_guest_native(
+                     "Java_com_epicgames_unreal_GameActivity_nativeInitHMDs");
+    }
     if (!fn) {
         KLJ_LOG("AndroidThunkJava_InitHMDs: no guest nativeInitHMDs to call back "
                 "into — the HMD modules never get PreInit");
@@ -318,12 +345,64 @@ static klj_val klj_ue4_receiver_stop(void *env, void *self, const klj_val *a, in
 // not have); everything else about it is a record. Worth printing rather than
 // dropping — it is the engine stating the resolution it intends to render at,
 // which is the first number a graphics arc wants.
+static klj_val klj_GA_forceQuit(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // UE4 calls this when it has decided to bail (e.g. a fatal RHI/init error).
+    // A no-op keeps the process alive instead of aborting on a missing method —
+    // but if this fires, something upstream went wrong and the log above it says
+    // what. (With vkGetPhysicalDeviceMemoryProperties2 implemented, the Vulkan
+    // path no longer triggers it.)
+    KLJ_LOG("AndroidThunkJava_ForceQuit() — the guest asked to quit; ignored "
+            "(see the log just above for why it wanted to)");
+    // Shipping UE builds strip their runtime log, so the "why" often is NOT
+    // above — nothing reaches stdout or logcat. Dump the GUEST call stack of
+    // whoever called ForceQuit instead: symbolised against libUE4/libUnreal it
+    // names the engine code that made the bail decision (the localization /
+    // pak-mount / module path), which is the only handle on a logless quit.
+    fprintf(stderr, "  [ue4] ForceQuit caller stack (symbolise against the guest "
+                    "libUE4/libUnreal with tools/symof.py):\n");
+    kl_fault_print_frames(stderr, __builtin_frame_address(0));
+    return (klj_val){0};
+}
 static klj_val klj_GA_setDesiredViewSize(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     KLJ_LOG("AndroidThunkJava_SetDesiredViewSize(%d, %d) — recorded; the window "
             "size is kl_ndk's",
             n > 0 ? (int)(int64_t)a[0].j : 0, n > 1 ? (int)(int64_t)a[1].j : 0);
     return (klj_val){.j = 0};
+}
+
+// Display refresh rate. The compositor presents at a fixed rate; report 90 Hz
+// as the one supported mode. Set is accepted (there is nothing to change) so
+// UE4's "pick a rate and apply it" path completes.
+static klj_val klj_GA_getNativeDisplayRefreshRate(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 90};
+}
+
+// AndroidThunkJava_GetDeviceOrientation()I feeds FAndroidMisc::GetDeviceOrientation,
+// whose return is an EDeviceScreenOrientation: 0 Unknown, 1 Portrait,
+// 2 PortraitUpsideDown, 3 LandscapeLeft, 4 LandscapeRight. On a headset there is
+// no phone panel to rotate — the scene goes to the XR compositor, not a rotated
+// surface — but the guest may still branch on this (e.g. width/height ordering),
+// so we report the fixed landscape UE4 uses by default for VR: LandscapeLeft.
+static klj_val klj_GA_getDeviceOrientation(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 3};   // EDeviceScreenOrientation::LandscapeLeft
+}
+static klj_val klj_GA_setNativeDisplayRefreshRate(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};   // jboolean true — accepted
+}
+static klj_val klj_GA_getSupportedRefreshRates(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *arr;
+    if (!arr) {
+        arr = klj_new_array('I', NULL, 1);
+        int32_t *v = klj_arr(arr)->data;
+        v[0] = 90;
+    }
+    return (klj_val){.l = arr};
 }
 
 // The system font directory, as the Java finds it: the first of /system/fonts,
@@ -729,6 +808,42 @@ static klj_val klj_MP14_selectTrack(void *env, void *self, const klj_val *a, int
     return (klj_val){.j = 0};
 }
 
+// AndroidThunkJava_GetSharedPreferenceString(name, key, default) — UE's own
+// convenience over Android SharedPreferences. On a fresh Klepton install there
+// is nothing stored, so the honest answer is the caller's default (the last
+// argument); returning it is what Android returns for an absent key anyway, and
+// it is enough to get a UE5 title (OLAR) past the settings read it does at boot
+// instead of aborting on an unimplemented method.
+static klj_val klj_GA_getSharedPreferenceString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *def = (n > 0 && a[n - 1].l) ? klj_str(a[n - 1].l) : "";
+    return (klj_val){.l = kl_jni_new_string(def ? def : "")};
+}
+
+// io/sentry/unreal/SentryBridgeJava.init(...) — the Sentry crash-reporting SDK's
+// Java bridge. We have no Sentry backend and want none; a no-op init lets the
+// guest (Into the Radius) proceed. It only ever reports on a crash we would see
+// ourselves, so swallowing it loses nothing.
+static klj_val klj_Sentry_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("SentryBridgeJava.init() — no-op (no Sentry backend)");
+    return (klj_val){.l = NULL};
+}
+
+// A GameActivity void method we deliberately do nothing for. OLAR registers a
+// network-reachability listener; there is no Android connectivity service here
+// and the engine treats "never notified" as "no change," which is correct for a
+// device that is simply online.
+static klj_val klj_GA_void_noop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = NULL};
+}
+
+// The Electra H264 decoder (com/epicgames/unreal/ElectraVideoDecoderH264) that
+// wanderer drives for its intro video is a whole family of its own — see
+// runtime/jni/kl_jni_electra.c, which wires it to kl_vtdec. It used to be a
+// single GetDecoderInformation stub returning NULL here to skip the video.
+
 const klj_binding klj_bind_ue4[] = {
     {"android/view/Display", "getRefreshRate", "()F", klj_Display_getRefreshRate},
     {"android/view/Display", "getAppVsyncOffsetNanos",        "()J", klj_Display_getAppVsyncOffsetNanos},
@@ -811,10 +926,37 @@ const klj_binding klj_bind_ue4[] = {
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetMetaDataString",
      "(Ljava/lang/String;)Ljava/lang/String;", klj_GA_getMetaDataString},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_InitHMDs", "()V", klj_GA_initHMDs},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ForceQuit", "()V", klj_GA_forceQuit},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetDesiredViewSize", "(II)V",
      klj_GA_setDesiredViewSize},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetNativeDisplayRefreshRate",
+     "()I", klj_GA_getNativeDisplayRefreshRate},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetDeviceOrientation",
+     "()I", klj_GA_getDeviceOrientation},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetNativeDisplayRefreshRate",
+     "(I)Z", klj_GA_setNativeDisplayRefreshRate},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetSupportedNativeDisplayRefreshRates",
+     "()[I", klj_GA_getSupportedRefreshRates},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetFontDirectory",
      "()Ljava/lang/String;", klj_GA_getFontDirectory},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_AddNetworkListener",
+     "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_InitializeWithPermission",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsBhapticsAvailable",
+     "()Z", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_EnableMotion",
+     "(Z)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetSharedPreferenceString",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+     klj_GA_getSharedPreferenceString},
+    {"io/sentry/unreal/SentryBridgeJava", "init",
+     "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+     klj_Sentry_init},
+    {"io/sentry/unreal/SentryBridgeJava", "setContext",
+     "(Ljava/lang/String;Ljava/util/HashMap;)V", klj_Sentry_init},
+    {"io/sentry/unreal/SentryBridgeJava", "setTag",
+     "(Ljava/lang/String;Ljava/lang/String;)V", klj_Sentry_init},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_PushSensorEvents", "()V",
      klj_GA_pushSensorEvents},
     // UE4's three BroadcastReceivers. `startReceiver` is where the state is

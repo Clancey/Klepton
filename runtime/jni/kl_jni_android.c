@@ -744,6 +744,30 @@ static klj_val klj_Buffer_rewind(void *env, void *self, const klj_val *a, int n)
 }
 // klj_void_noop is further down — it is the shared void handler, and these
 // bindings use it rather than adding a second one.
+static klj_val klj_PlayAssetDelivery_init(void *env, void *self,
+                                          const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // No Play Asset Delivery on this host (there is no Play Store), so Unity's
+    // core asset loading falls back to the APK/OBB. The caller does NOT null-
+    // check init()'s result — it calls GetObjectClass on it immediately — so a
+    // null return aborts; hand back a live stub wrapper instead. Any method the
+    // guest then calls on it is a work item to add if it is reached.
+    return (klj_val){.l = kl_jni_new_object("com/unity3d/player/PlayAssetDeliveryUnityWrapper")};
+}
+
+// Unity 6 (ZIX, 6000.3) initialises its accessibility bridge unconditionally
+// during UnityPlayer construction, and fataled here ("no host implementation")
+// before its first frame. Same contract as PlayAssetDelivery_init above: the
+// native caller does not null-check, so it gets a live stub delegate. There is
+// no screen reader on this host to drive it; the guest's own natives
+// (getRootNodeIds, hitTest, ...) are registered but nothing here calls them,
+// which is exactly what an Android device with accessibility off looks like.
+static klj_val klj_UnityAccessibilityDelegate_init(void *env, void *self,
+                                                   const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object("com/unity3d/player/UnityAccessibilityDelegate")};
+}
+
 static klj_val klj_false(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 0};
@@ -925,9 +949,22 @@ static klj_val klj_WifiManager_getConnectionInfo(void *env, void *self,
 // answer is yes — the guest is streaming from a Steam host over it as it asks.
 // Answering null would say the machine is offline while its own socket is
 // connected, and the stream scene reads that as a reason there is no video.
+// KL_NET_OFFLINE — report the device as having NO network, for a guest meant to
+// run OFFLINE. AC Nexus is one: its UbiServices SDK reads the answers below as
+// "online" and then blocks the main loop on Ubisoft requests that time out
+// (~1.25 s each, the Scheduler::dispatch stalls). Reporting no network sends it
+// straight to offline mode. Default 0 keeps the honest "connected" answer every
+// other guest needs (Steam Link streams over it).
+static int kl_net_offline(void) {
+    static int v = -1;
+    if (v < 0) v = kl_env_on("KL_NET_OFFLINE", 0);
+    return v;
+}
+
 static klj_val klj_ConnectivityManager_getActiveNetwork(void *env, void *self,
                                                         const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
+    if (kl_net_offline()) return (klj_val){.l = NULL};
     static void *net;
     return klj_singleton("android/net/Network", &net);
 }
@@ -944,6 +981,7 @@ static klj_val klj_ConnectivityManager_getActiveNetwork(void *env, void *self,
 static klj_val klj_ConnectivityManager_getActiveNetworkInfo(void *env, void *self,
                                                             const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
+    if (kl_net_offline()) return (klj_val){.l = NULL};
     static void *info;
     return klj_singleton("android/net/NetworkInfo", &info);
 }
@@ -954,7 +992,8 @@ static klj_val klj_ConnectivityManager_getActiveNetworkInfo(void *env, void *sel
 static klj_val klj_NetworkInfo_isConnected(void *env, void *self,
                                            const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    KLJ_LOG("NetworkInfo.isConnected() -> true");
+    if (kl_net_offline()) { KLJ_LOG_ONCE("NetworkInfo.isConnected() -> false (KL_NET_OFFLINE)"); return (klj_val){.j = 0}; }
+    KLJ_LOG_ONCE("NetworkInfo.isConnected() -> true");
     return (klj_val){.j = 1};
 }
 
@@ -974,7 +1013,7 @@ static klj_val klj_NetworkInfo_isConnected(void *env, void *self,
 static klj_val klj_NetworkInfo_getType(void *env, void *self,
                                        const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    KLJ_LOG("NetworkInfo.getType() -> TYPE_WIFI");
+    KLJ_LOG_ONCE("NetworkInfo.getType() -> TYPE_WIFI");
     return (klj_val){.j = KLJ_CONNECTIVITY_TYPE_WIFI};
 }
 
@@ -994,6 +1033,7 @@ static klj_val klj_NetworkInfo_getType(void *env, void *self,
 static klj_val klj_ConnectivityManager_getNetworkCapabilities(void *env, void *self,
                                                               const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
+    if (kl_net_offline()) return (klj_val){.l = NULL};
     static void *caps;
     return klj_singleton("android/net/NetworkCapabilities", &caps);
 }
@@ -1002,6 +1042,7 @@ static klj_val klj_NetworkCapabilities_hasTransport(void *env, void *self,
                                                     const klj_val *a, int n) {
     (void)env; (void)self;
     int t   = n > 0 ? (int)(int32_t)a[0].j : -1;
+    if (kl_net_offline()) { KLJ_LOG("NetworkCapabilities.hasTransport(%d) -> false (KL_NET_OFFLINE)", t); return (klj_val){.j = 0}; }
     int yes = (t == KLJ_NC_TRANSPORT_WIFI);
     KLJ_LOG("NetworkCapabilities.hasTransport(%d) -> %s", t, yes ? "true" : "false");
     return (klj_val){.j = (uint64_t)yes};
@@ -1303,6 +1344,29 @@ static void klj_obb_census(const char *dir) {
         if (!*first_other) snprintf(first_other, sizeof first_other, "%s", e->d_name);
     }
     closedir(d);
+
+    // The PATCH set, itemised — this census used to look only for main, so a
+    // run with main present but every patch/pakchunk absent read as "obb
+    // present" and the game then sat forever on its own loading screen with no
+    // line here to explain it (Asgard's Wrath 2: main.obb is 4.3 GB of
+    // bootstrap, the ~80 pakchunk patches are the other 58 GB and hold the
+    // content AND the shader pipeline caches). Count them and sum their bytes,
+    // so "main only" vs "main + N patches" is visible at a glance.
+    int patches = 0; long long patch_bytes = 0;
+    if ((d = opendir(dir))) {
+        while ((e = readdir(d)) != NULL) {
+            if (strncmp(e->d_name, "patch.", 6) != 0) continue;
+            size_t L = strlen(e->d_name);
+            if (L < 4 || strcmp(e->d_name + L - 4, ".obb") != 0) continue;
+            char p[1024]; struct stat st;
+            snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+            if (stat(p, &st) == 0 && st.st_size >= (1 << 20)) {
+                patches++; patch_bytes += (long long)st.st_size;
+            }
+        }
+        closedir(d);
+    }
+
     if (match) {
     // 1 MB is not a threshold anyone has to tune: the smallest real OBB in
         // this project is hundreds of megabytes, and the failures this catches
@@ -1314,8 +1378,16 @@ static void klj_obb_census(const char *dir) {
                     "and Unity will say the OBB's GUID is ''. Re-stage the obb "
                     "directory with the links RESOLVED",
                     code, dir, bytes);
+        else if (patches)
+            KLJ_LOG("obb: main.%ld.*.obb present in %s (%lld bytes) + %d patch "
+                    "obb(s) (%lld bytes) — full set staged",
+                    code, dir, bytes, patches, patch_bytes);
         else
-            KLJ_LOG("obb: main.%ld.*.obb is present in %s (%lld bytes)",
+            KLJ_LOG("obb: main.%ld.*.obb is present in %s (%lld bytes) but NO patch "
+                    "obbs — a title that ships pakchunk patches (its content and "
+                    "shader caches) will boot to its loading screen and STAY "
+                    "there. Re-stage the whole obb directory (run.sh --stage / "
+                    "build_run_vpro.sh --stage)",
                     code, dir, bytes);
         return;
     }
@@ -1335,11 +1407,27 @@ static void klj_obb_census(const char *dir) {
 // literal here would have been right for the guests that call this function and
 // silently wrong for the one that never does — including for the census, which
 // is the only instrument that says whether the game data is present at all.
+// Set by the active target (kl_app on device, kl_target_apply_host on host).
+// Empty until then; see kl_jni_set_obb_rel and kl_jni_obb_dir.
+static char g_obb_rel[256];
+void kl_jni_set_obb_rel(const char *rel) {
+    snprintf(g_obb_rel, sizeof g_obb_rel, "%s", rel && *rel ? rel : "");
+}
 const char *kl_jni_obb_dir(void) {
     static char path[1024];
     if (!*path) {
-        const kl_target *t = kl_target_resolve(NULL);
-        const char *rel = t && t->obb && *t->obb ? t->obb : "obb";
+        // The active target's own obb field, pushed in by whoever configured
+        // the run. Only if nobody did — which does not happen on either the
+        // device or host boot paths — fall back to resolving KL_TARGET, and
+        // finally to "obb". The fallback used to be the ONLY path and was
+        // wrong on device: KL_TARGET is unset there, so a UE4 guest's
+        // Android/obb/<package> collapsed to the default "obb". See
+        // kl_jni_set_obb_rel.
+        const char *rel = g_obb_rel;
+        if (!*rel) {
+            const kl_target *t = kl_target_resolve(NULL);
+            rel = t && t->obb && *t->obb ? t->obb : "obb";
+        }
         snprintf(path, sizeof path, "%s/%s", kl_jni_files_dir(), rel);
         klj_mkdir_p(path);
         klj_obb_census(path);
@@ -1361,7 +1449,76 @@ static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, in
     return (klj_val){.l = klj_new_file(klj_obb_dir())};
 }
 
+// java/util/HashMap — a real (small, linear) map. Guests build one and hand it
+// to a subsystem that reads it back (Into the Radius populates one right after
+// SentryBridgeJava.init), so a no-op put that drops the entry is not enough: the
+// value has to come back out. Keys are compared by string content when both are
+// Java strings (the common case — tag maps, config maps) and by identity
+// otherwise.
+typedef struct { void *k, *v; } klj_map_pair;
+typedef struct { klj_map_pair *e; unsigned n, cap; } klj_map;
+
+static int klj_map_key_eq(void *a, void *b) {
+    if (a == b) return 1;
+    const char *sa = a ? klj_str(a) : NULL, *sb = b ? klj_str(b) : NULL;
+    if (sa && sb) return strcmp(sa, sb) == 0;
+    return 0;
+}
+static klj_map *klj_map_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o ? o->data : NULL;
+}
+static klj_val klj_HashMap_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    if (self) klj_as_object(self)->data = calloc(1, sizeof(klj_map));
+    return (klj_val){.l = self};
+}
+static klj_val klj_HashMap_put(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_map *m = klj_map_of(self);
+    if (!m || n < 2) return (klj_val){.l = NULL};
+    for (unsigned i = 0; i < m->n; i++)
+        if (klj_map_key_eq(m->e[i].k, a[0].l)) {
+            void *old = m->e[i].v; m->e[i].v = a[1].l;
+            return (klj_val){.l = old};
+        }
+    if (m->n == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 8;
+        m->e = realloc(m->e, m->cap * sizeof *m->e);
+    }
+    m->e[m->n].k = a[0].l; m->e[m->n].v = a[1].l; m->n++;
+    return (klj_val){.l = NULL};
+}
+static klj_val klj_HashMap_get(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_map *m = klj_map_of(self);
+    if (m && n >= 1)
+        for (unsigned i = 0; i < m->n; i++)
+            if (klj_map_key_eq(m->e[i].k, a[0].l)) return (klj_val){.l = m->e[i].v};
+    return (klj_val){.l = NULL};
+}
+static klj_val klj_HashMap_containsKey(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_map *m = klj_map_of(self);
+    if (m && n >= 1)
+        for (unsigned i = 0; i < m->n; i++)
+            if (klj_map_key_eq(m->e[i].k, a[0].l)) return (klj_val){.j = 1};
+    return (klj_val){.j = 0};
+}
+static klj_val klj_HashMap_size(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_map *m = klj_map_of(self);
+    return (klj_val){.j = m ? (int)m->n : 0};
+}
+
 const klj_binding klj_bind_android[] = {
+    {"java/util/HashMap", "<init>", "()V", klj_HashMap_init},
+    {"java/util/HashMap", "put",
+     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_put},
+    {"java/util/HashMap", "get",
+     "(Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_get},
+    {"java/util/HashMap", "containsKey", "(Ljava/lang/Object;)Z", klj_HashMap_containsKey},
+    {"java/util/HashMap", "size", "()I", klj_HashMap_size},
 // ICU's time zones, which is where Mono's TimeZoneInfo looks on Android.
     {"android/icu/util/TimeZone", "getDefault", "()Ljava/lang/Object;", klj_TimeZone_getDefault},
     {"android/icu/util/TimeZone", "getID", "()Ljava/lang/String;", klj_TimeZone_getID},
@@ -1404,6 +1561,16 @@ const klj_binding klj_bind_android[] = {
     {"android/content/Intent", "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_addCategory},
     {"android/content/Intent", "getIntExtra", "(Ljava/lang/String;I)I",     klj_Intent_getIntExtra},
     {"android/content/Intent", "getBooleanExtra", "(Ljava/lang/String;Z)Z", klj_Intent_getBooleanExtra},
+    // Our synthetic launcher Intent carries no extras, so hasExtra is always
+    // false — the truthful answer for a MAIN/LAUNCHER intent (ATF probes it).
+    {"android/content/Intent", "hasExtra", "(Ljava/lang/String;)Z", klj_false},
+    // Vertigo Games' log utility (ATF). clearLogs()/related are dev telemetry
+    // helpers; no-op so the game's init that pokes them proceeds.
+    // klj_false returns 0; the caller of a void method discards it, so it is
+    // a fine no-op here (android.c has no shared void handler).
+    {"com/vertigogames/vertigoandroidutils/LogcatUtility", "clearLogs", "()V", klj_false},
+    {"com/vertigogames/vertigoandroidutils/LoggerInstance", "logToFile",
+     "(Ljava/lang/String;Ljava/lang/String;)Z", klj_false},
     {"android/content/Intent", "getStringExtra",  "(Ljava/lang/String;)Ljava/lang/String;",
      klj_Intent_getStringExtra},
     {"android/content/Intent", "getComponent",    "()Landroid/content/ComponentName;",
@@ -1484,6 +1651,19 @@ const klj_binding klj_bind_android[] = {
     // manifest), not embedded in a host app — so the Unity-as-a-Library
     // predicate is false, which is what the real Android would compute.
     {"com/unity3d/player/UnityPlayer", "isUaaLUseCase", "()Z", klj_false},
+    // Newer UnityPlayer boot callbacks. shouldSetGameState gates restoring a
+    // saved instance state (none here -> false); initializeGoogleAr asks whether
+    // to bring up ARCore, which this host does not provide. Both fataled
+    // ("no host implementation") once a guest's frame loop reached them.
+    {"com/unity3d/player/UnityPlayer", "shouldSetGameState", "()Z", klj_false},
+    {"com/unity3d/player/UnityPlayer", "initializeGoogleAr", "()Z", klj_false},
+    {"com/unity3d/player/UnityPlayer", "supportsWindowInsetController", "()Z", klj_false},
+    {"com/unity3d/player/PlayAssetDeliveryUnityWrapper", "init",
+     "(Lcom/unity3d/player/UnityPlayer;Landroid/content/Context;)Lcom/unity3d/player/PlayAssetDeliveryUnityWrapper;",
+     klj_PlayAssetDelivery_init},
+    {"com/unity3d/player/UnityAccessibilityDelegate", "init",
+     "(Lcom/unity3d/player/UnityPlayer;)Lcom/unity3d/player/UnityAccessibilityDelegate;",
+     klj_UnityAccessibilityDelegate_init},
 
     {"bitter/jnibridge/JNIBridge", "newInterfaceProxy",
      "(J[Ljava/lang/Class;)Ljava/lang/Object;", klj_JNIBridge_newInterfaceProxy},

@@ -58,6 +58,13 @@ KL_VTHUNK klv_sprintf,            klh_sprintf,           2
 KL_VTHUNK klv_snprintf,           klh_snprintf,          3
 KL_VTHUNK klv_asprintf,           klh_asprintf,          2
 KL_VTHUNK klv_dprintf,            klh_dprintf,           2
+// __sprintf_chk(dst, flag, cap, fmt, ...) — FORTIFY sprintf. Its four named args
+// (dst, flag, cap, fmt) are exactly klb___vsprintf_chk's, so the thunk hands &va
+// as the 5th arg and reuses that handler directly (no separate klh_ needed).
+KL_VTHUNK klv___sprintf_chk,      klb___vsprintf_chk,    4
+// __snprintf_chk(dst, n, flag, cap, fmt, ...) — one more named arg; forwards to
+// klb___snprintf_chk (see kl_libc_slink.c).
+KL_VTHUNK klv___snprintf_chk,     klb___snprintf_chk,    5
 KL_VTHUNK klv_syslog,             klh_syslog,            2
 KL_VTHUNK klv_warnx,              klh_warnx,             1
 KL_VTHUNK klv_android_log_print,  klh_android_log_print, 3

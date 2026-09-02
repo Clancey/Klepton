@@ -219,6 +219,19 @@ static const struct poke_cap_row k_poke_caps[] = {
     // memsz 0x111676), which is what a singleton pointer filled at runtime
     // looks like.
     { "2022.3.22f2-DWR", 0x19943c0, 0xec, 1 },
+    // Unity 2019.1.10f1 — Liminal (2026-08-23). The engine was rejecting units
+    // >= 32 ~68k times a session, so its dialog/dynamic text sampled a stale
+    // unit-0 texture and rendered as tofu boxes. Measured by the recipe above
+    // against this build's libunity (the __klelf ELF inside the framework):
+    //   0x10b04c0  "OpenGL Error: Invalid texture unit!"
+    //   0xb0520c   bl 0x5bdaf8            ; the singleton getter
+    //   0xb05210   ldr w8, [x0, #0xe8]    ; the cap
+    //   0xb05214   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x5bdaf8   adrp x8, 0x149e000 / ldr x0, [x8, #0x280]
+    // 0x149e280 lands in the RW LOAD (va 0x13b2000, memsz 0x1b3d18 -> 0x1565d18),
+    // a singleton pointer filled at runtime. Field 0xe8 is the same slot 2019.4
+    // uses; the singleton address is this build's own.
+    { "2019.1.10f1", 0x149e280, 0xe8, 1 },
 };
 #define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
 

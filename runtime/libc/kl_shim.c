@@ -29,6 +29,9 @@
 #include <libgen.h>
 #include <fnmatch.h>    // libunity (1.40) — every FNM_* number matches Linux's
 #include <pthread.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>   // pthread_set_qos_class_self_np for the receive-thread boost
+#endif
 #include <sched.h>
 #include <poll.h>
 #include <termios.h>
@@ -75,6 +78,7 @@ int getentropy(void *buffer, size_t size);
 #endif
 #include "klepton.h"
 #include "kl_env.h"
+#include "../guest/kl_obbmap.h"
 #include "kl_va.h"
 #include "kl_ndk.h"
 #include "kl_egl.h"
@@ -693,6 +697,26 @@ static int kl_socket(int domain, int type, int protocol) {
     }
     int fd = socket(domain, type, protocol);
     if (fd >= 0) kl_grow_sock_buffers(fd);
+    // Darwin traffic-class marking for the guest's UDP sockets. Steam Link's
+    // AV stream is plain UDP; stamped NET_SERVICE_TYPE_RV ("responsive
+    // multimedia - interactive media such as screen sharing", Apple's own
+    // description of exactly this workload) it rides the Wi-Fi WMM video/voice
+    // access categories instead of best-effort - lower airtime latency and
+    // jitter on the same link, which is also what Steam's bitrate controller
+    // reads when deciding to back off. KL_NET_RV=0 restores best-effort.
+#ifdef SO_NET_SERVICE_TYPE
+    if (fd >= 0 && type == SOCK_DGRAM && (domain == AF_INET || domain == AF_INET6)) {
+        static int rv = -1;
+        if (rv < 0) rv = kl_env_on("KL_NET_RV", 1);
+        if (rv) {
+            int st = NET_SERVICE_TYPE_RV;
+            if (setsockopt(fd, SOL_SOCKET, SO_NET_SERVICE_TYPE, &st, sizeof st) == 0) {
+                static int said; if (!said++) fprintf(stderr,
+                    "  [net] UDP sockets marked NET_SERVICE_TYPE_RV (interactive AV; KL_NET_RV=0 reverts)\n");
+            }
+        }
+    }
+#endif
     if (kl_net_trace())
         fprintf(stderr, "  [net] socket(dom=%d type=%d proto=%d) -> fd %d%s\n",
                 domain, type, protocol, fd, fd < 0 ? strerror(errno) : "");
@@ -762,6 +786,18 @@ static int klb_getifaddrs(struct ifaddrs **out) {
     return 0;
 }
 static void klb_freeifaddrs(struct ifaddrs *ifa) { freeifaddrs(ifa); }
+
+// JNI_GetCreatedJavaVMs(vmBuf, bufLen, nVMs) — the JNI invocation API's "hand me
+// the JavaVM already running in this process". Meta's MR Utility Kit
+// (libmrutilitykitshared, pulled in by olar/UE5) calls it to reach the VM;
+// unresolved, it was NULL and the guest jumped to 0x0 — which AMFI kills with an
+// uncatchable SIGKILL (signal 9). There is one synthetic VM here; return it.
+static int klb_JNI_GetCreatedJavaVMs(void **vmBuf, int bufLen, int *nVMs) {
+    void *vm = kl_jni_vm();
+    if (nVMs) *nVMs = vm ? 1 : 0;
+    if (vmBuf && bufLen >= 1 && vm) vmBuf[0] = vm;
+    return 0;   // JNI_OK
+}
 
 static int kl_connect(int fd, const struct sockaddr *sa, socklen_t len) {
     if (kl_net_offline()) {
@@ -1332,10 +1368,44 @@ static void kl_net_rate_note(int fd, ssize_t r) {
     s[i].pkts = 0; s[i].bytes = 0; s[i].lo = (size_t)-1; s[i].hi = 0; s[i].t0 = now;
 }
 
+// Raise a high-bitrate receive thread's QoS. Streaming guests (Steam Link) run
+// their UDP video receive on a thread they do NOT flag through
+// XR_KHR_android_thread_settings, so it rides at DEFAULT QoS and is scheduled
+// behind the compositor. A scheduling gap there lets the kernel UDP buffer
+// overflow, packets are lost, and Steam reads the loss as congestion and drops
+// the bitrate — the opposite of "maintain high bitrate". The thread that moves
+// the video bytes identifies ITSELF by throughput: a signalling/STUN thread
+// never accumulates much, a video receive thread crosses a couple of MB in a
+// fraction of a second. So bump the CALLING thread's own QoS (the safe self
+// door, no cross-thread race) once it has pulled enough to be the stream.
+// Thread-local and O(1) after the first hit. KL_NET_RECV_QOS=0 reverts.
+static void kl_net_rx_boost(ssize_t r) {
+#ifdef __APPLE__
+    if (r <= 0) return;
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_NET_RECV_QOS", 1);
+    if (!on) return;
+    static __thread uint64_t rx;
+    static __thread int boosted;
+    if (boosted) return;
+    rx += (uint64_t)r;
+    if (rx < (2ull << 20)) return;      // 2 MB: a video stream crosses this in a
+                                        // fraction of a second; signalling never does
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    boosted = 1;
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+    fprintf(stderr, "  [net] receive thread tid %llu has moved >2 MB -> raised to "
+                    "USER_INTERACTIVE QoS (high-bitrate stream; KL_NET_RECV_QOS=0 "
+                    "reverts)\n", (unsigned long long)tid);
+#else
+    (void)r;
+#endif
+}
 static ssize_t kl_recv(int fd, void *buf, size_t n, int flags) {
     int dflags = kl_msg_flags(flags, NULL);
     ssize_t r = recv(fd, buf, n, dflags);
     kl_net_rate_note(fd, r);
+    kl_net_rx_boost(r);
     if (kl_net_trace())
         fprintf(stderr, "  [net] recv(fd=%d, %zu B, flags=0x%x->0x%x) -> %zd%s\n",
                 fd, n, flags, dflags, r, r < 0 ? strerror(errno) : "");
@@ -1352,6 +1422,7 @@ static ssize_t kl_recvfrom(int fd, void *buf, size_t n, int flags,
     int dflags = kl_msg_flags(flags, NULL);
     ssize_t r = recvfrom(fd, buf, n, dflags, sa, len);
     kl_net_rate_note(fd, r);
+    kl_net_rx_boost(r);
     char host[80] = "-";
     if (r >= 0 && sa && len) {
         kl_sa_fmt(host, sizeof host, sa);
@@ -1362,6 +1433,23 @@ static ssize_t kl_recvfrom(int fd, void *buf, size_t n, int flags,
                 fd, n, flags, dflags, r, host, r < 0 ? strerror(errno) : "");
     kl_hexdump("<-", buf, r);
     return r;
+}
+
+// FORTIFY's recvfrom: __recvfrom_chk(fd, buf, len, __bos(buf), flags, sa, len).
+// hl2's libtier0 receives its game/LAN traffic through this fortified form and a
+// bare recvfrom binding never covered it, so the first packet aborted on an
+// unresolved import. The extra argument is the destination buffer's known size;
+// a well-formed call has len <= buflen, so this checks that and forwards to
+// kl_recvfrom (which still does the flag translation and the guest sockaddr
+// fixup). Clamp rather than trust: never let the socket write past the buffer.
+static ssize_t kl___recvfrom_chk(int fd, void *buf, size_t n, size_t cap, int flags,
+                                 struct sockaddr *sa, socklen_t *len) {
+    if (n > cap) {
+        if (kl_net_trace())
+            fprintf(stderr, "  [net] __recvfrom_chk: len %zu > buffer %zu — clamped\n", n, cap);
+        n = cap;
+    }
+    return kl_recvfrom(fd, buf, n, flags, sa, len);
 }
 
 // ---------- sendmsg / recvmsg: struct msghdr diverges ----------
@@ -1518,6 +1606,7 @@ static ssize_t kl_recvmsg(int fd, void *gmsg, int flags) {
     }
     ssize_t r = recvmsg(fd, &h, kl_msg_flags(flags, NULL));
     kl_net_rate_note(fd, r);
+    kl_net_rx_boost(r);
     char host[80] = "-";
     if (r >= 0) {
         if (h.msg_name && h.msg_namelen) {
@@ -1585,6 +1674,8 @@ static int kl_fd_is_regular(int fd) {
 }
 
 ssize_t kl_shim_read(int fd, void *buf, size_t n) {
+    int handled; ssize_t vr = kl_obbmap_read(fd, buf, n, &handled);
+    if (handled) return vr;   // OBB read-through fd — served from the archive
     ssize_t r = read(fd, buf, n);
     if (r >= 0 && (size_t)r < n && r != 0 && kl_fd_is_regular(fd)) {
         size_t done = (size_t)r;
@@ -1682,7 +1773,15 @@ static char *kl_strcpy_chk(char *d, const char *s, size_t dl) {
     if (strlen(s) + 1 > dl) die("__strcpy_chk overflow"); return strcpy(d, s); }
 static size_t kl_strlen_chk(const char *s, size_t dl) {
     size_t n = strlen(s);
-    if (n >= dl) die("__strlen_chk overflow");
+    if (n >= dl) {
+        // Name the string and the sizes before aborting — a fortify overflow is
+        // otherwise three layers removed from whatever handed the engine an
+        // over-long / unterminated buffer.
+        fprintf(stderr, "\n[klepton] __strlen_chk overflow: strlen=%zu >= object "
+                        "size=%zu; string=\"%.96s\"\n", n, dl, s);
+        fflush(stderr);
+        die("__strlen_chk overflow");
+    }
     return n;
 }
 static char *kl_strchr_chk(char *s, int ch, size_t dl) {
@@ -1699,6 +1798,54 @@ static int kl_vsnprintf_chk(char *d, size_t n, int flags, size_t dl,
     return vsnprintf(d, n, fmt, (va_list)m);
 }
 static size_t kl_malloc_usable_size(const void *p) { return malloc_size(p); }
+
+// jemalloc's extended allocation API. Android's system allocator IS jemalloc, so
+// guest libraries link these directly (Meta's MR Utility Kit — libmrutilitykit
+// shared, pulled in by olar — calls them from its own init). Darwin's allocator
+// is not jemalloc and exports none of them, so unresolved they were NULL and the
+// first call jumped to 0x0 → an uncatchable AMFI SIGKILL. Map them onto the host
+// allocator (Darwin's malloc_size / malloc_good_size give the sized-alloc info
+// jemalloc's flags variants carry). The `flags` (arena/alignment/zero hints) are
+// advisory and dropped; correctness does not depend on them.
+static void  *kl_mallocx(size_t size, int flags) {
+    if (!size) size = 1;
+    void *p = malloc(size);
+    if (p && (flags & 0x40)) memset(p, 0, size);   // MALLOCX_ZERO
+    return p;
+}
+static void  *kl_rallocx(void *p, size_t size, int flags) { (void)flags; return realloc(p, size); }
+static size_t kl_sallocx(const void *p, int flags)        { (void)flags; return malloc_size(p); }
+static void   kl_dallocx(void *p, int flags)              { (void)flags; free(p); }
+static void   kl_sdallocx(void *p, size_t size, int flags){ (void)size; (void)flags; free(p); }
+static size_t kl_nallocx(size_t size, int flags)          { (void)flags; return size ? malloc_good_size(size) : 0; }
+// xallocx resizes in place and returns the resulting size. We cannot grow in
+// place, so report the current size unchanged; a caller that wanted more sees no
+// growth and falls back to rallocx/realloc, which is the sanctioned path.
+static size_t kl_xallocx(void *p, size_t size, size_t extra, int flags) {
+    (void)size; (void)extra; (void)flags; return malloc_size(p);
+}
+// jemalloc's introspection/tuning knobs. There is no jemalloc here; answer
+// ENOENT ("no such option"), which is exactly how jemalloc reports an unknown
+// name and what well-behaved callers handle by carrying on with defaults.
+static int kl_mallctl(const char *name, void *op, size_t *ol, void *np, size_t nl) {
+    (void)name; (void)op; (void)ol; (void)np; (void)nl; return ENOENT;
+}
+static int kl_mallctlnametomib(const char *name, size_t *mib, size_t *miblen) {
+    (void)name; (void)mib; (void)miblen; return ENOENT;
+}
+static int kl_mallctlbymib(const size_t *mib, size_t miblen, void *op, size_t *ol,
+                           void *np, size_t nl) {
+    (void)mib; (void)miblen; (void)op; (void)ol; (void)np; (void)nl; return ENOENT;
+}
+// bionic's malloc-stats extension. Meta's MR Utility Kit imports it WEAKLY and
+// olar's build calls it during libmrutilitykitshared init WITHOUT null-testing
+// the weak slot — so left NULL it jumped to 0x0 and AMFI SIGKILL'd (signal 9,
+// olar's whole wall after the jemalloc shims). Answer "property not found"
+// (false, value untouched); the caller carries on with defaults. Signature is
+// bionic's: bool(const char* name, size_t name_size, size_t* value).
+static int kl_MallocExtension_GetNumericProperty(const char *name, size_t nsize, size_t *value) {
+    (void)name; (void)nsize; if (value) *value = 0; return 0;   // false: no such property
+}
 // execv would replace the HOST process with an Android binary. execl already
 // answers ENOSYS; match it.
 static int kl_execv(const char *p, char *const argv[]) {
@@ -1730,19 +1877,21 @@ X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
 X(klb___sched_cpucount) X(klb___libc_current_sigrtmin) X(klb___libc_current_sigrtmax)
 X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_statfs) X(klb_uname) X(klb_sigaction)
-X(klb_opendir) X(klb_readdir) X(klb_closedir)
+X(klb_opendir) X(klb_readdir) X(klb_closedir) X(klb_scandir) X(klb_alphasort)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
+X(klb_close) X(klb_lseek) X(klb_pread)
 X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename)
 X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
 X(klb_getrandom) X(klb_isnan)
-X(klb_mmap) X(klb_mprotect) X(klb_madvise) X(klb_sysinfo)
+X(klb_isnanf) X(klb_isinf) X(klb_isinff) X(klb_isfinite) X(klb_isfinitef)
+X(klb_mmap) X(klb_mprotect) X(klb_madvise) X(klb_sysinfo) X(klb_sbrk)
 X(klb_pthread_mutex_init) X(klb_pthread_mutex_lock) X(klb_pthread_mutex_unlock)
 X(klb_pthread_mutex_trylock) X(klb_pthread_mutex_destroy)
 X(klb_pthread_mutexattr_init) X(klb_pthread_mutexattr_destroy) X(klb_pthread_mutexattr_settype)
 X(klb_pthread_cond_init) X(klb_pthread_cond_destroy) X(klb_pthread_cond_signal)
-X(klb_pthread_cond_broadcast) X(klb_pthread_cond_wait) X(klb_pthread_cond_timedwait)
+X(klb_pthread_cond_broadcast) X(klb_pthread_cond_wait) X(klb_pthread_cond_timedwait) X(klb_pthread_cond_clockwait)
 X(klb_pthread_condattr_init) X(klb_pthread_condattr_destroy) X(klb_pthread_condattr_setclock)
 X(klb_pthread_rwlock_init) X(klb_pthread_rwlock_destroy) X(klb_pthread_rwlock_rdlock)
 X(klb_pthread_rwlock_wrlock) X(klb_pthread_rwlock_unlock)
@@ -1768,9 +1917,10 @@ X(klb_epoll_create) X(klb_epoll_create1) X(klb_epoll_ctl) X(klb_epoll_wait)
 X(klb_openat) X(klb___open_2)
 X(klb___memmove_chk) X(klb___strncpy_chk) X(klb___strncpy_chk2) X(klb___strcat_chk)
 X(klb___read_chk) X(klb___vsprintf_chk)
-X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64)
+X(klv___sprintf_chk) X(klv___snprintf_chk)
+X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64) X(klb_pwrite64)
 X(klb___strncat_chk) X(klb_ftruncate64) X(klb___fwrite_chk)
-X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_chdir)
+X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_chdir) X(klb_getcwd) X(klb_realpath)
 X(klb_sincosf) X(klb_sincos) X(klb_putchar) X(klb_getchar) X(klb_fdatasync)
 X(klb___cmsg_nxthdr) X(klb___cxa_thread_atexit_impl)
 X(klb_fileno) X(klb_fgetc) X(klb_ungetc) X(klb_getwc) X(klb_fgetwc)
@@ -1788,6 +1938,30 @@ X(klb___pthread_cleanup_push) X(klb___pthread_cleanup_pop)
 extern char **environ;
 // A VARIABLE, not a function, so it cannot ride the X() macro above.
 extern const unsigned char *klb_ctype_ptr;   // kl_libc_slink.c
+
+// POSIX per-process interval timers — bionic has them, Darwin does not (no
+// timer_t / timer_create). Xash3D imports the trio for a periodic timer it does
+// not strictly need on a platform that drives its own frame loop. Stub them:
+// creation "succeeds" with a token handle, arming is a no-op, and overrun is
+// always zero. A guest that only uses these for a spin it also polls a clock for
+// keeps working; one that depended on the signal would need real emulation
+// (a dispatch-source timer), which is the follow-up if a run shows it stalling.
+static int klb_timer_create(int clockid, void *sevp, void **timerid) {
+    (void)clockid; (void)sevp;
+    if (timerid) *timerid = (void *)(intptr_t)1;   // non-NULL token
+    return 0;
+}
+static int klb_timer_settime(void *t, int flags, const void *newv, void *oldv) {
+    (void)t; (void)flags; (void)newv; (void)oldv; return 0;
+}
+static int klb_timer_getoverrun(void *t) { (void)t; return 0; }
+
+// __stack_chk_guard — the stack-protector canary, a DATA symbol the guest reads
+// at function entry/exit. bionic exports it from libc; here the guest's copy is
+// unresolved (Source/Portal imports it), so provide one. The value only has to
+// be stable for the run and non-trivial; the guest never compares it to the
+// host's, it only checks its own prologue value against its own epilogue value.
+uintptr_t klb_stack_chk_guard = (uintptr_t)0x00000aff0a0000ULL;  // NUL/newline bytes trap overruns
 
 // ---------- table ----------
 typedef struct { const char *name; void *fn; } kl_entry;
@@ -1817,11 +1991,13 @@ static const kl_entry g_shim[] = {
     E("open", klv_open), E("fcntl", klv_fcntl), E("ioctl", klv_ioctl),
     E("setsockopt", kl_setsockopt), E("getsockopt", kl_getsockopt),
     E("read", kl_shim_read), E("usleep", kl_usleep),
+    E("close", klb_close), E("lseek", klb_lseek), E("pread", klb_pread),
     E("getaddrinfo", kl_getaddrinfo), E("connect", kl_connect),
     E("socket", kl_socket),
     E("bind", kl_bind), E("sendto", kl_sendto), E("accept", kl_accept),
     E("getifaddrs", klb_getifaddrs), E("freeifaddrs", klb_freeifaddrs),
-    E("recvfrom", kl_recvfrom), E("getpeername", kl_getpeername),
+    E("recvfrom", kl_recvfrom), E("__recvfrom_chk", kl___recvfrom_chk),
+    E("getpeername", kl_getpeername),
     E("sendmsg", kl_sendmsg), E("recvmsg", kl_recvmsg),
     E("send", kl_send), E("recv", kl_recv),
     E("getsockname", kl_getsockname),
@@ -1846,12 +2022,18 @@ static const kl_entry g_shim[] = {
 
     // divergent layouts / Android-only
     E("__errno", klb_errno), E("environ", &environ), E("gettid", klb_gettid),
+    // Xash3D (cs1/hl1) imports: a data global and the POSIX timer trio (stubbed).
+    E("in6addr_any", &in6addr_any),
+    E("timer_create", klb_timer_create), E("timer_settime", klb_timer_settime),
+    E("timer_getoverrun", klb_timer_getoverrun),
+    E("__stack_chk_guard", &klb_stack_chk_guard),   // Source/Portal data import
     E("stat", klb_stat), E("lstat", klb_lstat), E("fstat", klb_fstat), E("statfs", klb_statfs),
     E("uname", klb_uname), E("sigaction", klb_sigaction),
     E("sysconf", klb_sysconf),
     E("fopen", klb_fopen), E("access", klb_access),
     E("mkdir", klb_mkdir), E("unlink", klb_unlink), E("rename", klb_rename),
     E("opendir", klb_opendir), E("readdir", klb_readdir), E("closedir", klb_closedir),
+    E("scandir", klb_scandir), E("alphasort", klb_alphasort),
     E("lseek64", klb_lseek64), E("__ctype_get_mb_cur_max", klb_ctype_mb_cur_max),
     E("getpwuid", klb_getpwuid), E("getpwuid_r", klb_getpwuid_r),
     E("prctl", klb_prctl),
@@ -1860,11 +2042,15 @@ static const kl_entry g_shim[] = {
     // (no flags, 256-byte cap, 0/-1 rather than a count); isnan is a macro on
     // Darwin, so there is no symbol to forward. Both in kl_libc.c.
     E("getrandom", klb_getrandom), E("isnan", klb_isnan),
+    E("__isnan", klb_isnan), E("__isnanf", klb_isnanf), E("__isinf", klb_isinf),
+    E("__isinff", klb_isinff), E("__isfinite", klb_isfinite), E("__isfinitef", klb_isfinitef),
     E("mmap", klb_mmap), E("mprotect", klb_mprotect), E("madvise", klb_madvise),
+    E("sbrk", klb_sbrk),
     // Linux-only, and the third door onto the memory budget — UE4 asks here
     // where every Unity title reads /proc/meminfo. See klb_sysinfo.
     E("sysinfo", klb_sysinfo),
     E("sched_getaffinity", klb_sched_getaffinity), E("sched_setaffinity", klb_sched_setaffinity),
+    E("JNI_GetCreatedJavaVMs", klb_JNI_GetCreatedJavaVMs),
     E("__system_property_find", klb_sysprop_find),
     E("__system_property_get", klb_sysprop_get),
     E("__system_property_read", klb_sysprop_read),
@@ -1893,6 +2079,7 @@ static const kl_entry g_shim[] = {
     E("__memmove_chk", klb___memmove_chk), E("__strncpy_chk", klb___strncpy_chk),
     E("__strncpy_chk2", klb___strncpy_chk2), E("__strcat_chk", klb___strcat_chk),
     E("__read_chk", klb___read_chk), E("__vsprintf_chk", klb___vsprintf_chk),
+    E("__sprintf_chk", klv___sprintf_chk), E("__snprintf_chk", klv___snprintf_chk),
     // UE4 reads its OBB through pread64 from several threads, and FORTIFY
     // rewrites every one of those calls to the _chk form.
     E("__pread64_chk", klb___pread64_chk), E("__pwrite64_chk", klb___pwrite64_chk),
@@ -1901,6 +2088,7 @@ static const kl_entry g_shim[] = {
     // generator drops it. Only a FORTIFY build reaches the _chk form, so a guest
     // built without it would otherwise find this unresolved.
     E("pread64", klb_pread64),
+    E("pwrite64", klb_pwrite64),
     E("__strrchr_chk", klb___strrchr_chk), E("__strncat_chk", klb___strncat_chk),
     E("__fwrite_chk", klb___fwrite_chk),
     E("ftruncate64", klb_ftruncate64),
@@ -1918,6 +2106,8 @@ static const kl_entry g_shim[] = {
     // ...and the fifth path door, which decides where an id Tech 3 guest
     // thinks its whole installation is.
     E("chdir", klb_chdir),
+    E("getcwd", klb_getcwd),
+    E("realpath", klb_realpath),
     E("__sched_cpucount", klb___sched_cpucount),
     E("__libc_current_sigrtmin", klb___libc_current_sigrtmin),
     E("__libc_current_sigrtmax", klb___libc_current_sigrtmax),
@@ -1987,6 +2177,7 @@ static const kl_entry g_shim[] = {
     E("pthread_cond_broadcast", klb_pthread_cond_broadcast),
     E("pthread_cond_wait", klb_pthread_cond_wait),
     E("pthread_cond_timedwait", klb_pthread_cond_timedwait),
+    E("pthread_cond_clockwait", klb_pthread_cond_clockwait),
     E("pthread_condattr_init", klb_pthread_condattr_init),
     E("pthread_condattr_destroy", klb_pthread_condattr_destroy),
     E("pthread_condattr_setclock", klb_pthread_condattr_setclock),
@@ -2041,6 +2232,12 @@ static const kl_entry g_shim[] = {
     // Steam Link (SDL3) additions — plain forwards plus the small wrappers above
     E("getentropy", getentropy), E("tzset", tzset), E("strncasecmp", strncasecmp),
     E("malloc_usable_size", kl_malloc_usable_size), E("execv", kl_execv),
+    E("mallocx", kl_mallocx),
+    E("rallocx", kl_rallocx), E("sallocx", kl_sallocx), E("dallocx", kl_dallocx),
+    E("sdallocx", kl_sdallocx), E("nallocx", kl_nallocx), E("xallocx", kl_xallocx),
+    E("mallctl", kl_mallctl), E("mallctlnametomib", kl_mallctlnametomib),
+    E("mallctlbymib", kl_mallctlbymib),
+    E("MallocExtension_Internal_GetNumericProperty", kl_MallocExtension_GetNumericProperty),
 
     E("__klepton_unresolved", kl_unresolved),
 };

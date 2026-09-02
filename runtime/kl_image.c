@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <mach-o/loader.h>
 #include "klepton.h"
 #include "kl_x18.h"
 #include "kl_guestpatch.h"
@@ -62,6 +63,24 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define DT_FINI_ARRAYSZ 28
 #define DT_JMPREL 23
 #define DT_PLTRELSZ 2
+// Relative-relocation tables this loader must also honour. A library built by a
+// current NDK ships NONE of its relative relocs in DT_RELA: they are packed into
+// RELR (a bitmap) or Android's APS2 stream, and DT_RELA carries only the handful
+// that need a symbol. Miss these and every relative pointer — vtables, GOT, and
+// fatally the .init_array function pointers — keeps its raw link-time offset;
+// the first constructor call then jumps to that offset and AMFI kills the
+// process (CODESIGNING, "Invalid Page"). libmrutilitykitshared (olar) is the
+// first guest to use them: 6962 relocs in RELR (all 29 init_array slots) plus 15
+// in APS2. RELR has both the standardised tags and the older Android-range ones
+// bionic still emits; a library uses one spelling or the other.
+#define DT_RELR    0x24
+#define DT_RELRSZ  0x23
+#define DT_RELRENT 0x25
+#define DT_ANDROID_RELR    0x6fffe000
+#define DT_ANDROID_RELRSZ  0x6fffe001
+#define DT_ANDROID_RELRENT 0x6fffe003
+#define DT_ANDROID_RELA    0x60000011
+#define DT_ANDROID_RELASZ  0x60000012
 #define ELF64_R_SYM(i)  ((uint32_t)((i) >> 32))
 #define ELF64_R_TYPE(i) ((uint32_t)(i))
 #define R_AARCH64_ABS64      257
@@ -387,7 +406,14 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_JUMP_SLOT: {
             uint64_t v = sym_value(img, sidx, &nm);
-            if (!v && (img->symtab[sidx].st_info >> 4) == STB_WEAK
+            if (sidx == 0) {
+                // STN_UNDEF: a GLOB_DAT/ABS64 against symbol 0 resolves to 0
+                // (plus addend) per the ELF spec, exactly as bionic does — it is
+                // not a missing import. Without this the slot would get an abort
+                // trampoline and a guest that null-tests the pointer would call
+                // straight into it. APS2 streams emit these against symbol 0.
+                v = 0;
+            } else if (!v && (img->symtab[sidx].st_info >> 4) == STB_WEAK
                    && img->symtab[sidx].st_shndx == 0) {
                 // A WEAK undefined must stay NULL — that is the whole mechanism
                 // by which a guest asks whether an optional symbol exists. The
@@ -424,6 +450,77 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
     return 0;
 }
 
+// RELR: a bitmap-packed table of nothing but R_AARCH64_RELATIVE relocations. An
+// even entry is an address to relocate and seeds `where` for the bitmaps after
+// it; an odd entry is a bitmap whose set bits (from bit 1) relocate the 63 words
+// starting at `where`. Every relocated slot holds a link-time offset that the
+// load bias (img->base, since lo is 0 for every guest here) is added to — the
+// same adjustment R_AARCH64_RELATIVE makes, which is why none of this needs a
+// symbol. This is where a current NDK puts the .init_array pointers.
+static void apply_relr(kl_image *img, const uint64_t *relr, size_t count) {
+    const uintptr_t bias = (uintptr_t)img->base;
+    uint64_t *where = NULL;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t e = relr[i];
+        if ((e & 1) == 0) {
+            where = (uint64_t *)(bias + (uintptr_t)e);
+            *where++ += bias;
+            img->stats.relative++;
+        } else {
+            uint64_t bits = e >> 1;
+            for (uint64_t *w = where; bits; bits >>= 1, w++)
+                if (bits & 1) { *w += bias; img->stats.relative++; }
+            where += 63;
+        }
+    }
+}
+
+static int64_t read_sleb128(const uint8_t **pp, const uint8_t *end) {
+    int64_t r = 0; int shift = 0; uint8_t b = 0;
+    const uint8_t *p = *pp;
+    do {
+        if (p >= end) break;
+        b = *p++;
+        r |= (int64_t)(b & 0x7f) << shift;
+        shift += 7;
+    } while (b & 0x80);
+    if (shift < 64 && (b & 0x40)) r |= -((int64_t)1 << shift);
+    *pp = p;
+    return r;
+}
+
+// APS2 (Android packed relocations): a group-compressed stream of RELA entries.
+// Each is decoded back to (r_offset, r_info, r_addend) and handed to apply_relocs
+// one at a time, so a packed RELATIVE / GLOB_DAT / ABS64 / symbol-0 entry is
+// treated exactly as the same entry would be in a plain DT_RELA table. The four
+// group flags say which fields are shared across the group vs. read per-entry.
+static int apply_android_packed(kl_image *img, const uint8_t *blob, size_t sz) {
+    const uint8_t *p = blob, *end = blob + sz;
+    if (sz < 4 || memcmp(p, "APS2", 4) != 0) { err("DT_ANDROID_RELA not APS2"); return -1; }
+    p += 4;
+    int64_t count  = read_sleb128(&p, end);
+    int64_t offset = read_sleb128(&p, end);
+    int64_t info = 0, addend = 0;
+    enum { GRP_BY_INFO = 1, GRP_BY_OFF_DELTA = 2, GRP_BY_ADDEND = 4, GRP_HAS_ADDEND = 8 };
+    while (count > 0) {
+        int64_t gsz = read_sleb128(&p, end);
+        int64_t gf  = read_sleb128(&p, end);
+        int64_t goff_delta = (gf & GRP_BY_OFF_DELTA) ? read_sleb128(&p, end) : 0;
+        if (gf & GRP_BY_INFO) info = read_sleb128(&p, end);
+        if ((gf & GRP_HAS_ADDEND) && (gf & GRP_BY_ADDEND)) addend += read_sleb128(&p, end);
+        else if (!(gf & GRP_HAS_ADDEND)) addend = 0;
+        for (int64_t k = 0; k < gsz && count > 0; k++, count--) {
+            offset += (gf & GRP_BY_OFF_DELTA) ? goff_delta : read_sleb128(&p, end);
+            if (!(gf & GRP_BY_INFO)) info = read_sleb128(&p, end);
+            if ((gf & GRP_HAS_ADDEND) && !(gf & GRP_BY_ADDEND)) addend += read_sleb128(&p, end);
+            Elf64_Rela r; r.r_offset = (uint64_t)offset; r.r_info = (uint64_t)info;
+            r.r_addend = addend;
+            if (apply_relocs(img, &r, 1) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
 // Walk PT_DYNAMIC and bind the image: symtab/strtab, DT_INIT_ARRAY, and every
 // relocation. Shared by both loaders — the mmap path below and kl_load_dylib()
 // — because this half is identical either way. It is what lets klepton-ld emit a
@@ -436,6 +533,8 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
 static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t lo) {
     const Elf64_Rela *rela = NULL, *jmprel = NULL;
     size_t relasz = 0, pltsz = 0;
+    const uint64_t *relr = NULL; size_t relrsz = 0;
+    const uint8_t *arela = NULL; size_t arelasz = 0;
     for (int i = 0; i < phnum; i++) {
         if (ph[i].p_type != PT_DYNAMIC) continue;
         const Elf64_Dyn *dp = (const Elf64_Dyn *)(img->base + ph[i].p_vaddr - lo);
@@ -454,14 +553,25 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
             case DT_PLTRELSZ: pltsz = dp->d_val; break;
             case DT_INIT_ARRAY:   img->init_array = (void (**)(void))(img->base + dp->d_val); break;
             case DT_INIT_ARRAYSZ: img->init_count = dp->d_val / sizeof(void *); break;
+            case DT_RELR:
+            case DT_ANDROID_RELR:   relr   = (const uint64_t *)(img->base + dp->d_val); break;
+            case DT_RELRSZ:
+            case DT_ANDROID_RELRSZ: relrsz = dp->d_val; break;
+            case DT_ANDROID_RELA:   arela   = (const uint8_t *)(img->base + dp->d_val); break;
+            case DT_ANDROID_RELASZ: arelasz = dp->d_val; break;
             }
         }
     }
     if (!img->symtab || !img->strtab) { err("missing DT_SYMTAB/DT_STRTAB"); return -1; }
 
+    // Order is independent — RELA, RELR and APS2 relocate disjoint slots — but
+    // every relative table must run before kl_run_init: the .init_array pointers
+    // live in RELR/APS2 on a modern NDK and are raw offsets until relocated.
     if ((rela   && apply_relocs(img, rela,   relasz / sizeof(Elf64_Rela)) != 0) ||
         (jmprel && apply_relocs(img, jmprel, pltsz  / sizeof(Elf64_Rela)) != 0))
         return -1;
+    if (relr) apply_relr(img, relr, relrsz / sizeof(uint64_t));
+    if (arela && apply_android_packed(img, arela, arelasz) != 0) return -1;
     return 0;
 }
 
@@ -616,15 +726,23 @@ static int dylib_candidate(const char *path, char *out, size_t cap, char *name_o
     if (dot) *dot = 0;
     if (name_out) snprintf(name_out, name_cap, "%s", name);
 
+    // The on-disk framework/dylib can't carry '+' in its name — the App Store rejects
+    // a CFBundleExecutable that does (libc++_shared, error 90121) — so mkguest maps it
+    // to a filesystem-safe name. Apply the SAME map here to build the path, while the
+    // guest keeps calling the library by its real DT_NEEDED name (name_out, above).
+    char fsname[256];
+    snprintf(fsname, sizeof fsname, "%s", name);
+    for (char *p = fsname; *p; p++) if (*p == '+') *p = 'x';
+
     // Two layouts, because the host and the bundle disagree about what a
     // translated library looks like. `make dylibs` writes bare .dylib files; an
     // app bundle carries frameworks, which is also the layout AMFI accepts —
     // Xcode code-signs what it embeds in Frameworks/, and a loose Mach-O
     // elsewhere in the bundle is only sealed, not signed. Same image either
     // way.
-    snprintf(out, cap, "%s/%s.dylib", dir, name);
+    snprintf(out, cap, "%s/%s.dylib", dir, fsname);
     if (access(out, R_OK) == 0) return 1;
-    snprintf(out, cap, "%s/%s.framework/%s", dir, name, name);
+    snprintf(out, cap, "%s/%s.framework/%s", dir, fsname, fsname);
     return access(out, R_OK) == 0;
 }
 
@@ -1131,44 +1249,111 @@ void kl_unload(kl_image *img) {
 // search) has the exports in place. d_val entries are vaddrs; converting them
 // to file offsets goes through the PT_LOAD table, which on these libraries is
 // identity-mapped (p_vaddr == p_offset) but is not required to be.
+// Map an ELF vaddr to a pointer inside an in-memory image. Two layouts, because
+// the two sources below present the ELF differently: a raw .so on disk is in FILE
+// layout (index by the containing PT_LOAD's p_offset), while the ELF baked into a
+// translated dylib's __klelf is in LOAD/vaddr layout — the same one kl_load_dylib
+// and bind_dynamic read with `base + p_vaddr - lo`. Getting this wrong resolves
+// DT_STRTAB to garbage and every DT_NEEDED reads back empty.
+static const uint8_t *elf_vptr(const uint8_t *img, const Elf64_Phdr *ph, int phnum,
+                               uint64_t lo, int vaddr_layout, uint64_t va) {
+    if (vaddr_layout) return img + (va - lo);
+    for (int i = 0; i < phnum; i++)
+        if (ph[i].p_type == PT_LOAD && va >= ph[i].p_vaddr &&
+            va < ph[i].p_vaddr + ph[i].p_filesz)
+            return img + ph[i].p_offset + (va - ph[i].p_vaddr);
+    return NULL;
+}
+
+// DT_NEEDED out of an in-memory AArch64 ELF64 image. vaddr_layout selects how the
+// dynamic section and its string table are addressed (see elf_vptr).
+static int elf_list_needed(const uint8_t *img, int vaddr_layout, char names[][128], int max) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)img;
+    if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 || eh->e_machine != 183) return 0;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(img + eh->e_phoff);
+    uint64_t lo = UINT64_MAX;
+    for (int i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr < lo) lo = ph[i].p_vaddr;
+    if (lo == UINT64_MAX) lo = 0;
+
+    const Elf64_Dyn *dyn = NULL;
+    for (int i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_DYNAMIC) {
+            dyn = (const Elf64_Dyn *)elf_vptr(img, ph, eh->e_phnum, lo, vaddr_layout, ph[i].p_vaddr);
+            break;
+        }
+    const char *strtab = NULL;
+    if (dyn)
+        for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL; dp++)
+            if (dp->d_tag == DT_STRTAB) {
+                strtab = (const char *)elf_vptr(img, ph, eh->e_phnum, lo, vaddr_layout, dp->d_val);
+                break;
+            }
+    int n = 0;
+    if (dyn && strtab)
+        for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL && n < max; dp++)
+            if (dp->d_tag == DT_NEEDED) { snprintf(names[n], 128, "%s", strtab + dp->d_val); n++; }
+    return n;
+}
+
+// The DT_NEEDED sonames of an image, without loading it. Two sources, because the
+// ELF .so tree is on disk for a HOST run but NOT bundled on DEVICE — there only
+// the translated frameworks ship, with the original ELF baked into their
+// __TEXT,__klelf. Read the .so directly when it exists; otherwise resolve the
+// framework the same way kl_load_auto will and read DT_NEEDED out of __klelf.
+// Missing this second source silently dropped every bundled dependency on device
+// (vicecity/libmiamivr's libc++_shared.so was never loaded, and its first
+// allocation aborted in kl_unresolved_named on operator new / _Znwm).
 int kl_list_needed(const char *path, char names[][128], int max) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
+    if (fd >= 0) {
+        struct stat sb;
+        if (fstat(fd, &sb) == 0) {
+            uint8_t *file = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (file != MAP_FAILED) {
+                const Elf64_Ehdr *eh = (const Elf64_Ehdr *)file;
+                if (memcmp(eh->e_ident, "\x7f" "ELF", 4) == 0 && eh->e_machine == 183) {
+                    int n = elf_list_needed(file, 0, names, max);   // raw .so: file layout
+                    munmap(file, (size_t)sb.st_size);
+                    return n;
+                }
+                munmap(file, (size_t)sb.st_size);   // a Mach-O at this path: fall through
+            }
+        } else close(fd);
+    }
+    // Device: no .so on disk. Read DT_NEEDED from the translated dylib's __klelf.
+    char cand[1024];
+    if (!dylib_candidate(path, cand, sizeof cand, NULL, 0)) return -1;
+    int mfd = open(cand, O_RDONLY);
+    if (mfd < 0) return -1;
     struct stat sb;
-    if (fstat(fd, &sb) != 0) { close(fd); return -1; }
-    uint8_t *file = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (file == MAP_FAILED) return -1;
-
-    int n = 0;
-    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)file;
-    if (memcmp(eh->e_ident, "\x7f" "ELF", 4) == 0 && eh->e_machine == 183) {
-        const Elf64_Phdr *ph = (const Elf64_Phdr *)(file + eh->e_phoff);
-        const Elf64_Dyn *dyn = NULL;
-        for (int i = 0; i < eh->e_phnum; i++)
-            if (ph[i].p_type == PT_DYNAMIC) { dyn = (const Elf64_Dyn *)(file + ph[i].p_offset); break; }
-        const char *strtab = NULL;
-        if (dyn)
-            for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL; dp++)
-                if (dp->d_tag == DT_STRTAB) {
-                    // vaddr -> file offset via PT_LOAD
-                    for (int i = 0; i < eh->e_phnum; i++)
-                        if (ph[i].p_type == PT_LOAD &&
-                            dp->d_val >= ph[i].p_vaddr &&
-                            dp->d_val < ph[i].p_vaddr + ph[i].p_filesz) {
-                            strtab = (const char *)(file + ph[i].p_offset +
-                                                    (dp->d_val - ph[i].p_vaddr));
+    if (fstat(mfd, &sb) != 0) { close(mfd); return -1; }
+    uint8_t *mo = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, mfd, 0);
+    close(mfd);
+    if (mo == MAP_FAILED) return -1;
+    int n = -1;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)mo;
+    if ((size_t)sb.st_size >= sizeof *mh && mh->magic == MH_MAGIC_64) {
+        const uint8_t *lc = mo + sizeof *mh;
+        for (uint32_t i = 0; i < mh->ncmds && n < 0; i++) {
+            const struct load_command *cmd = (const struct load_command *)lc;
+            if (cmd->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                if (strcmp(seg->segname, "__TEXT") == 0) {
+                    const struct section_64 *sec = (const struct section_64 *)(lc + sizeof *seg);
+                    for (uint32_t s = 0; s < seg->nsects; s++)
+                        if (strcmp(sec[s].sectname, "__klelf") == 0) {
+                            // __klelf is in LOAD/vaddr layout (see elf_vptr / how
+                            // kl_load_dylib reads it), not raw file layout.
+                            n = elf_list_needed(mo + sec[s].offset, 1, names, max);
                             break;
                         }
-                    break;
                 }
-        if (dyn && strtab)
-            for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL && n < max; dp++)
-                if (dp->d_tag == DT_NEEDED) {
-                    snprintf(names[n], 128, "%s", strtab + dp->d_val);
-                    n++;
-                }
+            }
+            lc += cmd->cmdsize;
+        }
     }
-    munmap(file, (size_t)sb.st_size);
+    munmap(mo, (size_t)sb.st_size);
     return n;
 }

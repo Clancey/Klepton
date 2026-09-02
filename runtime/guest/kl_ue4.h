@@ -32,7 +32,10 @@
 //
 // `out` takes warnings that change what the run can do, or NULL for silence.
 // Returns 0, or non-zero with kl_ue4_error() set.
-int kl_ue4_configure(const char *libdir, FILE *out);
+// entry_lib is the target row's entry field ("libUE4", or "libUnreal" for a
+// UE5 guest — it selects the soname, the GameActivity package and the native
+// prefix in one move). NULL keeps the UE4 defaults.
+int kl_ue4_configure(const char *libdir, const char *entry_lib, FILE *out);
 
 // Why the last call that returned non-zero did. Never NULL.
 const char *kl_ue4_error(void);

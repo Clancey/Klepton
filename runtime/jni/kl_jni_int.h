@@ -18,6 +18,12 @@
 #include "kl_va.h"
 
 #define KLJ_LOG(...) do { fprintf(stderr, "[jni] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+// Hot-path variant: logs only the first time a given call site is reached.
+// For handlers that fire every frame with a constant answer (NetworkInfo,
+// connectivity), unconditional KLJ_LOG is thousands of synchronous stderr
+// writes per second on the render thread — enough to starve frame submission
+// and draw a visionOS watchdog kill. Log once; the answer never changes.
+#define KLJ_LOG_ONCE(...) do { static int _kl_logged; if (!_kl_logged) { _kl_logged = 1; KLJ_LOG(__VA_ARGS__); } } while (0)
 
 #define KLJ_MAX_CLASSES 512
 #define KLJ_MAX_NATIVES 1024
@@ -157,6 +163,7 @@ const char *klj_guest_package(void);
 klj_val     klj_PackageInfo_versionCode(void);
 klj_val     klj_PackageInfo_versionName(void);
 klj_val     klj_PackageInfo_packageName(void);
+klj_val     klj_PackageInfo_reqFeatures(void);
 klj_val     klj_appinfo_sourceDir(void);
 klj_val     klj_appinfo_nativeLibraryDir(void);
 klj_val     klj_appinfo_dataDir(void);
@@ -180,6 +187,8 @@ extern const klj_binding klj_bind_prefs[];
 extern const klj_binding klj_bind_io[];
 extern const klj_binding klj_bind_sdl[];
 extern const klj_binding klj_bind_ue4[];
+extern const klj_binding klj_bind_electra[];
+extern const klj_binding klj_bind_fmod[];
 extern const klj_binding klj_bind_jkxr[];
 extern const klj_binding klj_bind_services[];
 extern const klj_binding *const klj_binding_tables[];

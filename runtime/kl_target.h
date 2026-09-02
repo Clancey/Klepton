@@ -42,6 +42,24 @@ typedef enum {
     // the Activity's own order, threading the handle onCreate returned through
     // every one after it.
     KL_GUEST_JKXR,
+    // A plain Android NativeActivity + OpenXR guest: entered through
+    // ANativeActivity_onCreate, runs its own loop on the android_main thread the
+    // native-app-glue spawns, and submits its own OpenXR frames. No engine Java
+    // lifecycle — the shared kl_nativeactivity harness drives it. GTA Vice City VR
+    // (libmiamivr, a reVC/re3 port) is the first; other homebrew ports fit here.
+    KL_GUEST_NATIVE,
+    // SDL2 + OpenXR VR ports through org.libsdl.app.SDLActivity — kl_sdl2's door.
+    // The graph is mapped by the shared native loader, then SDL2's JNI_OnLoad and
+    // the SDLActivity handshake run the guest's entry on a background thread via
+    // nativeRunMain(lib, fn). Counter-Strike VR (cs1: libxash / SDL_main) and the
+    // Source ports (hl2/portal: liblauncher / LauncherMainAndroid) are here — the
+    // front DOOR, not the engine, is what this kind names.
+    KL_GUEST_SDL2,
+    // drbeef's GLES3JNILib door — kl_gles3jni. Static Java_com_drbeef_<pkg>_
+    // GLES3JNILib_* exports on a plain Activity (like JKXR): onCreate returns a
+    // handle threaded through onStart/onResume/onSurface*. Half-Life on Xash3D
+    // (hl1, com.drbeef.lambda1vr) is here; kl_jkxr keeps JKXR's own data layout.
+    KL_GUEST_GLES3JNI,
 } kl_guest_kind;
 
 typedef struct {

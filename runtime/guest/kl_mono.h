@@ -91,6 +91,22 @@ void kl_mono_poke_tick(void);
 // to claim, and it should not fork per platform. Returns 0 for anything absent.
 int  kl_mono_keycode_for_char(int ch);
 
+// Text-input request, shared through here because kl_mono is the keyboard seam.
+// The guest's SDLActivity.showTextInput sets it (kl_jni_sdl); there is no
+// on-screen keyboard in an immersive space, so the frontend polls this, focuses
+// a hidden text field to raise the SYSTEM keyboard, and feeds what is typed back
+// through kl_mono_key. The frontend clears it when the person dismisses the
+// keyboard. isScreenKeyboardShown reads the same flag, so the guest and the
+// frontend agree on whether text entry is up.
+void kl_mono_set_text_input(int on);
+int  kl_mono_text_input_wanted(void);
+
+// Deliver typed characters from the system keyboard to the guest as
+// SDL_TEXTINPUT (SDLInputConnection.nativeCommitText). Use this for text — not
+// kl_mono_key, whose key events do not fill an SDL text field. UTF-8; the
+// frontend calls it with each newly typed run. Backspace stays on kl_mono_key.
+void kl_mono_commit_text(const char *utf8);
+
 // --- frame out --------------------------------------------------------------
 
 // Register the kl_glfb frame sink. Must be called BEFORE the guest reaches its

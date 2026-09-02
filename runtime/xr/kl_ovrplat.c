@@ -8,6 +8,7 @@
 #include <sys/stat.h>              // the cloud-save directory is created
 #include "klepton.h"
 #include "kl_jni.h"
+#include "guest/kl_driver.h"   // target name, for the per-target KL_PLAT_USER default
 #include "kl_env.h"
 #include "kl_ovrplat.h"
 
@@ -88,6 +89,16 @@ static const char *const g_drm_markers[] = {
 static const char *const g_plat_absent[] = {
     "ovr_AssetFile_GetList",
     "ovr_Entitlement_GetIsViewerEntitled",
+    // The GetList completion's readers. They match the "AssetDetails"/"AssetFile"
+    // DRM markers by substring, but they only READ the empty list GetList
+    // returned - no id, no size, no delivery - so they carve out for the same
+    // reason GetList does: strictly more restrictive than the truth. The
+    // DELIVERY calls (ovr_AssetFile_Download*, DownloadById) are not here and
+    // stay refused.
+    "ovr_Message_GetAssetFileDeliveryList",
+    "ovr_AssetFileDeliveryList_GetSize",
+    "ovr_Message_GetAssetDetailsArray",
+    "ovr_AssetDetailsArray_GetSize",
 };
 
 static int plat_is_absent_ok(const char *name) {
@@ -96,8 +107,43 @@ static int plat_is_absent_ok(const char *name) {
     return 0;
 }
 
+// The IAP CATALOG calls — enumeration of what is for sale, not what is owned.
+// ovr_IAP_GetProductsBySKU returns a ProductArray of {sku, name, description,
+// formatted price}: the store's shop window, read to DECIDE whether to offer a
+// purchase. It reports no ownership and delivers no content, and on a host with
+// no store the truthful answer is "the request could not be made" (request 0),
+// the same answer ovr_User_GetLoggedInUser gives. This is the IAP twin of the
+// ovr_AssetFile_GetList carve-out: a pure enumeration is strictly MORE
+// restrictive than the truth. The OWNERSHIP half of the family is untouched and
+// still refuses — ovr_IAP_GetViewerPurchases (what the user bought),
+// ovr_IAP_ConsumePurchase, ovr_IAP_LaunchCheckoutFlow and every delivery call
+// keep matching the "IAP"/"Purchase" markers below, because this list is exact
+// names checked first, not a substring. GetNextProductArrayPage walks the same
+// catalog array, so it carves out for the same reason.
+static int plat_is_iap_catalog(const char *name) {
+    return strcmp(name, "ovr_IAP_GetProductsBySKU") == 0 ||
+           strcmp(name, "ovr_IAP_GetNextProductArrayPage") == 0;
+}
+
+// The read side of the OWNED half: "which IAPs has this viewer already bought?"
+// This looks like an ownership query, and it is — but answering it truthfully on
+// a host with no Oculus platform is "the request could not be made" (request id
+// 0), exactly what ovr_User_GetLoggedInUser and the IAP catalog return. That is
+// the OPPOSITE of circumvention: the guest is handed no purchase message, so it
+// learns of no entitlement it did not already have. Fabrication would be
+// DELIVERING a PurchaseArray that names something as owned, or answering the
+// WRITE side — ovr_IAP_ConsumePurchase / ovr_IAP_LaunchCheckoutFlow and the
+// AssetFile delivery calls — all of which stay in plat_is_drm and keep aborting.
+// So the honest failure is carved out and the grant-shaped calls are not.
+static int plat_is_iap_owned_query(const char *name) {
+    return strcmp(name, "ovr_IAP_GetViewerPurchases") == 0 ||
+           strcmp(name, "ovr_IAP_GetViewerPurchasesDeltaAsync") == 0;
+}
+
 static int plat_is_drm(const char *name) {
     if (plat_is_absent_ok(name)) return 0;
+    if (plat_is_iap_catalog(name)) return 0;
+    if (plat_is_iap_owned_query(name)) return 0;
     for (size_t i = 0; i < sizeof g_drm_markers / sizeof g_drm_markers[0]; i++)
         if (strstr(name, g_drm_markers[i])) return 1;
     return 0;
@@ -189,6 +235,10 @@ static uint64_t klplat_called(const char *name) {
 #define KLPLAT_MSG_APP_VERSION    1751583246u   //   .UserAgeCategory_Get
                                                 //   .Application_GetVersion
 #define KLPLAT_MSG_CLOUD_DIR      1990471406u   //   .CloudStorage2_GetUserDirectoryPath
+#define KLPLAT_MSG_ASSET_LIST     1258057588u   //   .AssetFile_GetList (KL_PROBE_ENUM, this APK)
+#define KLPLAT_MSG_ACCESS_TOKEN     0x06A85ABEu  // .User_GetAccessToken (Message<string>)
+#define KLPLAT_MSG_ACHIEVEMENT_DEFS 0x03D3458Du  // .Achievements_GetAllDefinitions (empty array)
+#define KLPLAT_MSG_LOGGED_IN_USER  0x436F345Du  // .User_GetLoggedInUser (Message<User>)
 #define KLPLAT_INIT_SUCCESS        0            // PlatformInitializeResult.Success
 #define KLPLAT_AGE_ADULT           3            // AccountAgeCategory.Ad
 
@@ -373,6 +423,119 @@ static uint64_t klplat_UnityInitWrapper(const char *app_id) {
 // was request id 1 with nothing ever arriving for it. The answer is unchanged
 // and so is the reasoning above; it is now delivered where the guest reads it,
 // as a non-error completion, which is how this API spells "entitled".
+// The platform's asset-file list. On a real Quest this is answered LOCALLY,
+// offline included: the platform reports which asset files are installed, and
+// for this title - whose whole 16 GB ships in the obb - the true answer is an
+// EMPTY list. Klepton used to refuse the request outright (request id 0), the
+// SDK surfaced "Request failed", and the game's loading orchestrator waited on
+// a content check that could never complete. An empty list delivers no
+// content, so the DRM line does not move: delivery, purchase and IAP queries
+// keep refusing.
+static uint64_t klplat_AssetFile_GetList(void) {
+    plat_hit("ovr_AssetFile_GetList");
+    return klplat_request("ovr_AssetFile_GetList", KLPLAT_MSG_ASSET_LIST, 0);
+}
+
+// The Oculus user *access token* — an opaque credential the app hands to its own
+// backend (Ubisoft Connect) to open a session. It is NOT an ownership answer: the
+// entitlement check is a separate request (klplat_Entitlement_GetIsViewerEntitled
+// above) and this token grants nothing on its own. Returning 0 — "the request
+// could not be made" — is what we did before, and AC Nexus does not treat it as a
+// soft failure: its platform-init chain logs "Request failed" and the loading->menu
+// transition aborts back to the loading loop. So we COMPLETE the request instead,
+// with an opaque offline token. With KL_NET_OFFLINE the token is never exchanged
+// against a server; the only point is that the request the game gates its own menu
+// on RESOLVES. Read back through ovr_Message_GetString, like CloudStorage2's path.
+static uint64_t klplat_User_GetAccessToken(void) {
+    plat_hit("ovr_User_GetAccessToken");
+    static const char tok[] = "OCACkleptonOfflineAccessToken000000000000";
+    return klplat_request_str("ovr_User_GetAccessToken",
+                              KLPLAT_MSG_ACCESS_TOKEN, 0, tok);
+}
+
+// Achievement *definitions* — the catalogue the game's achievement manager reads
+// at startup. No Oculus service here defines any, so the honest answer is an EMPTY
+// set, the same shape ovr_AssetFile_GetList's empty list takes. Delivered as a
+// completed request (IsError false, an AchievementDefinitionArray of size 0) rather
+// than as 0/"request could not be made", because AC Nexus gates its menu on the
+// request resolving and a bare 0 lands it on the same "Request failed" path that
+// aborts the transition. Achievements record what a player has DONE, not what they
+// own, so an empty definition set invents no entitlement. The size-0 array is read
+// through GetAchievementDefinitionArray (-> the message payload) and the existing
+// Array_GetSize answer (plat_is_empty_array -> 0).
+static uint64_t klplat_Achievements_GetAllDefinitions(void) {
+    plat_hit("ovr_Achievements_GetAllDefinitions");
+    return klplat_request("ovr_Achievements_GetAllDefinitions",
+                          KLPLAT_MSG_ACHIEVEMENT_DEFS, 0);
+}
+
+// Who is signed in — the ASYNC request form (the synchronous ovr_GetLoggedInUserID
+// is separate, below). Its completion is Message<User>. By DEFAULT we still answer
+// 0, "the request could not be made", which is the offline path Beat Saber wants
+// (see g_plat_request). But a title can run its online-init as a chain that ABORTS
+// on a failed request: AC Nexus's log shows the Oculus entitlement check PASS and
+// then this call fail with "Request failed", stranding it on the loading screen.
+// KL_PLAT_USER opts such a title into a synthetic OFFLINE user so the chain
+// completes. Not an ownership answer — entitlement is a separate request
+// (klplat_Entitlement_GetIsViewerEntitled) that already passed — only "who is
+// playing", which a real headset answers even with no network.
+// Default ON for titles that HARD-QUIT on a failed login rather than falling
+// back to offline. ZIX prints "Oculus Auth Failed! Quitting" and exits when
+// GetLoggedInUser returns 0, so for it the synthetic offline user is not
+// optional; the knob still overrides in either direction. Beat Saber and the
+// rest keep the default-0 offline path (they tolerate no user).
+static int klplat_user_default(void) {
+    // Titles that ABORT when ovr_GetLoggedInUserID / GetLoggedInUser returns 0 —
+    // they put up "Unable to get a valid UserID ... check you have an Entitlement"
+    // and then FMessageDialog->abort on the game thread. A synthetic offline user
+    // is strictly better for these: there is no Oculus service to sign in to, and
+    // the alternative is a hard exit before the menu. Unity titles that read 0 as
+    // "offline, carry on" are NOT in this list and keep the 0.
+    static const char *on[] = { "zix", "intotheradius", "redmatter2", "vampire", "twd2" };
+    const char *t = kl_driver_target_name();
+    if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
+        if (strcmp(t, on[i]) == 0) return 1;
+    return 0;
+}
+static uint64_t klplat_User_GetLoggedInUser(void) {
+    plat_hit("ovr_User_GetLoggedInUser");
+    if (!kl_env_on("KL_PLAT_USER", klplat_user_default())) {
+        static int said;
+        if (!said) { said = 1;
+            fprintf(stderr, "  [plat] ovr_User_GetLoggedInUser -> 0 (no platform "
+                    "user; set KL_PLAT_USER=1 for a synthetic offline user)\n"); }
+        return 0;
+    }
+    return klplat_request("ovr_User_GetLoggedInUser", KLPLAT_MSG_LOGGED_IN_USER, 0);
+}
+
+// The User that completion carries. The message handle IS the user handle (one
+// payload per message), and these read its fields. An offline user: a fixed
+// non-zero ovrID — 0 would read as "no user" and defeat the point — and a plain
+// name. Every other User field the SDK's model reads is optional, and NULL/0 is
+// how it spells "absent" (see the launch-details note), so only these three are
+// set; the rest answer 0 permissively and are never even reached unless
+// KL_PLAT_USER handed out the user above.
+static uint64_t klplat_User_GetID(const void *h) {
+    plat_hit("ovr_User_GetID"); (void)h;
+    return 1000000000000042ull;          // fixed, non-zero synthetic ovrID
+}
+static const char *klplat_User_GetOculusID(const void *h) {
+    plat_hit("ovr_User_GetOculusID"); (void)h;
+    return "kleptonplayer";
+}
+static const char *klplat_User_GetDisplayName(const void *h) {
+    plat_hit("ovr_User_GetDisplayName"); (void)h;
+    return "Klepton Player";
+}
+// The list payload's one accessor pair: the handle is the message (the same
+// convention as every other payload here), and its size is zero.
+static uint64_t klplat_AssetFileDeliveryList_GetSize(const void *h) {
+    plat_hit("ovr_AssetDetailsArray_GetSize");
+    (void)h;
+    return 0;
+}
+
 static uint64_t klplat_Entitlement_GetIsViewerEntitled(void) {
     plat_hit("ovr_Entitlement_GetIsViewerEntitled");
     return klplat_request("ovr_Entitlement_GetIsViewerEntitled",
@@ -575,12 +738,29 @@ static int plat_is_init(const char *name) {
 // of. Answering with a fabricated request id would have the caller polling
 // ovr_PopMessage for a completion that cannot come.
 static const char *const g_plat_request[] = {
+    // The IAP catalog (see plat_is_iap_catalog): a store query with no store to
+    // ask, so 0 = "request could not be made", the honest failure. Ownership IAP
+    // calls never reach here — plat_is_drm refuses them first.
+    "ovr_IAP_GetProductsBySKU", "ovr_IAP_GetNextProductArrayPage",
+    // Owned-inventory query: honest failure, grants nothing (see plat_is_iap_owned_query).
+    "ovr_IAP_GetViewerPurchases", "ovr_IAP_GetViewerPurchasesDeltaAsync",
     "ovr_RichPresence_Clear", "ovr_RichPresence_Set",
     "ovr_RichPresence_SetDestination", "ovr_RichPresence_SetIsJoinable",
     // Asking who is logged in is not an ownership question; with no platform
     // service the request cannot be made, which is what 0 says. Beat Saber
     // 1.28 takes its offline path from there (~swap 34k of the boot).
     "ovr_User_GetLoggedInUser",
+    // The signed-in user's SOCIAL graph — friends, and the room/party a friend
+    // is in. Pure social decoration, no ownership: with no platform service the
+    // request cannot be made (0). Asgard's Wrath 2 walks this whole family right
+    // after KL_PLAT_USER hands it a user; each is honestly "could not be made".
+    "ovr_User_GetLoggedInUserFriends",
+    "ovr_User_GetLoggedInUserFriendsAndRooms",
+    "ovr_User_GetLoggedInUserFriendsV2",
+    "ovr_User_GetNextUserArrayPage",
+    "ovr_User_GetOrgScopedID",
+    "ovr_User_LaunchFriendRequestFlow",
+    "ovr_User_GetLoggedInUserManagedInfo",
 };
 
 // Whole families where EVERY entry point is request-returning, so the same
@@ -757,13 +937,53 @@ static int plat_is_request(const char *name) {
 // on the spot. RE4 asks during engine init.
 static uint64_t klplat_GetLoggedInUserID(void) {
     plat_hit("ovr_GetLoggedInUserID");
+    // KL_PLAT_USER opts a title into a synthetic OFFLINE user, the same switch
+    // klplat_User_GetLoggedInUser reads for the async form. Some titles gate boot
+    // on "is anyone signed in?" and ForceQuit when this returns 0 — Asgard's
+    // Wrath 2 does exactly that (ovr_PlatformInitializeAndroid succeeds,
+    // ovr_GetLoggedInUserID == 0, then AndroidThunkJava_ForceQuit). The ID is
+    // the SAME synthetic ovrID ovr_User_GetID hands back, so the sync and async
+    // views of "who is playing" agree. This is a session identity, NOT an
+    // ownership answer: entitlement stays a separate request
+    // (ovr_Entitlement_GetIsViewerEntitled) that still returns "could not be
+    // made" and grants nothing. The default is the per-target one — the SAME
+    // klplat_user_default() the async form reads — so a title that fatals on a
+    // 0 here (Into the Radius, Red Matter 2: "Unable to get a valid UserID")
+    // gets the synthetic id without a flag, while titles fine with 0 (RE4) keep
+    // it. Previously this hardcoded 0 and only the async form honoured the
+    // per-target default, so the sync callers still fatalled.
+    if (kl_env_on("KL_PLAT_USER", klplat_user_default())) {
+        static int saidu;
+        if (!saidu) { saidu = 1;
+            fprintf(stderr, "  [plat] ovr_GetLoggedInUserID -> synthetic offline "
+                    "user (KL_PLAT_USER=1); NOT an entitlement grant\n"); }
+        return 1000000000000042ull;   // == klplat_User_GetID's synthetic ovrID
+    }
     static int said;
     if (!said) {
         said = 1;
         fprintf(stderr, "  [plat] ovr_GetLoggedInUserID -> 0 (no platform user; "
-                        "there is no service here to be signed in to)\n");
+                        "there is no service here to be signed in to; set "
+                        "KL_PLAT_USER=1 for a synthetic offline user)\n");
     }
     return 0;
+}
+
+// ovr_GetLoggedInUserLocale — a SYNCHRONOUS getter (returns const char*, not an
+// ovrRequest), the locale the store would report for the signed-in user. There
+// is no platform user here, but the guest reads the string to pick a language,
+// and a NULL would crash the read — so answer the host's, defaulting to en_US.
+static uint64_t klplat_GetLoggedInUserLocale(void) {
+    plat_hit("ovr_GetLoggedInUserLocale");
+    static char loc[16];
+    if (!loc[0]) {
+        const char *lang = getenv("LANG");            // e.g. "en_US.UTF-8"
+        int i = 0;
+        if (lang) for (; lang[i] && lang[i] != '.' && i < (int)sizeof loc - 1; i++) loc[i] = lang[i];
+        if (i == 0) { loc[0]='e'; loc[1]='n'; loc[2]='_'; loc[3]='U'; loc[4]='S'; i=5; }
+        loc[i] = '\0';
+    }
+    return (uint64_t)(uintptr_t)loc;
 }
 
 // The real libovrplatformloader exports JNI_OnLoad and caches the JavaVM out of
@@ -789,6 +1009,7 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"JNI_OnLoad",                (void *)klplat_JNI_OnLoad},
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
     {"ovr_GetLoggedInUserID",     (void *)klplat_GetLoggedInUserID},
+    {"ovr_GetLoggedInUserLocale", (void *)klplat_GetLoggedInUserLocale},
     {"ovr_UnityInitWrapper",      (void *)klplat_UnityInitWrapper},
     {"ovr_PopMessage",            (void *)klplat_PopMessage},
     {"ovr_FreeMessage",           (void *)klplat_FreeMessage},
@@ -796,6 +1017,32 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_UserAgeCategory_Get",   (void *)klplat_UserAgeCategory_Get},
     {"ovr_Application_GetVersion",(void *)klplat_Application_GetVersion},
     {"ovr_Message_GetApplicationVersion",      (void *)klplat_Message_GetPayload},
+    {"ovr_AssetFile_GetList",                  (void *)klplat_AssetFile_GetList},
+    {"ovr_Message_GetAssetFileDeliveryList",   (void *)klplat_Message_GetPayload},
+    {"ovr_AssetFileDeliveryList_GetSize",      (void *)klplat_AssetFileDeliveryList_GetSize},
+    // ...and the names this SDK build actually reads the same payload through
+    // (measured: the GetList completion was consumed via GetAssetDetailsArray,
+    // which the DRM family then refused by prefix). An EMPTY details array
+    // names no content, delivers no content, and unblocks the reader.
+    {"ovr_Message_GetAssetDetailsArray",       (void *)klplat_Message_GetPayload},
+    {"ovr_AssetDetailsArray_GetSize",          (void *)klplat_AssetFileDeliveryList_GetSize},
+    // The user access token and the achievement catalogue — two request-style
+    // calls the game issues during platform init and gates its menu on. Both
+    // complete with benign, empty/offline data (see the handlers above) rather
+    // than the bare 0 that lands the guest on its "Request failed" path. The
+    // exact-match binding here overrides the ovr_Achievements_ prefix rule.
+    {"ovr_User_GetAccessToken",                (void *)klplat_User_GetAccessToken},
+    {"ovr_Achievements_GetAllDefinitions",     (void *)klplat_Achievements_GetAllDefinitions},
+    {"ovr_Message_GetAchievementDefinitionArray", (void *)klplat_Message_GetPayload},
+    // The logged-in user (async) and the User accessors its completion feeds.
+    // Gated by KL_PLAT_USER inside the handler; the accessors are inert unless a
+    // user was handed out. The exact-match binding overrides ovr_User_GetLoggedInUser's
+    // entry in g_plat_request.
+    {"ovr_User_GetLoggedInUser",               (void *)klplat_User_GetLoggedInUser},
+    {"ovr_Message_GetUser",                    (void *)klplat_Message_GetPayload},
+    {"ovr_User_GetID",                         (void *)klplat_User_GetID},
+    {"ovr_User_GetOculusID",                   (void *)klplat_User_GetOculusID},
+    {"ovr_User_GetDisplayName",                (void *)klplat_User_GetDisplayName},
     {"ovr_ApplicationVersion_GetCurrentCode",  (void *)klplat_AppVersion_code},
     {"ovr_ApplicationVersion_GetLatestCode",   (void *)klplat_AppVersion_code},
     {"ovr_ApplicationVersion_GetCurrentName",  (void *)klplat_AppVersion_name},

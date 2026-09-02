@@ -29,6 +29,7 @@
 #include "klepton.h"
 #include "kl_ndk.h"
 #include "kl_vtdec.h"
+#include "kl_avdec.h"
 
 void kl_unresolved_named(const char *name);     // kl_shim.c
 
@@ -195,6 +196,9 @@ static const char *g_key_language        = "language";
 static const char *g_key_channel_count   = "channel-count";
 static const char *g_key_sample_rate     = "sample-rate";
 static const char *g_key_stride          = "stride";
+static const char *g_key_rotation        = "rotation-degrees";
+static const char *g_key_encoder_delay   = "encoder-delay";
+static const char *g_key_slice_height    = "slice-height";
 
 // ---------------------------------------------------------------------------
 // AMediaExtractor — the DEMUXER, and the one part of this file that refuses.
@@ -237,6 +241,7 @@ static const char *g_key_stride          = "stride";
 typedef struct {
     uint32_t magic;
     char    *source;        // for the report: what it was asked to open
+    kl_avdemux *dm;         // the demuxer, when a container was opened (else NULL)
 } klm_extractor;
 
 static klm_extractor *klm_ex(void *ex) {
@@ -260,6 +265,7 @@ static void *klm_AMediaExtractor_new(void) {
 static int klm_AMediaExtractor_delete(void *ex) {
     klm_extractor *x = klm_ex(ex);
     if (!x) return AMEDIA_ERROR_INVALID_OBJECT;
+    if (x->dm) { kl_avdemux_close(x->dm); x->dm = NULL; }
     free(x->source);
     x->magic = 0;
     free(x);
@@ -279,20 +285,51 @@ static int klm_extractor_refuse(klm_extractor *x, const char *what) {
     return AMEDIA_ERROR_UNSUPPORTED;
 }
 
+// KL_MEDIA_EXTRACTOR=0: refuse every extractor source politely, so a guest whose
+// video pipeline wedges a load (zix: a Unity VideoPlayer pump thread spinning in
+// AMediaExtractor_getSampleTrackIndex/advance while the hub scene never
+// activates) errors its VideoPlayer and proceeds without the video. Diagnostic
+// A/B first, per-target default only if it proves out — default ON (1) serves
+// video exactly as before for everyone.
+static int klm_extractor_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_MEDIA_EXTRACTOR", 1);
+    return on;
+}
+
 static int klm_AMediaExtractor_setDataSource(void *ex, const char *location) {
     klm_extractor *x = klm_ex(ex);
     if (!x) return AMEDIA_ERROR_INVALID_OBJECT;
+    if (!klm_extractor_enabled()) return klm_extractor_refuse(x, location);
+    if (location) {
+        x->dm = kl_avdemux_open(location, 0, 0);
+        if (x->dm) {
+            free(x->source); x->source = strdup(location);
+            fprintf(stderr, "  [media] AMediaExtractor: demuxing \"%s\"\n", location);
+            return AMEDIA_OK;
+        }
+    }
     return klm_extractor_refuse(x, location);
 }
 
 static int klm_AMediaExtractor_setDataSourceFd(void *ex, int fd, int64_t offset, int64_t length) {
-    (void)offset; (void)length;
     klm_extractor *x = klm_ex(ex);
     if (!x) return AMEDIA_ERROR_INVALID_OBJECT;
-    // The fd's own path if the kernel will give it — a refusal that names the
-    // file is worth more in a log than one that names a descriptor number.
+    if (!klm_extractor_enabled()) return klm_extractor_refuse(x, NULL);
+    // The fd's own path — the video lives at [offset, offset+length) inside it
+    // (a subfile of the OBB, usually). kl_avdemux slices that range out and
+    // demuxes it; the codec half (AMediaCodec -> kl_vtdec) decodes the Annex-B.
     char path[1024];
     int named = fd >= 0 && fcntl(fd, F_GETPATH, path) == 0;
+    if (named) {
+        x->dm = kl_avdemux_open(path, (long long)offset, (long long)length);
+        if (x->dm) {
+            free(x->source); x->source = strdup(path);
+            fprintf(stderr, "  [media] AMediaExtractor: demuxing \"%s\" [%lld+%lld]\n",
+                    path, (long long)offset, (long long)length);
+            return AMEDIA_OK;
+        }
+    }
     return klm_extractor_refuse(x, named ? path : NULL);
 }
 
@@ -300,19 +337,66 @@ static int klm_AMediaExtractor_setDataSourceFd(void *ex, int fd, int64_t offset,
 // are the values the NDK defines for "no more samples" / "no such track", not
 // invented ones, so a guest that ignored the setDataSource status still walks a
 // consistent empty stream rather than reading uninitialised memory.
-static size_t  klm_AMediaExtractor_getTrackCount(void *ex)      { (void)ex; return 0; }
-static void   *klm_AMediaExtractor_getTrackFormat(void *ex, size_t i) { (void)ex; (void)i; return NULL; }
-static int     klm_AMediaExtractor_selectTrack(void *ex, size_t i) {
-    (void)ex; (void)i; return AMEDIA_ERROR_INVALID_PARAMETER;
+static size_t klm_AMediaExtractor_getTrackCount(void *ex) {
+    klm_extractor *x = klm_ex(ex);
+    return (x && x->dm) ? 1 : 0;
+}
+static void *klm_AMediaExtractor_getTrackFormat(void *ex, size_t i) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x || !x->dm || i != 0) return NULL;
+    int w = 0, h = 0; const char *mime = NULL; long long dur = 0; float fps = 0;
+    kl_avdemux_info(x->dm, &w, &h, &mime, &dur, &fps);
+    klm_format *f = klm_AMediaFormat_new();
+    if (!f) return NULL;
+    klm_AMediaFormat_setString(f, g_key_mime, mime ? mime : "video/avc");
+    klm_AMediaFormat_setInt32(f, g_key_width, w);
+    klm_AMediaFormat_setInt32(f, g_key_height, h);
+    klm_AMediaFormat_setInt32(f, g_key_duration, (int32_t)dur);
+    // Frame rate: without it Unity's AndroidVideoMedia::GetFormatInfo cannot
+    // read a rate from the format, falls back to timing the first two samples,
+    // gets a zero delta on our probe path, logs "Unable to detect video frame
+    // rate", and tears the VideoPlayer down before real playback ever starts —
+    // which is why the world was black. nominalFrameRate gives it directly.
+    if (fps > 0)
+        klm_AMediaFormat_setInt32(f, g_key_frame_rate, (int32_t)(fps + 0.5f));
+    // Unity sizes its codec input buffers from max-input-size; without it the
+    // allocation is 0/garbage and the guest null-derefs in its allocator right
+    // after opening the video. A keyframe (with the parameter sets we inject) is
+    // well under this bound.
+    if (w > 0 && h > 0)
+        klm_AMediaFormat_setInt32(f, "max-input-size", w * h);
+    return f;
+}
+static int klm_AMediaExtractor_selectTrack(void *ex, size_t i) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x || !x->dm || i != 0) return AMEDIA_ERROR_INVALID_PARAMETER;
+    return AMEDIA_OK;               // the single video track is already reading
 }
 static ssize_t klm_AMediaExtractor_readSampleData(void *ex, uint8_t *buf, size_t cap) {
-    (void)ex; (void)buf; (void)cap; return -1;      // -1 is end of stream
+    klm_extractor *x = klm_ex(ex);
+    if (!x || !x->dm) return -1;
+    return (ssize_t)kl_avdemux_read(x->dm, buf, (unsigned long)cap);
 }
-static int     klm_AMediaExtractor_getSampleTrackIndex(void *ex) { (void)ex; return -1; }
-static int64_t klm_AMediaExtractor_getSampleTime(void *ex)       { (void)ex; return -1; }
-static bool    klm_AMediaExtractor_advance(void *ex)             { (void)ex; return false; }
-static int     klm_AMediaExtractor_seekTo(void *ex, int64_t us, int mode) {
-    (void)ex; (void)us; (void)mode; return AMEDIA_ERROR_UNSUPPORTED;
+static int klm_AMediaExtractor_getSampleTrackIndex(void *ex) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x || !x->dm) return -1;
+    return kl_avdemux_sample_time_us(x->dm) < 0 ? -1 : 0;
+}
+static int64_t klm_AMediaExtractor_getSampleTime(void *ex) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x || !x->dm) return -1;
+    return (int64_t)kl_avdemux_sample_time_us(x->dm);
+}
+static bool klm_AMediaExtractor_advance(void *ex) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x || !x->dm) return false;
+    return kl_avdemux_advance(x->dm) != 0;
+}
+static int klm_AMediaExtractor_seekTo(void *ex, int64_t us, int mode) {
+    (void)mode;
+    klm_extractor *x = klm_ex(ex);
+    if (!x || !x->dm) return AMEDIA_ERROR_UNSUPPORTED;
+    return kl_avdemux_seek_us(x->dm, (long long)us) ? AMEDIA_OK : AMEDIA_ERROR_UNSUPPORTED;
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1113,9 @@ static const struct { const char *name; void *fn; } g_media[] = {
     M("AMEDIAFORMAT_KEY_CHANNEL_COUNT",  &g_key_channel_count),
     M("AMEDIAFORMAT_KEY_SAMPLE_RATE",    &g_key_sample_rate),
     M("AMEDIAFORMAT_KEY_STRIDE",         &g_key_stride),
+    M("AMEDIAFORMAT_KEY_ROTATION",       &g_key_rotation),
+    M("AMEDIAFORMAT_KEY_ENCODER_DELAY",  &g_key_encoder_delay),
+    M("AMEDIAFORMAT_KEY_SLICE_HEIGHT",   &g_key_slice_height),
 
     M("AMediaCodec_createDecoderByType",  klm_AMediaCodec_createDecoderByType),
     M("AMediaCodec_configure",            klm_AMediaCodec_configure),

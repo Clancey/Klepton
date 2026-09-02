@@ -73,7 +73,13 @@ struct kl_ANativeActivity {
 // `entry` names the symbol so a guest that exports it under another name is a
 // row rather than a fork; every caller so far passes
 // "ANativeActivity_onCreate".
-int kl_na_create(kl_image *img, const char *entry, FILE *out);
+// data_path overrides the activity's internalDataPath / externalDataPath when
+// non-NULL; passing NULL keeps the default (kl_jni_files_dir()). Android's
+// ANativeActivity.internalDataPath is getFilesDir() == <dataDir>/files, but the
+// default here is the bare data dir — fine for guests that read their content
+// elsewhere (UE4 from the OBB, Steam Link from its own tree), wrong for one that
+// builds paths straight off it (GTA Vice City VR: <internalDataPath>/gamedata).
+int kl_na_create(kl_image *img, const char *entry, const char *data_path, FILE *out);
 
 // The rest of what Android's NativeActivity does, in its order — onStart,
 // onResume, the window, focus. onCreate itself typically only spawns the

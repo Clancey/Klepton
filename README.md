@@ -63,10 +63,20 @@ Currently working well on both macOS and visionOS with minor-to-no graphical iss
 - Resident Evil 4 VR
 - OpenBrush (OpenXR)
 - OpenJK XR (Team Beef)
+- Counter Strike
+- Half Life
+- Half Life 2
+- Portal
+- Vice City
+- Into the Radius
+- Red Matter 2
+- Vampire: The Masquerade - Justice
 
 WIP or not in a great state:
 
 - Steam VR Link (no AWDL mitigations due to entitlement restrictions, XR_EXT_hand_tracking not implemented yet)
+- Xbox Cloud Gaming — a separate build that is essentially a web app (a PWA wrapper around the streaming client), not a translated APK
+- ZIX
 
 Abandoned due to anticheat, JIT mmaping, or other problems:
 

@@ -43,7 +43,14 @@ enum KleptonAudio {
             // keeps the system's own spatialisation out of the way — the guest
             // mixes its own stereo and anything we add on top is a second
             // opinion about a scene we already rendered.
-            try session.setCategory(.playback, mode: .default)
+            //
+            // ...UNLESS the microphone toggle is on, in which case the category
+            // becomes .playAndRecord so a guest (Steam Link's voice chat) can
+            // capture — see setCategoryForMic. That is opt-in and off by default
+            // precisely because .playAndRecord hands the ringer switch a veto
+            // over the music, which is not a tradeoff to make for a title that
+            // never asks for the mic.
+            try Self.setCategoryForMic(session, KleptonMic.shared.settings.enabled)
             // Ask for the guest's rate. If the system grants it the resampler
             // in kl_audio.c degenerates to a copy; if it does not, kl_audio
             // measures what it actually got and resamples. Either way this is a
@@ -101,7 +108,7 @@ enum KleptonAudio {
         // configured again from scratch first.
         observe(AVAudioSession.mediaServicesWereResetNotification) { _ in
             NSLog("[au] media services were reset — reconfiguring from scratch")
-            try? session.setCategory(.playback, mode: .default)
+            try? Self.setCategoryForMic(session, KleptonMic.shared.settings.enabled)
             try? session.setActive(true)
             // A reset invalidates every audio object in the process, and the
             // spatial experience is one of them — without this the sound comes
@@ -150,6 +157,59 @@ enum KleptonAudio {
         try session.setPreferredOutputNumberOfChannels(2)
         try session.setIntendedSpatialExperience(.bypassed)
         NSLog("[au] direct stereo: system spatialisation bypassed, 2 ch preferred")
+    }
+
+    /// Set the session category from the microphone toggle. OFF → .playback
+    /// (the default this app has always used). ON → .playAndRecord with
+    /// .voiceChat mode, which is what a guest capturing for voice chat wants and
+    /// what enables the input bus kl_audio.c's capture unit binds. Mirrors ALVR,
+    /// which takes exactly this pair for SteamVR's microphone.
+    static func setCategoryForMic(_ session: AVAudioSession, _ mic: Bool) throws {
+        if mic {
+            // mode .default, NOT .voiceChat — and this is deliberate even though the
+            // capture unit is now VoiceProcessingIO. .voiceChat makes the SYSTEM
+            // insert its own voice-processing I/O; with our VPIO that is redundant,
+            // and if VPIO ever fails and kl_audio.c falls back to a plain RemoteIO
+            // capture unit, .voiceChat's system unit STARVES it → silence (the
+            // recurring "peak 0" / no-sound regression). .default has no system
+            // voice unit to compete, so BOTH capture units stay audible: VPIO still
+            // applies its own noise-suppression/AGC (unit-level, not mode-gated) for
+            // clean voice, and a RemoteIO fallback is raw but working — never silent.
+            try session.setCategory(.playAndRecord, mode: .default,
+                                    options: [.allowBluetooth, .defaultToSpeaker])
+        } else {
+            try session.setCategory(.playback, mode: .default)
+        }
+    }
+
+    /// Called by KleptonMic when the toggle changes at runtime. Reconfigures the
+    /// live session and, when turning the mic ON, asks for record permission so
+    /// the visionOS prompt appears the moment the user opts in (and never
+    /// before). The C capture side is armed separately via kl_audio_mic_set_enabled.
+    static func applyMicCategory(_ on: Bool) {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try setCategoryForMic(session, on)
+            try session.setActive(true)
+            try directStereo(session)
+            NSLog("[au] microphone \(on ? "enabled — category .playAndRecord" : "disabled — category .playback")")
+            if on {
+                // The input route the capture unit will actually read. If inputs is
+                // empty or inputChannels is 0, the mic is not on the route and the
+                // capture renders silence no matter what — this line says which.
+                let r = session.currentRoute
+                NSLog("[au] mic route: inputs=\(r.inputs.map { $0.portType.rawValue }) "
+                      + "inputChannels=\(session.inputNumberOfChannels) "
+                      + "available=\(session.availableInputs?.map { $0.portType.rawValue } ?? [])")
+            }
+        } catch {
+            NSLog("[au] microphone category change failed: \(error)")
+        }
+        if on {
+            AVAudioApplication.requestRecordPermission { granted in
+                NSLog("[au] microphone permission \(granted ? "granted" : "denied")")
+            }
+        }
     }
 
     private static func observe(_ name: Notification.Name,

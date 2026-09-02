@@ -86,6 +86,10 @@ enum OVRPRawButton {
     static let a: UInt32              = 0x0000_0001   // (v)
     static let b: UInt32              = 0x0000_0002   // (v)
     static let rThumbstick: UInt32    = 0x0000_0004
+    static let lThumbstickUp: UInt32   = 0x0000_0010
+    static let lThumbstickDown: UInt32 = 0x0000_0020
+    static let lThumbstickLeft: UInt32 = 0x0000_0040
+    static let lThumbstickRight: UInt32 = 0x0000_0080
     static let x: UInt32              = 0x0000_0100   // (v)
     static let y: UInt32              = 0x0000_0200   // (v)
     static let lThumbstick: UInt32    = 0x0000_0400
@@ -913,6 +917,12 @@ final class KleptonControllers {
     private static let anatomical =
         ProcessInfo.processInfo.environment["KL_HAND_ANATOMICAL"] == "1"
 
+    // Hysteresis latch for the synthesised thumbstick-direction button bits, per
+    // hand — so a stick held near the on/off threshold does not chatter the
+    // GetDown/GetUp edges that snap turn keys on. Touched only from pollButtons.
+    private static var lStickDir = (up: false, down: false, left: false, right: false)
+    private static var rStickDir = (up: false, down: false, left: false, right: false)
+
     // MARK: - Polling
 
     /// Poll the Sense controllers' buttons. Called once per frame from the
@@ -1047,9 +1057,21 @@ final class KleptonControllers {
             // visionOS 27 build gets it the moment the system stops eating it —
             // and `notePresses` above is what will say when that happens,
             // which is worth more than a guessed selector.
+            // The Sense Create (L) / Options (R) buttons both arrive as
+            // "Button Menu". Split by HAND, per the user's spec:
+            //  - LEFT (Create) keeps the original behaviour: menu AND system
+            //    together, exactly as it always was.
+            //  - RIGHT (Options) is the Oculus MENU button (start) alone - the
+            //    old OR also fired system on every press, which read as "not
+            //    sure what this button does".
+            //  - A real Home/PS element, if this visionOS delivers one (check
+            //    the "[cp] ... elements:" line), is the system/home bit alone -
+            //    the SteamVR dashboard, the Oculus home.
             let menuish = pressed("Button Menu") || pressed("Button Share")
                        || pressed("Button Options")
-            let homeish = pressed("Button Menu") || pressed("Button Home")
+            let psish = pressed("Button Home") || pressed("Button PS")
+                     || pressed("Button PS Button")
+            let homeish = (hand == 0 && pressed("Button Menu")) || psish
 
             var st = KleptonHandState()
             st.fromController = true
@@ -1069,12 +1091,30 @@ final class KleptonControllers {
             // The axis fallback is kept for anything that does publish them.
             // ALVR reads `dpads["Thumbstick"]` for the Sense pair; the prefixed
             // names are what a conventional gamepad uses.
+            // The PSVR2 Sense publishes the stick THREE ways at once (census on
+            // this device: dpad "Thumbstick", axes "Thumbstick X/Y Axis", and
+            // discrete buttons "Thumbstick Left/Right/Up/Down"), and NOT every one
+            // carries the live analog: here the dpad element exists but its
+            // xAxis/yAxis read a flat 0, so the old `if let d = dp[n] { return … }`
+            // returned that zero and never tried the axes — the guest saw a stick
+            // that never moved (no walking, and the analog-derived snap-turn bits
+            // stayed 0 too). Take the first source that is actually deflected: the
+            // analog dpad, then the analog axes, then the discrete direction
+            // buttons as a coarse ±1 so a stick that only reports edges still
+            // walks and turns.
             func stick2() -> SIMD2<Float> {
-                for n in ["Thumbstick",
-                          hand == 0 ? "Left Thumbstick" : "Right Thumbstick"] {
-                    if let d = dp[n] { return SIMD2(d.xAxis.value, d.yAxis.value) }
+                let eps: Float = 0.02
+                func live(_ v: SIMD2<Float>) -> Bool { v.x*v.x + v.y*v.y > eps*eps }
+                if let d = dp["Thumbstick"] {
+                    let v = SIMD2(d.xAxis.value, d.yAxis.value); if live(v) { return v }
                 }
-                return SIMD2(axis("Thumbstick X Axis"), axis("Thumbstick Y Axis"))
+                if let d = dp[hand == 0 ? "Left Thumbstick" : "Right Thumbstick"] {
+                    let v = SIMD2(d.xAxis.value, d.yAxis.value); if live(v) { return v }
+                }
+                let axv = SIMD2(axis("Thumbstick X Axis"), axis("Thumbstick Y Axis"))
+                if live(axv) { return axv }
+                return SIMD2(value("Thumbstick Right") - value("Thumbstick Left"),
+                             value("Thumbstick Up")    - value("Thumbstick Down"))
             }
             st.stick = stick2()
 
@@ -1108,14 +1148,49 @@ final class KleptonControllers {
                 // which hand carried it was never observable there either.
                 // Publishing both is what makes the mapping independent of
                 // which Sense controller a given physical button sits on.
-                if menuish { bits |= OVRPRawButton.start }
+                // RIGHT hand Options = the RIGHT system click, plainly - the
+                // Oculus button's slot on the Touch profile
+                // (oculustouch_right_system_click where Steam Input offers it).
+                // Delivered as this hand's own system bit; what it does is
+                // whatever the user binds to it on the PC.
+                if menuish { bits |= OVRPRawButton.back }
                 if homeish { bits |= OVRPRawButton.back }
-                // The guest reads stick *direction* bits as well as the axes,
-                // and only the right hand has them in the raw enum.
-                if pressed("Thumbstick Up")    { bits |= OVRPRawButton.rThumbstickUp }
-                if pressed("Thumbstick Down")  { bits |= OVRPRawButton.rThumbstickDown }
-                if pressed("Thumbstick Left")  { bits |= OVRPRawButton.rThumbstickLeft }
-                if pressed("Thumbstick Right") { bits |= OVRPRawButton.rThumbstickRight }
+            }
+            // The guest reads stick *direction* bits as well as the axes — and
+            // SNAP TURN reads only these (OVRInput.GetDown(Secondary/Primary
+            // ThumbstickRight)), never the axis. They MUST come from the analog
+            // stick position, not from discrete "Thumbstick Left/Right" GC
+            // elements: a PSVR2 Sense / Touch stick is one analog DPAD element
+            // that never fires those discrete presses, so deriving the bits from
+            // `pressed(...)` left them permanently 0 and snap turn did nothing —
+            // exactly Red Matter 2's symptom, while smooth-turn titles (Into The
+            // Radius) that read the axis were unaffected. Real Oculus firmware
+            // synthesises these bits from the stick past a threshold; do the
+            // same, with hysteresis so a stick resting near the edge does not
+            // chatter GetDown/GetUp. Both hands, so left-stick snap turn works too.
+            let onT: Float = 0.5, offT: Float = 0.4
+            func dirBit(_ v: Float, _ prev: Bool) -> Bool {
+                return v >= (prev ? offT : onT)
+            }
+            let sx = st.stick.x, sy = st.stick.y
+            let latch = hand == 0 ? Self.lStickDir : Self.rStickDir
+            var nd = (up: false, down: false, left: false, right: false)
+            nd.right = dirBit( sx, latch.right)
+            nd.left  = dirBit(-sx, latch.left)
+            nd.up    = dirBit( sy, latch.up)
+            nd.down  = dirBit(-sy, latch.down)
+            if hand == 0 {
+                Self.lStickDir = nd
+                if nd.up    { bits |= OVRPRawButton.lThumbstickUp }
+                if nd.down  { bits |= OVRPRawButton.lThumbstickDown }
+                if nd.left  { bits |= OVRPRawButton.lThumbstickLeft }
+                if nd.right { bits |= OVRPRawButton.lThumbstickRight }
+            } else {
+                Self.rStickDir = nd
+                if nd.up    { bits |= OVRPRawButton.rThumbstickUp }
+                if nd.down  { bits |= OVRPRawButton.rThumbstickDown }
+                if nd.left  { bits |= OVRPRawButton.rThumbstickLeft }
+                if nd.right { bits |= OVRPRawButton.rThumbstickRight }
             }
             // A pressed button is a touched one. The capacitive touch inputs
             // above are additive to that, not a replacement: OVRInput treats
@@ -1681,6 +1756,20 @@ final class KleptonControllers {
                 // Nothing tracked this hand. Leave kl_ovrp's own synthesised
                 // head-relative hand alone rather than pushing a stale pose —
                 // it at least keeps the controllers inside the frustum.
+                //
+                // ...but a Sense controller's BUTTONS are pose-independent, and
+                // this branch is exactly where they were being dropped: holding
+                // the controllers mutes visionOS hand tracking (no anchors), and
+                // when the accessory pose is also absent this `continue` skipped
+                // the input push - pollButtons() had the trigger, the guest
+                // never saw it, and a menu gated on "press trigger" waited
+                // forever. Push the buttons; only the pose stays synthesised.
+                if st.fromController {
+                    kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
+                                                 st.indexTrigger, st.handTrigger,
+                                                 st.stick.x, st.stick.y)
+                    lock.lock(); state[hand] = st; lock.unlock()
+                }
                 continue
             }
 

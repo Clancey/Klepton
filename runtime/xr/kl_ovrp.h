@@ -351,6 +351,11 @@ typedef struct {
     // left. The same question kl_glfb_eye_mtl_origin_top_left answers for an
     // eye, with the same polarity, so one convention covers both passes.
     int   origin_top_left;
+    // The texture handle the guest SUBMITTED for this layer (EnqueueSubmitLayer2
+    // texL). AC Nexus draws its menu UI into its OWN textures and submits those
+    // here, not into the swapchain image we handed out via GetLayerTexture2 — so
+    // the compositor resolves THIS to an MTLTexture, or every panel is empty.
+    unsigned long long tex;
 } kl_ovrp_overlay;
 
 // How many non-eye layers the guest submitted with its most recent frame, and
@@ -361,6 +366,13 @@ typedef struct {
 // Returns 0 and leaves *out untouched for an index that is not there.
 int kl_ovrp_overlay_count(void);
 int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out);
+
+// 1 while the guest has a live Equirect loading layer (AC Nexus's video
+// skybox). The compositor plays the loading mp4 onto the equirect while this is
+// set, and shows the guest's eye picture once it clears. See kl_ovrp.c.
+int kl_loadingvideo_active(void);
+// The guest's LoadingScreen.stopUpdatingLoadingScreen() hook - hide the skybox.
+void kl_loadingvideo_stop(void);
 
 // ...and the two calls that FILE those records for a guest that does not speak
 // OVRPlugin at all.

@@ -105,6 +105,9 @@ void kl_glfb_draw_census(FILE *f);
 // framebuffer with the picture" by looking for the FBO whose color attachment
 // is one of these (fb0 is black by construction — the VR frame goes to eye
 // textures, not the backbuffer).
+// hl2 diagnostic: sample the real ANGLE draw/read framebuffer + color attachment at
+// the moment the eye-copy runs (called from the guest-log shim at "began eye submission").
+void kl_glfb_probe_current_rt(const char *why);
 void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex);
 
 // ...and which of an eye's images the guest most recently PRESENTED. Registering

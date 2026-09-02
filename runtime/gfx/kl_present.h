@@ -68,6 +68,15 @@ void kl_present_note_window_surface(int w, int h);
 // The eye pair is the more specific fact, so it is the one that decides.
 void kl_present_note_eye_texture(void);
 
+// kl_glfb, when an OpenXR COMPOSITION LAYER (quad/cylinder) is backed. Like an
+// eye texture, this is a guest presenting through the XR compositor, i.e. an
+// immersive guest — even before it renders a projection layer. Xash's VR menus
+// (cs1, hl1) sit on a quad layer with NO eye textures while in the menu; without
+// this, kl_present read them as MONO (they also create an SDL window), the flat
+// shell took over with a black mono capture, and the Matting/Microphone controls
+// vanished. Counts toward STEREO exactly like an eye texture.
+void kl_present_note_xr_layer(void);
+
 // Drop back to whatever the surfaces now say — for a guest that tears its eye
 // textures down. Separate from the note above so the sticky rule stays
 // explicit rather than being an accident of call order.

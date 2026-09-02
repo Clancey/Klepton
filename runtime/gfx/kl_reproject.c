@@ -477,6 +477,7 @@ static const char kl_msl_overlay[] =
 "    uint     flip_y;\n"
 "    uint     srgb_decode;\n"
 "    uint     visible;\n"
+"    uint     opaque;\n"
 "};\n"
 "vertex VOut kl_ov_v(uint vid [[vertex_id]],\n"
 "                    constant KLOv *us [[buffer(0)]],\n"
@@ -511,8 +512,75 @@ static const char kl_msl_overlay[] =
 "        float3 hi = pow((c.rgb + 0.055) / 1.055, float3(2.4));\n"
 "        c.rgb = select(hi, lo, c.rgb <= float3(0.04045));\n"
 "    }\n"
+"    if (u.opaque != 0u) c.a = 1.0;\n"
 "    return c;\n"
 "}\n";
+
+// The EQUIRECT overlay — a 360 panorama drawn as a skybox behind everything,
+// which is what AC Nexus shows during shader warmup and where the flat quad
+// pass draws nothing (an equirect layer carries no quad size). A fullscreen
+// triangle, and per fragment the view ray is reconstructed from the inverse
+// projection and rotated into world space, then turned into equirect UV
+// (longitude from atan2, latitude from acos). World-locked: the ray uses the
+// eye's world rotation, so turning the head reveals different parts. One uniform
+// per amplified view, indexed by [[amplification_id]] exactly as the quad pass.
+static const char kl_msl_equirect[] =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct EqOut { float4 pos [[position]]; float2 ndc; };\n"
+"struct KLEq {\n"
+"    float4x4 inv_proj;\n"
+"    float4x4 world_rot;\n"
+"    uint slice;\n"
+"    uint flip_y;\n"
+"    uint srgb_decode;\n"
+"    uint visible;\n"
+"    uint test;\n"
+"    float hscale;\n"
+"};\n"
+"vertex EqOut kl_eq_v(uint vid [[vertex_id]],\n"
+"                     constant KLEq *us [[buffer(0)]],\n"
+"                     ushort amp [[amplification_id]]) {\n"
+"    constant KLEq &u = us[amp];\n"
+"    EqOut o;\n"
+"    float2 p = float2((vid == 1u) ? 3.0 : -1.0, (vid == 2u) ? 3.0 : -1.0);\n"
+"    if (u.visible == 0u) { o.pos = float4(2.0, 2.0, 2.0, 1.0); o.ndc = float2(0); return o; }\n"
+"    // Finite far depth (reverse-Z ~1000 m), not 0: visionOS discards a\n"
+"    // submitted frame whose depth is all 0 (infinity) as empty, so the\n"
+"    // skybox must sit at a real distance to be kept and reprojected.\n"
+"    o.pos = float4(p, 0.0001, 1.0);\n"
+"    o.ndc = p;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 kl_eq_f(EqOut in [[stage_in]],\n"
+"                        texture2d<float> tex [[texture(0)]],\n"
+"                        sampler samp [[sampler(0)]],\n"
+"                        constant KLEq *us [[buffer(0)]],\n"
+"                        ushort amp [[amplification_id]]) {\n"
+"    constant KLEq &u = us[amp];\n"
+"    if (u.test == 1u) return float4(1.0, 0.0, 1.0, 1.0);\n"
+"    float4 clip = float4(in.ndc, 1.0, 1.0);\n"
+"    float4 vp = u.inv_proj * clip;\n"
+"    float3 vdir = normalize(vp.xyz / vp.w);\n"
+"    float3 wdir = normalize((u.world_rot * float4(vdir, 0.0)).xyz);\n"
+"    const float PI = 3.14159265358979;\n"
+"    float uu = atan2(wdir.x, -wdir.z) / (2.0 * PI) * u.hscale + 0.5;\n"
+"    float vv = acos(clamp(wdir.y, -1.0, 1.0)) / PI;\n"
+"    if (u.flip_y != 0u) vv = 1.0 - vv;\n"
+"    if (u.test == 4u) return float4(wdir * 0.5 + 0.5, 1.0);\n"
+"    if (u.test == 2u) return float4(uu, vv, 0.5, 1.0);\n"
+"    float4 c = tex.sample(samp, float2(uu, vv));\n"
+"    if (u.srgb_decode != 0u) {\n"
+"        float3 lo = c.rgb / 12.92;\n"
+"        float3 hi = pow((c.rgb + 0.055) / 1.055, float3(2.4));\n"
+"        c.rgb = select(hi, lo, c.rgb <= float3(0.04045));\n"
+"    }\n"
+"    if (u.test == 3u) return float4(max(c.rgb, float3(0.2)), 1.0);\n"
+"    c.a = 1.0;\n"
+"    return c;\n"
+"}\n";
+
+const char *kl_reproject_equirect_msl(void) { return kl_msl_equirect; }
 
 const char *kl_reproject_msl(void)      { return kl_msl_reproject; }
 const char *kl_reproject_blit_msl(void) { return kl_msl_blit; }
@@ -865,6 +933,24 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
                                      (float)r[2] / (float)ov->tex_w,
                                      (float)r[3] / (float)ov->tex_h);
 
+    // KL_OVERLAY_FLIP_X: mirror the sampled U. AC Nexus's menu panels read
+    // horizontally mirrored ("backwards" text) - the guest fills them for a quad
+    // it expects viewed from the opposite face than OVR's -Z Pose convention
+    // states. Baked into uv_rect (start at the right edge, walk back with a
+    // negative width) so no shader or struct change is needed. Off by default so
+    // no other target regresses; promoted per-target once confirmed.
+    if (kl_env_on("KL_OVERLAY_FLIP_X", 0)) {
+        u.uv_rect.x += u.uv_rect.z;
+        u.uv_rect.z  = -u.uv_rect.z;
+    }
+    // KL_OVERLAY_FLIP_Y: mirror the sampled V, independent of the shader's own
+    // flip_y (which tracks origin_top_left). AC Nexus's panels come in 180-degree
+    // rotated, so the readable result is FLIP_X + FLIP_Y together.
+    if (kl_env_on("KL_OVERLAY_FLIP_Y", 0)) {
+        u.uv_rect.y += u.uv_rect.w;
+        u.uv_rect.w  = -u.uv_rect.w;
+    }
+
     // world <- quad, then view <- world. Unlike the eye pass NOTHING is dropped
     // here: the layer has a position and the display's eye offset is what gives
     // it the stereo disparity a quad at 7 m is supposed to have.
@@ -879,6 +965,7 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
     u.srgb_decode = (uint32_t)kl_reproject_srgb_decode();
     u.flip_y = ov->origin_top_left ? 1u : 0u;
     u.visible = 1;
+    u.opaque = kl_env_on("KL_OVERLAY_OPAQUE", 0) ? 1u : 0u;
     return u;
 }
 

@@ -47,6 +47,42 @@ int kl_mono_input_available(void) {
     return g_in.mouse != NULL;
 }
 
+// The guest wants text entry (SDLActivity.showTextInput) — raised by kl_jni_sdl,
+// consumed by the frontend to focus a hidden field and raise the system keyboard.
+static int g_text_input_wanted;
+void kl_mono_set_text_input(int on)  { g_text_input_wanted = on ? 1 : 0; }
+int  kl_mono_text_input_wanted(void) { return g_text_input_wanted; }
+
+// Committed text from the system keyboard. onNativeKeyDown/Up (kl_mono_key) is
+// the game-control path and does NOT produce SDL_TEXTINPUT — SDL's Android
+// backend takes typed CHARACTERS from the IME's SDLInputConnection.nativeCommit
+// Text, so a text field only fills from there. This is that path: the frontend
+// hands over each newly typed run of characters and SDL turns it into
+// SDL_TEXTINPUT. Backspace stays on kl_mono_key (KEYCODE_DEL), which the field
+// does honour as an edit key.
+typedef void (*kl_fn_commit)(void *env, void *cls, void *jstr, int32_t newcursor);
+void kl_mono_commit_text(const char *utf8) {
+    if (!utf8 || !*utf8) return;
+    static int resolved;
+    static kl_fn_commit commit;
+    static void *env, *cls;
+    if (!resolved) {
+        resolved = 1;
+        commit = (kl_fn_commit)kl_jni_native("org/libsdl/app/SDLInputConnection",
+                                             "nativeCommitText", NULL);
+        env = kl_jni_env();
+        cls = kl_jni_class("org/libsdl/app/SDLInputConnection");
+        if (!commit)
+            fprintf(stderr, "  [mono] no SDLInputConnection.nativeCommitText — "
+                            "system-keyboard text cannot reach the guest\n");
+    }
+    if (!commit) return;
+    kl_jni_local_frame_push();
+    void *s = kl_jni_new_string(utf8);
+    commit(env, cls, s, 1);
+    kl_jni_local_frame_pop();
+}
+
 void kl_mono_pointer(int state, int action, float x, float y) {
     mono_resolve();
     if (!g_in.mouse) return;

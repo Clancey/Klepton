@@ -31,6 +31,20 @@
 -->
 <plist version="1.0">
 <dict>
+	<!-- Microphone: required or visionOS KILLS the process the instant anything
+	     touches the mic. It is only ever touched when the Microphone toggle is
+	     ON (off by default — KleptonMic.swift), so most sessions never trigger
+	     the prompt this string backs. A guest such as Steam Link uses it for
+	     voice chat. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Klepton uses the microphone only when you turn on the Microphone toggle, so a running app (such as Steam Link voice chat) can hear you.</string>
+	<!-- The app icon's asset-catalog name. Filled per target by the generated
+	     KL_APPICON_NAME build setting (gen_xcodeproj.py): the target's own
+	     AppIcon-<name> stack when Assets.xcassets carries one, a benign
+	     placeholder otherwise. Without this key visionOS never looks in
+	     Assets.car and the Home View shows the blank default. -->
+	<key>CFBundleIconName</key>
+	<string>$(KL_APPICON_NAME)</string>
 	<!-- THE SCENE MANIFEST — and specifically the immersive-space ROLE.
 	     Without this the app has no immersive scene session, and the failure is
 	     silent in every direction that can be checked from inside the app:

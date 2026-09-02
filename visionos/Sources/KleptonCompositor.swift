@@ -48,6 +48,9 @@ import CompositorServices
 import Metal
 import simd
 import ARKit
+import AVFoundation
+import CoreVideo
+import QuartzCore
 
 // What the drawable costs, and therefore how much of the display we can afford
 // to actually use. Three settings here decide that, and they are entangled:
@@ -244,6 +247,13 @@ final class KleptonCompositor {
     /// The overlay pass — a guest's non-eye layers. nil when it failed to
     /// build, which is named at construction rather than per frame.
     private var overlayPipeline: MTLRenderPipelineState?
+    /// The equirect (360 panorama) overlay pipeline and its depth state.
+    /// Drawn as a skybox behind the eye content: depth-tests .greaterEqual at
+    /// the far plane and writes no depth, so real eye pixels stay in front and
+    /// the panorama fills the rest (which, during shader warmup, is everything).
+    private var equirectPipeline: MTLRenderPipelineState?
+    private var equirectDepthState: MTLDepthStencilState?
+    private var loadingSkyboxDepthState: MTLDepthStencilState?
     private var probePipeline: MTLRenderPipelineState?
     /// Red, green, blue — one second each, off the wall clock. Deliberately
     /// full-intensity primaries: whatever tone mapping or colour management sits
@@ -455,10 +465,39 @@ final class KleptonCompositor {
     private var anchorHeld = 0
     private var anchorUnknown = 0
     private let holdAnchor = klEnvOn("KL_CP_ANCHOR_HOLD", default: true)
+    // Host recenter — the Quest Oculus-button hold, done where the Quest does
+    // it: in the OS layer. `recenterXform` rebases the world origin so the
+    // head's current yaw+XZ become identity; folded into originFromDevice(),
+    // the ONE function every consumer reads, so published guest poses and the
+    // compositor's own placement shift together and the streamed view (Steam
+    // Link -> SteamVR) snaps to the new forward coherently. Set by holding the
+    // right Sense Options button >= 1 s (KleptonControllers).
+    nonisolated(unsafe) static var pendingRecenter = false
+    private var recenterXform = matrix_identity_float4x4
     private var cmdCommitted = 0
     private let cmdLock = NSLock()
     private var cmdCompleted = 0
     private var cmdError: Error?
+    // Startup diagnostics for the signal-9 wall: what the last renderFrame saw,
+    // surfaced into the alive report, plus a short per-frame trace of the first
+    // few seconds so the log can say whether the loop keeps iterating and
+    // whether its command buffers complete — the two things a 2 s report cannot
+    // catch on an app that dies in ~1 s.
+    private var lastGlFenceSeen: UInt64 = 0
+    private var lastProjLayersSeen = 0
+    private var lastEncodedSeen = 0
+    private var startupTrace = 0
+    // Startup-deadlock guard: the guest's fence value goes non-zero after its
+    // first swap, then every frame waits on it. If the guest then goes
+    // heads-down (loading a multi-GB OBB, compiling shaders) the signalling
+    // command buffer stalls behind that GPU work and the composite buffers pile
+    // up uncompleted — the drawable pool starves, this loop stops presenting,
+    // and visionOS SIGKILLs the app with no report. Bounding the outstanding
+    // fenced buffers keeps a drawable free so the loop always presents (black
+    // if need be) and survives until the guest catches up.
+    private let maxFenceBacklog = Int(klEnvFloat("KL_CP_FENCE_BACKLOG", 2))
+    private var fenceBacklogSkips = 0
+    private var warnedFenceBacklog = false
     private var loggedFirstPicture = false
     private var loggedGuestEnd = false
 
@@ -590,7 +629,7 @@ final class KleptonCompositor {
     private func originFromDevice(_ anchor: DeviceAnchor?) -> simd_float4x4 {
         if let anchor {
             lastGoodOriginFromDevice = anchor.originFromAnchorTransform
-            return anchor.originFromAnchorTransform
+            return recenterXform * anchor.originFromAnchorTransform
         }
         guard holdAnchor, let held = lastGoodOriginFromDevice else {
             // Nothing has ever tracked — the frames before ARKit starts — or the
@@ -600,7 +639,7 @@ final class KleptonCompositor {
             return matrix_identity_float4x4
         }
         anchorHeld += 1
-        return held
+        return recenterXform * held
     }
 
     /// Sample every pose for this frame and push it across the seam.
@@ -842,6 +881,39 @@ final class KleptonCompositor {
                 NSLog("[cp] the overlay pipeline failed to build — a guest's non-eye "
                       + "layers will not be composited (on Unreal that is its whole UI)")
             }
+
+            // The equirect panorama pipeline — a 360 skybox behind everything.
+            // Opaque (a background is not blended), same formats/amplification as
+            // the quad pass. See kl_msl_equirect and encodeOverlays.
+            let qdesc = MTLRenderPipelineDescriptor()
+            if let qlib = try? device.makeLibrary(source: String(cString: kl_reproject_equirect_msl()),
+                                                  options: nil) {
+                qdesc.vertexFunction   = qlib.makeFunction(name: "kl_eq_v")
+                qdesc.fragmentFunction = qlib.makeFunction(name: "kl_eq_f")
+                qdesc.colorAttachments[0].pixelFormat = color
+                qdesc.depthAttachmentPixelFormat = .depth32Float
+                qdesc.maxVertexAmplificationCount = amplification
+                equirectPipeline = try? device.makeRenderPipelineState(descriptor: qdesc)
+            }
+            if equirectPipeline == nil {
+                NSLog("[cp] the equirect pipeline failed to build — 360 background "
+                      + "overlays (AC Nexus loading skybox) will not be composited")
+            }
+            // Far-plane, read-only depth so the panorama sits behind eye content.
+            let qds = MTLDepthStencilDescriptor()
+            qds.depthCompareFunction = .greaterEqual
+            qds.isDepthWriteEnabled = false
+            equirectDepthState = device.makeDepthStencilState(descriptor: qds)
+            // The loading skybox WRITES a finite far depth. visionOS reprojects
+            // using the submitted depth and discards a frame whose depth is all
+            // 0 (reverse-Z infinity) as "nothing there" - which is why a
+            // colour-correct skybox (and even its clear) showed black. Writing a
+            // distant-but-finite depth makes it a real backdrop the compositor
+            // keeps.
+            let lsds = MTLDepthStencilDescriptor()
+            lsds.depthCompareFunction = .greaterEqual
+            lsds.isDepthWriteEnabled = true
+            loadingSkyboxDepthState = device.makeDepthStencilState(descriptor: lsds)
 
             // KL_CP_PROBE: swap ONE thing about the pass and see if the black
             // moves. Each rung isolates a different link in the chain, so a
@@ -1367,6 +1439,7 @@ final class KleptonCompositor {
         var presented = 0
         var iterations = 0
         var nextReport = Date()
+        NSLog("[cp] render loop entered (startup frame-trace on; build has fence content-gate + diag)")
         loop: while true {
             switch layerRenderer.state {
             case .invalidated:
@@ -1394,7 +1467,7 @@ final class KleptonCompositor {
             }
             iterations += 1
             if Date() >= nextReport {
-                nextReport = Date().addingTimeInterval(2)
+                nextReport = Date().addingTimeInterval(0.5)
                 cmdLock.lock(); let done = cmdCompleted; cmdLock.unlock()
                 NSLog("[cp] alive: \(iterations) iters, \(presented) with a picture, "
                       + "\(blackFrames) black, guest=\(kl_app_guest_state()), "
@@ -1404,6 +1477,8 @@ final class KleptonCompositor {
                       // diverged, the GPU is waiting on the guest's fence and
                       // nothing is being drawn at all.
                       + "cmdbuf \(done)/\(cmdCommitted) done"
+                      + " fence=\(lastGlFenceSeen) layers=\(lastProjLayersSeen) enc=\(lastEncodedSeen)"
+                      + (fenceBacklogSkips > 0 ? " fence-skips \(fenceBacklogSkips)" : "")
                       + (noFence ? " (NOFENCE)" : ""))
                 NSLog("[cp] \(cadenceSummary())")
                 NSLog("[cp] \(stageSummary())")
@@ -1538,14 +1613,22 @@ final class KleptonCompositor {
                 // texture on purpose — compositing the last good frame through
                 // a loading transition is better than a black one. Only two
                 // *different* live textures mean the two sides have diverged.
-                if read && guestTex != nil && guestTex != mineTex { bad = true }
+                //
+                // ...and a nil CACHE entry is not one either. `eyes` is filled
+                // by the GL provider path only; a Vulkan guest's eye storage
+                // lives in kl_glfb's table (checked first by eyeSource) and
+                // never appears here. Comparing against the empty cache flagged
+                // every Vulkan run as "DIFFERENT textures" — which is what sent
+                // the wrath2 black-screen hunt to the eye seam when the actual
+                // fault was the overlay quad's size parse (kl_ovrp.c).
+                if read && guestTex != nil && mineTex != nil && guestTex != mineTex { bad = true }
                 // Only the low bits: two pointers into the same heap differ
                 // there, and a full 64-bit address per eye per stage makes the
                 // line unreadable at the moment it matters most.
                 let tag = guestTex.map { String(UInt(bitPattern: $0) & 0xffffff, radix: 16) } ?? "nil"
                 out += " e\(eye)=\(tag)"
                 if !read { out += "?" }
-                else if guestTex != nil && guestTex != mineTex { out += "!=SAMPLED" }
+                else if guestTex != nil && mineTex != nil && guestTex != mineTex { out += "!=SAMPLED" }
             }
             out += " |"
         }
@@ -1696,6 +1779,7 @@ final class KleptonCompositor {
                 : 0
         }
         let glFence = kl_glfb_gpu_fence_value()
+        lastGlFenceSeen = glFence; lastProjLayersSeen = projLayerCount
         let frameValue = glFence != 0 ? glFence : kl_vulkan_frame_serial()
         // KL_CP_NOFENCE=1 skips the wait. A composite command buffer that waits
         // on an event value the guest's queue never signals is COMMITTED and
@@ -1703,8 +1787,45 @@ final class KleptonCompositor {
         // healthy, and the display shows nothing. That failure is invisible
         // from this side, so it needs its own A/B — and cmdCompleted below is
         // the measurement that says whether it is happening.
-        if let ev = guestFrameEvent, glFence != 0, !noFence {
+        // Only wait on the guest fence while the backlog of committed-but-not-
+        // completed composite buffers is small. Once it grows, the guest's
+        // signal is not arriving (it is heads-down), and continuing to wait
+        // would starve the drawable pool and get the app watchdog-killed — so
+        // present without the wait until the guest catches up. A no-op for a
+        // healthy guest, whose buffers complete every frame (backlog stays 0-1).
+        //
+        // Two gates, both about NOT deadlocking the drawable pool:
+        //   1. Content: a black frame (no projection layers yet) has nothing to
+        //      order against, so it must not wait — the guest sets the fence
+        //      non-zero on its first swap but then goes heads-down (loading a
+        //      multi-GB OBB, compiling shaders) without signalling it. Waiting
+        //      there is a command buffer that never completes; it holds the one
+        //      drawable, the next frame blocks acquiring one, the loop stops
+        //      presenting after a SINGLE committed buffer (cmdbuf 0/1), and
+        //      visionOS SIGKILLs with no report. Present black, unwaited.
+        //   2. Backlog: even with content, if committed buffers stop completing
+        //      the guest is stalling — present without the wait so a drawable
+        //      stays free. Belt-and-braces behind gate 1.
+        // Both are no-ops for a healthy guest: it submits layers every frame
+        // and its buffers complete, so the wait is always encoded as before.
+        cmdLock.lock(); let doneNow = cmdCompleted; cmdLock.unlock()
+        let outstanding = cmdCommitted - doneNow
+        let haveGuestContent = projLayerCount > 0
+        if let ev = guestFrameEvent, glFence != 0, !noFence,
+           haveGuestContent, outstanding <= maxFenceBacklog {
             cmd.encodeWaitForEvent(ev, value: glFence)
+        } else if glFence != 0 && !noFence && (!haveGuestContent || outstanding > maxFenceBacklog) {
+            fenceBacklogSkips += 1
+            if !warnedFenceBacklog {
+                warnedFenceBacklog = true
+                NSLog("[cp] guest fence set (\(glFence)) but "
+                      + (haveGuestContent
+                         ? "backlog \(outstanding) buffers not completed"
+                         : "no projection layers yet")
+                      + " — presenting WITHOUT the fence wait so the drawable pool "
+                      + "does not starve (the guest is still loading). "
+                      + "Further skips silenced.")
+            }
         }
         if frameValue != 0 && frameValue == lastGuestFrame {
             staleInARow += 1
@@ -1736,6 +1857,26 @@ final class KleptonCompositor {
         // it is the average of the two eyes' own transforms. `deviceAnchor`
         // below still gets the raw anchor, which is what that API means.
         let originFromHead = Self.headFrom(originFromDevice, midpoint: eyeMidpointInDevice)
+        if Self.pendingRecenter {
+            Self.pendingRecenter = false
+            // Yaw + horizontal position only, exactly Quest's recenter: height
+            // and pitch/roll stay physical. Build the head's yaw-XZ frame and
+            // fold its inverse into the origin, so from the NEXT frame the
+            // current gaze direction is the world's -Z at the world's origin.
+            let c2 = originFromHead.columns.2
+            let yaw = atan2f(c2.x, c2.z)          // head +Z projected to XZ
+            let px = originFromHead.columns.3.x
+            let pz = originFromHead.columns.3.z
+            let cy = cosf(yaw), sy = sinf(yaw)
+            let m = simd_float4x4(
+                simd_float4( cy, 0, -sy, 0),
+                simd_float4(  0, 1,   0, 0),
+                simd_float4( sy, 0,  cy, 0),
+                simd_float4( px, 0,  pz, 1))
+            recenterXform = m.inverse * recenterXform
+            NSLog("[cp] RECENTER: yaw %.1f deg, pos (%.2f, %.2f) folded into the origin",
+                  yaw * 180 / .pi, px, pz)
+        }
 
         // Measure the pose the composite is about to DRAW with, which is not
         // always the frame record. With the layer path live the eye picture is
@@ -1753,6 +1894,20 @@ final class KleptonCompositor {
             r.px = pl.pose.0; r.py = pl.pose.1; r.pz = pl.pose.2
             r.qx = pl.pose.3; r.qy = pl.pose.4; r.qz = pl.pose.5; r.qw = pl.pose.6
             measured = r
+        }
+        // EXPERIMENT (missioniss head-lock): log the DISPLAY head yaw (live) next
+        // to the RENDER pose yaw (what the guest drew), once a second. Both
+        // tracking together means the reprojection inputs are correct and the
+        // frozen view is the guest's own render; a fixed display yaw means the
+        // compositor is not getting live head rotation.
+        Self.headLockTraceN += 1
+        if Self.headLockTraceN % 90 == 0, projLayerCount > 0 {
+            let c2 = originFromHead.columns.2
+            let dispYaw = atan2f(c2.x, c2.z) * 180 / .pi
+            let pl = projLayers[0]
+            let qy = pl.pose.4, qz = pl.pose.5, qw = pl.pose.6, qx = pl.pose.3
+            let rendYaw = atan2f(2*(qw*qy + qx*qz), 1 - 2*(qy*qy + qz*qz)) * 180 / .pi
+            NSLog("[cp] headlock-probe: display yaw %.1f  render yaw %.1f", dispYaw, rendYaw)
         }
         noteReprojection(rendered: measured,
                          originFromHead: originFromHead, stage: stage)
@@ -1881,13 +2036,22 @@ final class KleptonCompositor {
             guard let self else { return }
             self.cmdLock.lock()
             self.cmdCompleted += 1
+            let n = self.cmdCompleted
             let first = self.cmdError == nil && b.error != nil
             if first { self.cmdError = b.error }
             self.cmdLock.unlock()
+            if n <= 12 { NSLog("[cp] cmdbuf #\(n) COMPLETED" + (b.error != nil ? " err=\(b.error!)" : "")) }
             if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
         }
         cmd.commit()
         cmdCommitted += 1
+        lastEncodedSeen = encoded
+        if startupTrace < 300 {
+            startupTrace += 1
+            cmdLock.lock(); let dn = cmdCompleted; cmdLock.unlock()
+            NSLog("[cp] trace f\(startupTrace) fence=\(glFence) layers=\(projLayerCount) "
+                  + "enc=\(encoded) cmd=\(cmdCommitted)/\(dn)")
+        }
         noteCadence(presentation: presentation, drawable: main)
         frame.endSubmission()      // only here — see startSubmission above
         return encoded > 0 ? 1 : 0
@@ -2014,6 +2178,29 @@ final class KleptonCompositor {
         enc.label = "klepton composite view\(viewIndices)"
         if probe == 1 { enc.endEncoding(); return viewIndices.count }
         guard let pipeline, let sampler else { enc.endEncoding(); return 0 }
+
+        // Loading skybox. While an Equirect loading layer is live the guest's
+        // eye is black - AC Nexus feeds that layer an Android MediaPlayer video
+        // surface that does not exist on visionOS - so rather than reproject a
+        // black eye, play the game's own loading mp4 and draw it as the 360
+        // environment. When the guest finishes loading it destroys the layer,
+        // this tears the player down, and the eye path below resumes.
+        if kl_loadingvideo_active() == 0 {
+            if loadingVideo != nil {
+                loadingVideo?.stop(); loadingVideo = nil; loadingVideoTried = false
+            }
+        } else if let tex = loadingVideoTexture() {
+            drawLoadingSkybox(enc, viewIndices: viewIndices, drawable: drawable,
+                              layered: layered, originFromHead: originFromHead,
+                              texture: tex, sampler: sampler)
+            // The menu is the video backdrop PLUS the guest's UI quad overlays on
+            // top (once it can allocate its layers). Draw them over the skybox so
+            // the menu shows through instead of only the loading environment.
+            _ = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
+                               originFromHead: originFromHead, writeDepth: true)
+            enc.endEncoding()
+            return viewIndices.count
+        }
 
         // One uniform per view, in the order the viewports and the amplification
         // mappings are given — the vertex shader indexes this array by
@@ -2427,6 +2614,7 @@ final class KleptonCompositor {
     private var projLayers = [kl_ovrp_proj_layer](repeating: kl_ovrp_proj_layer(),
                                                   count: 8)
     private var projLayerCount = 0
+    nonisolated(unsafe) static var headLockTraceN = 0
     private var identityGridBuffer: MTLBuffer?
     private var loggedProjMiss = Set<Int>()
     private var lastProjShape = ""
@@ -2483,9 +2671,57 @@ final class KleptonCompositor {
         let n = Int(kl_ovrp_overlay_count())
         if n == 0 { return 0 }
         var drawn = 0
+        var drewEquirect = false
         for i in 0..<n {
             var ov = kl_ovrp_overlay()
             guard kl_ovrp_overlay_get(Int32(i), &ov) != 0 else { continue }
+            // Equirect layers are the loading/menu backdrop, which the host
+            // draws itself from the real mp4 (drawLoadingSkybox). The guest's
+            // own equirect layers here are 2x2 placeholders or the wild video
+            // handle - drawing them as a full skybox stretches 4 pixels over the
+            // sphere and flickers over everything. Skip them; the backdrop is
+            // already handled.
+            if ov.shape == 5 {
+                // The guest's own equirect layer — the menu ENVIRONMENT backdrop.
+                // Skipped while these were 2x2 placeholders; now that the menu
+                // renders for real, the 512x512+ ones carry the backdrop the user
+                // sees as "missing background". Draw the first per pass whose texL
+                // resolves, through the same skybox pipeline the loading video
+                // uses (behind everything at far depth). KL_OVERLAY_EQ=0 restores
+                // the old skip. The quad restore below puts the pipeline and depth
+                // state back for the panels that follow.
+                // ov.tex != 0: an equirect whose texL is NULL (layer 4, the video
+                // placeholder) must NOT fall back to its empty swapchain image —
+                // that drew a BLACK sphere over the far plane. And the depth
+                // state is restored UNCONDITIONALLY: encodeEquirect swaps in the
+                // greaterEqual-at-far compare, and leaking it into the quad
+                // draws below made every panel fail the depth test — composited
+                // in the log, invisible in the headset (the post-equirect
+                // regression).
+                if Self.drawEquirectOverlays, !drewEquirect, ov.tex_w >= 64, ov.tex != 0,
+                   encodeEquirect(enc, ov: ov, viewIndices: viewIndices,
+                                  drawable: drawable, originFromHead: originFromHead) {
+                    drewEquirect = true
+                }
+                if drewEquirect, let depthState { enc.setDepthStencilState(depthState) }
+                continue
+            }
+            // KL_OVERLAY_SKIP_HEADLOCKED=1: drop head-locked overlays. In AC Nexus
+            // the interactive menu is entirely WORLD-locked (buttons/panels placed
+            // in the scene); the only head-locked quads are the fullscreen loading
+            // /fade cover (e.g. layer 3 1024x1024 and layer 5 1.35m, both glued
+            // 0.5 m in front of the eyes) which the game leaves up in its init loop
+            // and which draws over the menu behind it. Skipping them reveals the
+            // menu; off by default so no other guest's head-locked HUD regresses.
+            if Self.skipHeadLockedOverlays && ov.head_locked != 0 {
+                if !loggedOverlayMiss.contains(ov.layer_id) {
+                    loggedOverlayMiss.insert(ov.layer_id)
+                    NSLog("[cp] overlay layer \(ov.layer_id) (shape \(ov.shape), "
+                          + "\(ov.size.0)x\(ov.size.1) m) SKIPPED — head-locked "
+                          + "(KL_OVERLAY_SKIP_HEADLOCKED)")
+                }
+                continue
+            }
             // One uniform per amplified view, exactly as the eye pass does — the
             // array is indexed by [[amplification_id]] and a view with no
             // placement says so with `visible = 0` rather than by not drawing,
@@ -2500,7 +2736,13 @@ final class KleptonCompositor {
                 // table — an OpenXR quad on GL is bound there and a Vulkan one
                 // is recorded there too. Vulkan first, so RE4's path is
                 // untouched.
-                let t = kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage, Int32(vi), &w, &h)
+                // The guest-submitted texL first: AC Nexus draws its menu UI
+                // into its own textures and submits those, not into the swapchain
+                // image we handed out — so that handle, resolved to its MTLTexture,
+                // is where the panel pixels actually are. Falls back to the layer
+                // image (RE4's path) then kl_glfb when texL carries nothing.
+                let t = kl_vulkan_mtl_for_handle(ov.tex)
+                    ?? kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage, Int32(vi), &w, &h)
                     ?? kl_glfb_layer_mtl_texture(ov.layer_id, ov.stage, &w, &h)
                 if texture == nil, let t { texture = Unmanaged<MTLTexture>
                     .fromOpaque(t).takeUnretainedValue() }
@@ -2522,6 +2764,9 @@ final class KleptonCompositor {
                 }
                 continue
             }
+            // The equirect branch above may have swapped the depth state for
+            // its behind-everything compare; restore the quad's before drawing.
+            if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
             enc.setRenderPipelineState(pipe)
             enc.setFragmentTexture(texture, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
@@ -2541,6 +2786,222 @@ final class KleptonCompositor {
         }
         return drawn
     }
+    /// Matches `struct KLEq` in kl_msl_equirect (kl_reproject.c) byte for byte:
+    /// two float4x4 then four uint, 144 bytes, 16-aligned. One per amplified
+    /// view, indexed by [[amplification_id]].
+    private struct KLEqUniform {
+        var invProj: simd_float4x4 = matrix_identity_float4x4
+        var worldRot: simd_float4x4 = matrix_identity_float4x4
+        var slice: UInt32 = 0
+        var flipY: UInt32 = 0
+        var srgbDecode: UInt32 = 0
+        var visible: UInt32 = 0
+        var test: UInt32 = 0
+        var hscale: Float = 1
+    }
+
+    /// The 3x3 rotation of a rigid transform, re-homed as a 4x4 with no
+    /// translation — the panorama is at infinity, so only orientation maps a
+    /// view-space ray into the sphere\'s world space.
+    private static func rotationOnly(_ m: simd_float4x4) -> simd_float4x4 {
+        var r = matrix_identity_float4x4
+        r.columns.0 = SIMD4<Float>(m.columns.0.x, m.columns.0.y, m.columns.0.z, 0)
+        r.columns.1 = SIMD4<Float>(m.columns.1.x, m.columns.1.y, m.columns.1.z, 0)
+        r.columns.2 = SIMD4<Float>(m.columns.2.x, m.columns.2.y, m.columns.2.z, 0)
+        r.columns.3 = SIMD4<Float>(0, 0, 0, 1)
+        return r
+    }
+
+    /// V flips and sRGB decode differ by how the guest authored the panorama;
+    /// both are one device run to settle, so they are env-switchable.
+    private static let skipHeadLockedOverlays = klEnvOn("KL_OVERLAY_SKIP_HEADLOCKED", default: false)
+    private static let drawEquirectOverlays = klEnvOn("KL_OVERLAY_EQ", default: true)
+    private static let eqFlipY = klEnvOn("KL_EQ_FLIP", default: false)
+    private static let eqSrgbDecode = klEnvOn("KL_EQ_SRGB", default: false)
+    // KL_EQ_TEST=1 solid magenta (pass reaches display?), 2 UV gradient
+    // (mapping), 3 sampled texture brightened (dim content?), 4 world-ray
+    // colour (reconstruction). 0 = normal. A no-rebuild localiser for a black
+    // skybox.
+    private static let eqTest: UInt32 = {
+        if let s = ProcessInfo.processInfo.environment["KL_EQ_TEST"],
+           let v = UInt32(s) { return v }
+        return 0
+    }()
+    // Horizontal angular scale for the equirect: 1.0 = full 360 deg across the
+    // texture width (2:1 vs the 180 deg vertical, so a square video looks
+    // stretched), 2.0 = 180 deg across the width (square texture -> square
+    // angular, un-stretched). KL_EQ_HSCALE overrides.
+    private static let eqHScale: Float = {
+        if let s = ProcessInfo.processInfo.environment["KL_EQ_HSCALE"],
+           let v = Float(s) { return v }
+        return 2.0
+    }()
+
+    /// Composite a 360 equirect panorama (shape 5). A fullscreen triangle whose
+    /// fragment shader turns each pixel back into a world ray and samples the
+    /// sphere, at far-plane reverse-Z so eye content (when there is any) sits in
+    /// front. During shader warmup there is no eye content and this is the whole
+    /// picture — which on Quest is the loading skybox and here was black.
+    private func encodeEquirect(_ enc: MTLRenderCommandEncoder,
+                                ov: kl_ovrp_overlay,
+                                viewIndices: [Int],
+                                drawable: LayerRenderer.Drawable,
+                                originFromHead: simd_float4x4) -> Bool {
+        guard let pipe = equirectPipeline else { return false }
+        var w: Int32 = 0, h: Int32 = 0
+        // texL first — AC Nexus renders its backdrop into its OWN texture and
+        // submits that handle, exactly as its menu quads do; the layer swapchain
+        // image is the empty fallback. Same ladder, same reason, as the quad path.
+        let t = kl_vulkan_mtl_for_handle(ov.tex)
+            ?? kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage,
+                                            Int32(viewIndices.first ?? 0), &w, &h)
+            ?? kl_glfb_layer_mtl_texture(ov.layer_id, ov.stage, &w, &h)
+        guard let t else {
+            if !loggedOverlayMiss.contains(ov.layer_id) {
+                loggedOverlayMiss.insert(ov.layer_id)
+                NSLog("[cp] equirect overlay layer \(ov.layer_id) (stage "
+                      + "\(ov.stage)) has no MTLTexture — not composited")
+            }
+            return false
+        }
+        let texture = Unmanaged<MTLTexture>.fromOpaque(t).takeUnretainedValue()
+        var uniforms: [KLEqUniform] = []
+        for vi in viewIndices {
+            let proj = drawable.computeProjection(viewIndex: vi)
+            let originFromView = originFromHead
+                * Self.headFromView(drawable.views[vi].transform,
+                                    midpoint: eyeMidpointInDevice)
+            var u = KLEqUniform()
+            u.invProj = proj.inverse
+            u.worldRot = Self.rotationOnly(originFromView)
+            u.flipY = Self.eqFlipY ? 1 : 0
+            u.srgbDecode = Self.eqSrgbDecode ? 1 : 0
+            u.visible = 1
+            u.test = Self.eqTest
+            u.hscale = Self.eqHScale
+            uniforms.append(u)
+        }
+        enc.setRenderPipelineState(pipe)
+        if let equirectDepthState { enc.setDepthStencilState(equirectDepthState) }
+        enc.setFragmentTexture(texture, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        if !loggedOverlayDraw.contains(ov.layer_id) {
+            loggedOverlayDraw.insert(ov.layer_id)
+            NSLog("[cp] compositing EQUIRECT panorama layer \(ov.layer_id): "
+                  + "\(w)x\(h) tex, flipY=\(Self.eqFlipY) srgb=\(Self.eqSrgbDecode)")
+        }
+        return true
+    }
+
+    // The host-driven loading skybox player (AC Nexus). Created lazily the
+    // first frame an Equirect loading layer is live, torn down when it clears.
+    private var loadingVideo: LoadingVideoPlayer?
+    private var loadingVideoTried = false
+    private var loadingSkyboxDraws = 0
+
+    /// The current video frame as an MTLTexture, creating the player on first
+    /// use. The loading videos are staged beside the rest of the asset tree, so
+    /// the path comes from kl_app_assets_dir(). nil until a frame is decoded.
+    private func loadingVideoTexture() -> MTLTexture? {
+        // DIAGNOSTIC (KL_SCRATCH_DEBUG=1): draw the wild-handle scratch — the one
+        // image AC Nexus actually composites its frame into — as the skybox, so
+        // we can SEE what the guest produced. Spread over the sphere it is
+        // distorted, but it answers whether the guest's real content is in there.
+        if ProcessInfo.processInfo.environment["KL_SCRATCH_DEBUG"] == "1" {
+            var sw: Int32 = 0, sh: Int32 = 0
+            if let t = kl_vulkan_wild_scratch_mtl(&sw, &sh) {
+                return Unmanaged<MTLTexture>.fromOpaque(t).takeUnretainedValue()
+            }
+        }
+        if loadingVideo == nil {
+            if loadingVideoTried { return nil }
+            loadingVideoTried = true
+            guard let dir = kl_app_assets_dir() else { return nil }
+            let base = String(cString: dir)
+            // The init loop is the long warmup environment; fall back to the
+            // shorter background loop if the build ships only that.
+            let candidates = ["Background-with-Initialisation-Loop.mp4",
+                              "Background-Looping.mp4"]
+            var found: URL? = nil
+            for c in candidates {
+                let path = base + "/" + c
+                if FileManager.default.fileExists(atPath: path) {
+                    found = URL(fileURLWithPath: path); break
+                }
+            }
+            guard let url = found,
+                  let lv = LoadingVideoPlayer(device: device, url: url) else {
+                NSLog("[cp] loading skybox: no playable loading video under \(base)")
+                return nil
+            }
+            NSLog("[cp] loading skybox: playing \(url.lastPathComponent)")
+            lv.start()
+            loadingVideo = lv
+        }
+        return loadingVideo?.latestTexture()
+    }
+
+    /// Draw a video frame as a 360 equirect environment filling every view -
+    /// the same fullscreen-triangle equirect pass the guest-overlay path uses,
+    /// but sourced from our own player instead of a (missing) guest texture.
+    private func drawLoadingSkybox(_ enc: MTLRenderCommandEncoder,
+                                   viewIndices: [Int],
+                                   drawable: LayerRenderer.Drawable,
+                                   layered: Bool,
+                                   originFromHead: simd_float4x4,
+                                   texture: MTLTexture,
+                                   sampler: MTLSamplerState) {
+        guard let pipe = equirectPipeline else { return }
+        // Same viewport + amplification wiring the eye pass uses, so the
+        // fullscreen triangle covers both eyes in the layered (amplified) path
+        // rather than only view 0.
+        enc.setViewports(viewIndices.map { drawable.views[$0].textureMap.viewport })
+        if layered && viewIndices.count > 1 {
+            var mappings = viewIndices.enumerated().map { (n, vi) in
+                MTLVertexAmplificationViewMapping(
+                    viewportArrayIndexOffset: UInt32(n),
+                    renderTargetArrayIndexOffset: UInt32(drawable.views[vi].textureMap.sliceIndex))
+            }
+            enc.setVertexAmplificationCount(viewIndices.count, viewMappings: &mappings)
+        }
+        var uniforms: [KLEqUniform] = []
+        for vi in viewIndices {
+            let proj = drawable.computeProjection(viewIndex: vi)
+            let originFromView = originFromHead
+                * Self.headFromView(drawable.views[vi].transform,
+                                    midpoint: eyeMidpointInDevice)
+            var u = KLEqUniform()
+            u.invProj = proj.inverse
+            u.worldRot = Self.rotationOnly(originFromView)
+            u.flipY = Self.eqFlipY ? 1 : 0
+            u.srgbDecode = Self.eqSrgbDecode ? 1 : 0
+            u.visible = 1
+            u.test = Self.eqTest
+            u.hscale = Self.eqHScale
+            uniforms.append(u)
+        }
+        enc.setRenderPipelineState(pipe)
+        if let loadingSkyboxDepthState { enc.setDepthStencilState(loadingSkyboxDepthState) }
+        enc.setFragmentTexture(texture, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        loadingSkyboxDraws += 1
+        if loadingSkyboxDraws == 1 || loadingSkyboxDraws % 120 == 0 {
+            NSLog("[cp] loading skybox: drew \(loadingSkyboxDraws) frames "
+                  + "(\(texture.width)x\(texture.height), amp=\(viewIndices.count), "
+                  + "TEST=\(Self.eqTest), FLIP=\(Self.eqFlipY), SRGB=\(Self.eqSrgbDecode))")
+        }
+    }
+
     private let overlaysEnabled = klEnvOn("KL_GUEST_OVERLAYS", default: true)
     private var loggedOverlayMiss = Set<Int32>()
     private var loggedOverlayDraw = Set<Int32>()
@@ -2981,6 +3442,7 @@ final class KleptonCompositor {
     /// The midpoint the callback uses — the instance's, copied out so a C
     /// function pointer can reach it.
     nonisolated(unsafe) static var headAtMidpoint = SIMD3<Float>(0, 0, 0)
+    nonisolated(unsafe) static var loggedEyeMidpoint = false
 
     /// The eye midpoint in the device anchor's frame — the offset between what
     /// visionOS calls the device and what OpenXR calls VIEW.
@@ -3024,11 +3486,17 @@ final class KleptonCompositor {
                                                (a.y + b.y) * 0.5,
                                                (a.z + b.z) * 0.5)
             Self.headAtMidpoint = eyeMidpointInDevice
-            NSLog(String(format: "[cp] eye midpoint (%.4f, %.4f, %.4f) m from the "
-                                 + "device anchor — head space is this, not the anchor "
-                                 + "(KL_HEAD_MIDPOINT=0 restores the anchor)",
-                         eyeMidpointInDevice.x, eyeMidpointInDevice.y,
-                         eyeMidpointInDevice.z))
+            // Once, not per frame: this fires on every drawable and the value is
+            // ~constant, so an unconditional NSLog is thousands of writes/sec on
+            // the render thread — a frame-pacing / watchdog hazard.
+            if !Self.loggedEyeMidpoint {
+                Self.loggedEyeMidpoint = true
+                NSLog(String(format: "[cp] eye midpoint (%.4f, %.4f, %.4f) m from the "
+                                     + "device anchor — head space is this, not the anchor "
+                                     + "(KL_HEAD_MIDPOINT=0 restores the anchor)",
+                             eyeMidpointInDevice.x, eyeMidpointInDevice.y,
+                             eyeMidpointInDevice.z))
+            }
         }
         for (i, view) in drawable.views.enumerated() where i < 2 {
             // Relative to the eye MIDPOINT, because that is what the guest
@@ -3373,5 +3841,85 @@ final class KleptonCompositor {
                      ageMs, worstAgeMs, staleInARow))
         worstDelta = 0
         worstAgeMs = 0
+    }
+}
+
+
+/// Plays one of AC Nexus's loading mp4s (HEVC) and hands the compositor the
+/// current frame as an MTLTexture. This is the visionOS stand-in for the Android
+/// MediaPlayer the game drives its OVROverlay video background with: there is no
+/// Android Surface here, so the host decodes the same file itself and the
+/// compositor draws it as the equirect skybox. Looping, muted (the guest owns
+/// audio), and single-item so the video output stays attached across loops.
+final class LoadingVideoPlayer {
+    private let url: URL
+    private var player: AVPlayer?
+    private var output: AVPlayerItemVideoOutput?
+    private var cache: CVMetalTextureCache?
+    // Held so the CVPixelBuffer behind `current` stays alive while the GPU
+    // samples it; replaced, not accumulated, each new frame.
+    private var retained: CVMetalTexture?
+    private var current: MTLTexture?
+    private var endObserver: NSObjectProtocol?
+
+    init?(device: MTLDevice, url: URL) {
+        self.url = url
+        var c: CVMetalTextureCache?
+        guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &c)
+                == kCVReturnSuccess, let c else { return nil }
+        self.cache = c
+    }
+
+    func start() {
+        guard player == nil else { return }
+        let item = AVPlayerItem(url: url)
+        let attrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+        ]
+        let out = AVPlayerItemVideoOutput(outputSettings: attrs)
+        item.add(out)
+        output = out
+        let p = AVPlayer(playerItem: item)
+        p.isMuted = true
+        p.actionAtItemEnd = .none
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak p] _ in
+            p?.seek(to: .zero)
+            p?.play()
+        }
+        player = p
+        p.play()
+    }
+
+    /// The newest decoded frame, or the last one if none is ready this vsync.
+    func latestTexture() -> MTLTexture? {
+        guard let output, let cache else { return current }
+        let host = CACurrentMediaTime()
+        let t = output.itemTime(forHostTime: host)
+        guard t.isValid, output.hasNewPixelBuffer(forItemTime: t),
+              let pb = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil) else {
+            return current
+        }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        var cvtex: CVMetalTexture?
+        let r = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, pb, nil, .bgra8Unorm, w, h, 0, &cvtex)
+        if r == kCVReturnSuccess, let cvtex, let mtl = CVMetalTextureGetTexture(cvtex) {
+            retained = cvtex
+            current = mtl
+        }
+        return current
+    }
+
+    func stop() {
+        player?.pause()
+        player = nil
+        output = nil
+        current = nil
+        retained = nil
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        endObserver = nil
+        if let cache { CVMetalTextureCacheFlush(cache, 0) }
     }
 }

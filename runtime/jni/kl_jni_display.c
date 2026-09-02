@@ -240,6 +240,21 @@ static klj_val klj_UnityPlayer_requestUserAuthorization(void *env, void *self,
     return (klj_val){.l = NULL};
 }
 
+// UnityPermissions.requestUserPermissions(activity, String[], callback) — Unity
+// 6's callback-based permission request (ZIX). Same reality as
+// requestUserAuthorization above: there is no user to prompt and the state is
+// already settled by the manifest model hasUserAuthorizedPermission reads, so
+// this returns immediately without modelling a wait. The game reads the actual
+// state through hasUserAuthorizedPermission; a game that instead blocks on the
+// callback would need it invoked, and this is where that would go.
+static klj_val klj_UnityPermissions_requestUserPermissions(void *env, void *self,
+                                                           const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("UnityPermissions.requestUserPermissions(...) — no user to ask; "
+            "state is whatever hasUserAuthorizedPermission reports");
+    return (klj_val){.l = NULL};
+}
+
 // UnityPermissions.hasUserAuthorizedPermission(Activity, String) — the STATIC
 // form of the same question Context.checkCallingOrSelfPermission and
 // Activity.checkSelfPermission already answer, so it reads the same
@@ -291,6 +306,9 @@ const klj_binding klj_bind_display[] = {
     {"com/unity3d/player/UnityPermissions", "hasUserAuthorizedPermission",
      "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z",
                                                  klj_UnityPermissions_hasUserAuthorized},
+    {"com/unity3d/player/UnityPermissions", "requestUserPermissions",
+     "(Lcom.unity3d.player.UnityPlayerActivity;[Ljava/lang/String;Lcom.unity3d.player.IPermissionRequestCallbacks;)V",
+                                                 klj_UnityPermissions_requestUserPermissions},
 
     // ---- display, window and orientation ----
     {"android/hardware/display/DisplayManager", "getDisplay",

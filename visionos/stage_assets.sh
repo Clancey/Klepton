@@ -28,8 +28,17 @@ BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
 APK="$ROOT/$KLT_APK"
 ASSETS="$ROOT/$KLT_ASSETS"
 TREE="$KLT_TREE"
+# Present-or-absent, like the obb and files below. A NativeActivity port
+# (vicecity/libmiamivr) can ship no assets/ inside the APK at all — its data is
+# the staged files/ tree — and an unconditional copy of a directory that does not
+# exist is a staging failure for a target that is correct. Every other target has
+# an assets/ dir, so this clears nothing for them.
+if [ ! -d "$ASSETS" ]; then
+  echo "[stage] no assets/ for $KLT_NAME — staging none"
+  ASSETS=""
+fi
 
-[ -d "$ASSETS" ] || { echo "!! $ASSETS missing"; exit 1; }
+# (assets is optional — handled present-or-absent just above; the APK is not)
 [ -f "$APK" ]    || { echo "!! $APK missing"; exit 1; }
 
 # The OBB, for a SPLIT APPLICATION BINARY guest. Beat Saber 1.40 is one: the APK
@@ -53,13 +62,40 @@ TREE="$KLT_TREE"
 # engines report a missing OBB by carrying on — so it is silent at both ends.
 # The same relative path is used for the SOURCE under userdata, so a host run
 # and a device run read the file from the same place.
-OBB_REL="${KLT_OBB:-obb}"
+OBB_REL="${KLT_OBB-obb}"
+OBB_RAW="${KLT_OBB_RAW:-0}"   # 1 = the obb dir holds LOOSE files, not a packaged *.obb
 OBB="${KL_OBB_DIR:-$HOME/Library/Application Support/Klepton/userdata/$KLT_NAME/$OBB_REL}"
-if [ "${KL_SKIP_OBB:-0}" = 1 ] || ! compgen -G "$OBB/*.obb" > /dev/null 2>&1; then
-  # Say WHICH directory was empty. "no OBB" is correct for four of the seven
-  # targets and a staging mistake for the other three, and they looked the same.
-  [ "${KL_SKIP_OBB:-0}" = 1 ] || echo "[stage] no *.obb in $OBB — staging none"
+if [ "${KL_SKIP_OBB:-0}" = 1 ]; then
   OBB=""
+elif [ "$OBB_RAW" = 1 ]; then
+  # AC Nexus and its shape: the game streams LOOSE files from the obb dir, so
+  # there is no *.obb to glob for. Present-or-absent on the DIRECTORY instead,
+  # staged wholesale into <container>/android-files/<obb>.
+  if [ -d "$OBB" ] && [ -n "$(ls -A "$OBB" 2>/dev/null)" ]; then :; else
+    echo "[stage] no files in $OBB — staging none"
+    OBB=""
+  fi
+elif ! compgen -G "$OBB/*.obb" > /dev/null 2>&1; then
+  # Say WHICH directory was empty. "no OBB" is correct for several targets and a
+  # staging mistake for the others, and they looked the same.
+  echo "[stage] no *.obb in $OBB — staging none"
+  OBB=""
+fi
+
+# The internal getFilesDir() payload, for a guest that reads loose files from
+# <files>/files rather than only from the obb (AC Nexus: saves, settings,
+# DecodedBanks, il2cpp metadata pulled from the device's internal storage). The
+# source mirrors the container exactly - userdata/<name>/files maps to
+# <container>/android-files/files - so a host run and a device run read it from
+# the same place. Present-or-absent, like the obb; KL_SKIP_FILES=1 leaves it.
+FILES_REL="${KLT_STAGE_FILES:-}"
+FILES=""
+if [ -n "$FILES_REL" ] && [ "${KL_SKIP_FILES:-0}" != 1 ]; then
+  FILES="${KL_FILES_DIR:-$HOME/Library/Application Support/Klepton/userdata/$KLT_NAME/$FILES_REL}"
+  if [ -d "$FILES" ] && [ -n "$(ls -A "$FILES" 2>/dev/null)" ]; then :; else
+    echo "[stage] no files in $FILES — staging none"
+    FILES=""
+  fi
 fi
 
 # The RETAIL game data, for an engine-port guest. JKXR is one: it is OpenJK, so
@@ -153,13 +189,18 @@ if [ -z "$TARGET" ]; then
   rm -rf "$DEST/$TREE/assets"
   # A copy, not a symlink: the guest resolves paths by concatenation
   # and a link would work here but hide a real failure on device.
-  cp -R "$ASSETS" "$DEST/$TREE/assets"
+  if [ -n "$ASSETS" ]; then cp -R "$ASSETS" "$DEST/$TREE/assets"; fi
   cp "$APK" "$DEST/$KLT_APK"
   [ ${#META[@]} -gt 0 ] && cp "${META[@]}" "$DEST/$TREE/"
   if [ -n "$OBB" ]; then
     rm -rf "$DEST/android-files/$OBB_REL"
     mkdir -p "$DEST/android-files/$(dirname "$OBB_REL")"
     cp -RL "$OBB" "$DEST/android-files/$OBB_REL"
+  fi
+  if [ -n "$FILES" ]; then
+    rm -rf "$DEST/android-files/$FILES_REL"
+    mkdir -p "$DEST/android-files/$(dirname "$FILES_REL")"
+    cp -RL "$FILES" "$DEST/android-files/$FILES_REL"
   fi
   if [ -n "$RETAIL" ]; then
     # -L, because what userdata holds are symlinks into the user's install.
@@ -206,8 +247,8 @@ fi
 # -L: both the OBB directory and the retail one are deliberately symlinks into
 # an install elsewhere on this machine, and what is uploaded is what they point
 # at. Without it this line says 44 MB and then spends twenty minutes.
-echo "[stage] device $TARGET, $KLT_NAME ($(du -shcL "$ASSETS" "$APK" ${OBB:+"$OBB"} ${RETAIL:+"$RETAIL"} 2>/dev/null | tail -1 | cut -f1))"
-copy "$ASSETS" "Documents/$TREE/assets"
+echo "[stage] device $TARGET, $KLT_NAME ($(du -shcL ${ASSETS:+"$ASSETS"} "$APK" ${OBB:+"$OBB"} ${FILES:+"$FILES"} ${RETAIL:+"$RETAIL"} 2>/dev/null | tail -1 | cut -f1))"
+if [ -n "$ASSETS" ]; then copy "$ASSETS" "Documents/$TREE/assets"; fi
 copy "$APK"    "Documents/$KLT_APK"
 copy_meta
 # The OBB, FILE BY FILE and through the RESOLVED path — not `copy "$OBB"`.
@@ -225,13 +266,32 @@ copy_meta
 # destination is the FILE's path rather than the directory's parent, which is
 # why this cannot just gain a flag.
 if [ -n "$OBB" ]; then
-  for f in "$OBB"/*.obb; do
-    [ -e "$f" ] || continue          # a dangling link on THIS machine too
-    echo "[stage] device $TARGET, $KLT_NAME $f"
-    real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$f")
-    copy "$real" "Documents/android-files/$OBB_REL/$(basename "$f")"
-    echo "[stage] done $f"
-  done
+  if [ "$OBB_RAW" = 1 ]; then
+    # Loose files: copy the DIRECTORY wholesale, the way `copy "$ASSETS"` does.
+    # The entries are real extracted files, so unlike the *.obb path there is no
+    # per-file deref; the resolved source still guards userdata/<name>/obb being
+    # itself a symlink into the extracted tree.
+    real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$OBB")
+    echo "[stage] device $TARGET, $KLT_NAME $OBB_REL/ ($(du -shL "$OBB" 2>/dev/null | cut -f1))"
+    copy "$real" "Documents/android-files/$OBB_REL"
+    echo "[stage] done $OBB_REL/"
+  else
+    for f in "$OBB"/*.obb; do
+      [ -e "$f" ] || continue          # a dangling link on THIS machine too
+      echo "[stage] device $TARGET, $KLT_NAME $f"
+      real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$f")
+      copy "$real" "Documents/android-files/$OBB_REL/$(basename "$f")"
+      echo "[stage] done $f"
+    done
+  fi
+fi
+# The internal getFilesDir() payload, copied as a DIRECTORY through the resolved
+# path for the same reasons as the loose obb above.
+if [ -n "$FILES" ]; then
+  real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$FILES")
+  echo "[stage] device $TARGET, $KLT_NAME $FILES_REL/ ($(du -shL "$FILES" 2>/dev/null | cut -f1))"
+  copy "$real" "Documents/android-files/$FILES_REL"
+  echo "[stage] done $FILES_REL/"
 fi
 # The retail pk3s, file by file and through the RESOLVED path, for the reason
 # the OBB is staged that way: what userdata holds are symlinks into the user's

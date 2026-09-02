@@ -207,12 +207,14 @@ typedef struct {
     // picture with no error surface; an absent one is the failure that is
     // already happening and is at least honest.
     uint32_t      visible;
+    uint32_t      opaque;    // KL_OVERLAY_OPAQUE: force sampled alpha to 1
 } kl_overlay_uniforms;
 
 // The overlay shader — `kl_ov_v` / `kl_ov_f`, a 4-vertex triangle strip with no
 // vertex buffer, buffer(0) an array indexed by [[amplification_id]] exactly as
 // the reprojection pass's is.
 const char *kl_reproject_overlay_msl(void);
+const char *kl_reproject_equirect_msl(void);
 
 // Build one view's uniforms for one overlay. `origin_from_device` and
 // `device_from_view` are the same two matrices kl_reproject_build takes, and

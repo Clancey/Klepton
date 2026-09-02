@@ -27,12 +27,13 @@ typedef void (*anativeactivity_oncreate_fn)(kl_ANativeActivity *, void *, size_t
         } else if (out) fprintf(out, "  [na] %s — not registered\n", #name);    \
     } while (0)
 
-int kl_na_create(kl_image *img, const char *entry, FILE *out) {
+int kl_na_create(kl_image *img, const char *entry, const char *data_path, FILE *out) {
     if (!img) {
         if (out) fprintf(out, "  [na] no image to enter\n");
         return 1;
     }
     if (!entry) entry = "ANativeActivity_onCreate";
+    if (!data_path) data_path = kl_jni_files_dir();
 
     anativeactivity_oncreate_fn onCreate =
         (anativeactivity_oncreate_fn)kl_sym(img, entry);
@@ -50,13 +51,17 @@ int kl_na_create(kl_image *img, const char *entry, FILE *out) {
     g_act.vm               = kl_jni_vm();
     g_act.env              = kl_jni_env();
     g_act.clazz            = kl_jni_activity();
-    g_act.internalDataPath = kl_jni_files_dir();
-    g_act.externalDataPath = kl_jni_files_dir();
+    g_act.internalDataPath = data_path;
+    g_act.externalDataPath = data_path;
     // 29, the same Quest-2 answer Build.SDK_INT gives. Two numbers describing
     // one device have to agree — this is the display-panel group answer again.
     g_act.sdkVersion       = 29;
     g_act.assetManager     = kl_ndk_asset_manager();
-    g_act.obbPath          = kl_jni_files_dir();
+    // Short /sdcard alias, not the ~90-char container path from kl_jni_files_dir():
+    // both resolve to the same place via kl_guest_path, but the guest reads obbPath
+    // straight from the struct and a game that appends+FORTIFY-strcats into a fixed
+    // buffer overflows on the long form (vicecity's 128-byte casepath buffer).
+    g_act.obbPath          = "/sdcard";
 
     if (out) {
         fprintf(out, "  activity: clazz=%p env=%p assets=%p sdk=%d dataPath=%s\n",

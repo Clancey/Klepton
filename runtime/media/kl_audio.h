@@ -22,6 +22,7 @@
 #define KL_AUDIO_H
 #include <stddef.h>
 #include <stdio.h>
+#include <stdint.h>
 
 // Open the device for a guest stream of `rate` Hz, `channels` channels,
 // `bits` bits per sample (16 is the only width FMOD produces and the only one
@@ -87,5 +88,28 @@ void kl_audio_report(FILE *f);
 // rather than heard as a dropout. 0 leaves the 80 ms default. KL_AUDIO_LATENCY_MS
 // still overrides. Set before the guest opens its audio device.
 void kl_audio_set_latency_ms(unsigned ms);
+
+// ---- Microphone capture (opt-in; OFF by default) ----
+// The KleptonMic toggle (a persisted setting, mirrored on KleptonChroma) calls
+// kl_audio_mic_set_enabled. Nothing touches the microphone — and so nothing
+// triggers the visionOS mic permission prompt — while it is OFF: a guest input
+// stream (kl_aaudio.c / kl_opensl.c) is still told "no capture device", exactly
+// as before. When it is ON, a guest that opens an input stream drives
+// kl_audio_mic_open/read/close and gets real samples.
+void     kl_audio_mic_set_enabled(int on);
+int      kl_audio_mic_enabled(void);
+
+// Open the capture device (idempotent). Returns 0 on success; negative if the
+// mic is disabled, unavailable, or permission was refused. want_rate/want_channels
+// are hints; delivered samples are interleaved int16 at kl_audio_mic_rate() /
+// kl_audio_mic_channels().
+int      kl_audio_mic_open(unsigned want_rate, unsigned want_channels);
+void     kl_audio_mic_close(void);
+unsigned kl_audio_mic_rate(void);
+unsigned kl_audio_mic_channels(void);
+
+// Non-blocking: pull up to `frames` frames of interleaved int16 into buf.
+// Returns frames actually read (0 if none buffered / not open / disabled).
+int      kl_audio_mic_read_i16(int16_t *buf, int frames);
 
 #endif

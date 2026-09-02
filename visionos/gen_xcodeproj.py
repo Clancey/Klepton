@@ -177,13 +177,66 @@ C_PRJ_D = oid("CPRJD"); C_PRJ_R = oid("CPRJR")
 C_TGT_D = oid("CTGTD"); C_TGT_R = oid("CTGTR")
 F_C = oid("FC"); F_H = oid("FH"); F_BRIDGE = oid("FBRDG")
 B_C = oid("BC")
+# The app icon: an asset catalog holding one solid-image-stack per target that
+# has one (AppIcon-<name>.solidimagestack). Targets without one build exactly
+# as before - the catalog compiles empty for them and no APPICON setting is
+# emitted, so the icon is strictly additive.
+F_ASSETS = oid("FASSET"); B_ASSETS = oid("BASSET"); BP_RES = oid("BPRES")
+import os as _os
+# Compile-time launcher opt-in (also drives LAUNCHER_COND + the display name below).
+_launcher_on = _os.environ.get("KL_CUSTOM_LAUNCHER", "").strip().lower() in ("1", "true", "yes", "on")
+# NB: the bundle id is deliberately NOT switched by the launcher flag. It is a SIGNING
+# identity, and forcing an unregistered id (e.g. com.noosphere.hl1vr) makes every local
+# device build fail code-signing and silently relaunch the old app. For the neutral
+# store id, register the App ID first, then archive with an explicit
+# KLEPTON_BUNDLE_ID=com.noosphere.hl1vr. Local launcher builds keep the dev id and sign.
+_assets_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "Assets.xcassets")
+def _stack_exists(n): return _os.path.isdir(_os.path.join(_assets_dir, n + ".solidimagestack"))
+# With the launcher on, a trademark-free monogram icon (AppIcon-<t>-launcher) replaces
+# the target's normal icon when one is present; otherwise the normal icon stands. Both
+# are gitignored, so this is strictly local/opt-in.
+_icon_base = f"AppIcon-{KLT['name']}"
+_icon_name = (f"{_icon_base}-launcher"
+              if _launcher_on and _stack_exists(f"{_icon_base}-launcher")
+              else _icon_base)
+HAS_ICON = _stack_exists(_icon_name)
+ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon_name}\";\n"
+                         if HAS_ICON else "")
+                        # Info.plist's CFBundleIconName is $(KL_APPICON_NAME) —
+                        # always defined so expansion never leaves a literal
+                        # "$(...)" in the bundle; the placeholder names no stack
+                        # and behaves exactly like the old no-icon build.
+                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n")
+
+# Trim the asset catalog to THIS target. The shared Assets.xcassets holds one icon
+# stack per target (~26), and actool compiles ALL of them into the app's Assets.car
+# (~75 MB of icons the app never uses). So build a per-target catalog under build/
+# (gitignored) carrying only this target's normal + launcher stacks, and reference
+# THAT below instead of the full catalog. Iconless targets get an empty catalog,
+# which builds exactly as the shared one did for them.
+import shutil as _shutil
+_appicon_catalog = f"build/appicon/{KLT['name']}.xcassets"
+_cat_abs = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), _appicon_catalog)
+_shutil.rmtree(_cat_abs, ignore_errors=True)
+_os.makedirs(_cat_abs, exist_ok=True)
+_src_contents = _os.path.join(_assets_dir, "Contents.json")
+if _os.path.exists(_src_contents):
+    _shutil.copy(_src_contents, _os.path.join(_cat_abs, "Contents.json"))
+else:
+    open(_os.path.join(_cat_abs, "Contents.json"), "w").write(
+        '{\n  "info" : { "author" : "xcode", "version" : 1 }\n}\n')
+for _stack in (_icon_base, f"{_icon_base}-launcher"):
+    _s = _os.path.join(_assets_dir, _stack + ".solidimagestack")
+    if _os.path.isdir(_s):
+        _shutil.copytree(_s, _os.path.join(_cat_abs, _stack + ".solidimagestack"))
 
 # The Swift half of the language split: the App/UI, and the Compositor Services
 # renderer adds. A list rather than an id pair each, for the same reason
 # the guest libraries are one.
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
-         "KleptonChroma.swift"]
+         "KleptonChroma.swift", "KleptonMic.swift",
+         "KleptonLauncher.swift", "KleptonHL1.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(
@@ -218,6 +271,25 @@ filerefs = "\n".join(
 embeds = "\n".join(f'\t\t\t\t{g["emb"]},' for g in guest)
 fwchildren = "\n".join(f'\t\t\t\t{g["ref"]},' for g in guest)
 
+# Compile-time opt-in for the custom "configure, then Start" launcher (hl1/hl2/
+# portal). Only when this project is generated with KL_CUSTOM_LAUNCHER set does the
+# build carry the KL_CUSTOM_LAUNCHER Swift active-compilation condition that
+# klLauncherTitle() (Sources/KleptonLauncher.swift) gates on — so a shipping build
+# bakes the launcher in with no runtime env. Default builds (and visionos/run.sh)
+# omit it and keep the original autoboot / "Boot"-button shape. Applies to both
+# Debug and Release (this is the target-level COMMON block); $(inherited) preserves
+# the project-level DEBUG condition.
+# With the launcher on, the game builds present a compact trademark-free name; every
+# other build (and every other target) keeps its normal display name from targets.py.
+_launcher_display = {"hl1": "HL1VR", "hl2": "HL2VR", "portal": "P1VR"}
+_display = (_launcher_display.get(KLT['name'], KLT['display']) if _launcher_on
+            else KLT['display'])
+# Trailing newline, glued at line-start to the next setting — the same shape as
+# ENTITLEMENTS_SETTING / ASSETCATALOG_SETTING above, so it lands on its own line in
+# the output and expands to nothing (no blank line) when the flag is off.
+LAUNCHER_COND = ('\t\t\t\tSWIFT_ACTIVE_COMPILATION_CONDITIONS = "KL_CUSTOM_LAUNCHER $(inherited)";\n'
+                 if _launcher_on else "")
+
 COMMON = f"""
 				CLANG_ENABLE_MODULES = YES;
 {ENTITLEMENTS_SETTING}				CODE_SIGN_STYLE = Automatic;
@@ -225,7 +297,7 @@ COMMON = f"""
 				DEVELOPMENT_TEAM = {TEAM};
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = Info.plist;
+{ASSETCATALOG_SETTING}				INFOPLIST_FILE = Info.plist;
 				// One entry per runtime source directory: a runtime header is
 				// included by BARE NAME everywhere, including from
 				// Klepton-Bridging-Header.h, so each directory holding one has
@@ -262,7 +334,7 @@ COMMON = f"""
 					"$(inherited)",
 					"KL_TARGET_DEFAULT=\\\\\\"{KLT['name']}\\\\\\"",
 				);
-				INFOPLIST_KEY_CFBundleDisplayName = "{KLT['display']}";
+				INFOPLIST_KEY_CFBundleDisplayName = "{_display}";
 				INFOPLIST_KEY_GCSupportsControllerUserInteraction = YES;
 				// NOT UIApplicationSceneManifest_Generation. Setting it makes Xcode
 				// GENERATE the scene manifest and overwrite the one in Info.plist —
@@ -291,7 +363,7 @@ COMMON = f"""
 				SDKROOT = xros;
 				SUPPORTED_PLATFORMS = "xros xrsimulator";
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/Klepton-Bridging-Header.h";
-				SWIFT_VERSION = 5.0;
+{LAUNCHER_COND}				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 7;
 				// visionOS 26, not 2.0. The device runs 27 and the SDK is 26, and an
 				// app declaring a 2.0 minimum is asking the system for five-major-
@@ -313,6 +385,7 @@ PBX = f"""// !$*UTF8*$!
 /* Begin PBXBuildFile section */
 {swift_buildfiles}
 		{B_C} /* kl_app.c in Sources */ = {{isa = PBXBuildFile; fileRef = {F_C}; }};
+		{B_ASSETS} /* Assets.xcassets in Resources */ = {{isa = PBXBuildFile; fileRef = {F_ASSETS}; }};
 		{B_RT_LNK} /* Klepton.xcframework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {F_RT}; }};
 {buildfiles}
 /* End PBXBuildFile section */
@@ -323,6 +396,7 @@ PBX = f"""// !$*UTF8*$!
 		{F_C} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = kl_app.c; sourceTree = "<group>"; }};
 		{F_H} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = kl_app.h; sourceTree = "<group>"; }};
 		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Klepton-Bridging-Header.h"; sourceTree = "<group>"; }};
+		{F_ASSETS} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = {_appicon_catalog}; sourceTree = "<group>"; }};
 		{F_RT} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Klepton.xcframework; path = ../build/Klepton.xcframework; sourceTree = "<group>"; }};
 {filerefs}
 /* End PBXFileReference section */
@@ -359,6 +433,7 @@ PBX = f"""// !$*UTF8*$!
 				{G_SRC},
 				{G_FW},
 				{G_PROD},
+				{F_ASSETS},
 			);
 			sourceTree = "<group>";
 		}};
@@ -399,6 +474,7 @@ PBX = f"""// !$*UTF8*$!
 			buildPhases = (
 				{BP_SRC},
 				{BP_FRM},
+				{BP_RES},
 				{BP_EMB},
 			);
 			buildRules = ();
@@ -435,6 +511,17 @@ PBX = f"""// !$*UTF8*$!
 			);
 		}};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		{BP_RES} = {{
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				{B_ASSETS},
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		}};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		{BP_SRC} = {{

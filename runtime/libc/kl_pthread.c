@@ -21,6 +21,9 @@
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include <semaphore.h>
 #include <sched.h>
 #include <signal.h>
@@ -29,6 +32,8 @@
 #include <time.h>
 #include <dispatch/dispatch.h>
 #include "klepton.h"
+#include "kl_env.h"
+#include "kl_x18.h"
 
 // ---------- lazy handle in guest storage ----------
 // CRITICAL: bionic's sync types are `int32_t __private[N]`, so guest objects are only
@@ -95,7 +100,16 @@ SYNC_TABLE(pthread_rwlock_t, g_rwl, g_rwl_n, pthread_rwlock_init(fresh, NULL))
 // deadlock (2026-08-06 capture hang). So mutexes are keyed by guest
 // *address* instead: a copied or recycled address is the same mutex, a
 // different address is a different mutex, and guest storage is never read.
-#define MTX_MAP_SIZE 32768          // power of two; abort past it, KL_MAX_SYNC-style
+// Keyed by guest ADDRESS, and slots are only reclaimed on an explicit
+// pthread_mutex_destroy — which many guests never call (freeing the containing
+// object is legal on Linux, where a pthread_mutex_t needs no destroy). So the
+// table fills monotonically with the working set of distinct mutex addresses.
+// TWD2's UE4 load creates ~32k mutexes without destroying any and overflowed the
+// old 32768 table: mtx_entry_for's unbounded probe then spun FOREVER on the first
+// insert into a full table (the "abort past it" below was never implemented), which
+// looked like a hang with FAsyncLoading pinned 99% in mtx_entry_for. 8x the size so
+// a large UE4 load fits, and mtx_entry_for now bounds its probe (see there).
+#define MTX_MAP_SIZE 262144         // power of two; mtx_entry_for degrades (not hangs) if full
 typedef struct {
     _Atomic(uintptr_t)   key;       // guest address; 0 = empty
     // Atomic, and published AFTER the key with release ordering — see
@@ -155,8 +169,25 @@ typedef struct {
     // this condvar, so the one check that can recognise the aliasing bug answers
     // about an unrelated entry.
     _Atomic(void *)          last_mutex;
+    // Cond-deadlock instrumentation (KL_TRACE_CONDDUMP). `waiters` is how many
+    // threads are asleep in this cond right now; `signals` counts every
+    // signal+broadcast delivered to it; `last_sig_ns` is when the last one landed.
+    // At a hang, waiters>0 with signals still climbing = a lost wakeup (the signal
+    // reached a DIFFERENT host cond than the sleeper is on — aliasing/copy);
+    // waiters>0 with signals frozen = nobody is signalling it at all.
+    _Atomic(int)             waiters;
+    _Atomic(uint64_t)        signals;
+    _Atomic(uint64_t)        last_sig_ns;
+    _Atomic(void *)          waiter_ra;   // guest call site of the last waiter here
+    _Atomic(void *)          waiter_ra2;  // one frame deeper: the caller of that
 } cnd_entry;
 static cnd_entry g_cnd_map[MTX_MAP_SIZE];
+
+static uint64_t cnd_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static pthread_cond_t *cnd_make(void) {
     pthread_cond_t *fresh = malloc(sizeof *fresh);
@@ -195,6 +226,7 @@ static pthread_cond_t *cnd_host(cnd_entry *e) {
 }
 static pthread_cond_t *cnd(void *g) { return cnd_host(cnd_entry_for(g)); }
 
+
 // The host mutex behind an entry. Separate from the lookup because the entry
 // may be visible for a few instructions before its mutex is: the creator
 // publishes the key with the CAS and the mutex immediately after, so a reader
@@ -216,16 +248,46 @@ static pthread_mutex_t *mtx_host(mtx_entry *e) {
 // Several threads first-locking one brand-new mutex at once is exactly what a
 // thread pool coming up does, which is why it was intermittent and why it
 // picked the guest with the most thread pools.
+// A single shared fallback used only when the whole table is full — better a few
+// guest mutexes serialising on one recursive host mutex than an infinite probe
+// spin. With MTX_MAP_SIZE at 262144 this should never be reached in practice; it
+// exists so a pathological guest degrades instead of hanging (which is exactly
+// what TWD2 did at the old 32768).
+static mtx_entry g_mtx_overflow;
+static mtx_entry *mtx_overflow(void) {
+    if (!atomic_load(&g_mtx_overflow.m)) {
+        pthread_mutex_t *m = mtx_make();
+        pthread_mutex_t *expect = NULL;
+        if (!atomic_compare_exchange_strong(&g_mtx_overflow.m, &expect, m) && m) {
+            pthread_mutex_destroy(m); free(m);
+        }
+    }
+    static _Atomic int said;
+    if (atomic_fetch_add(&said, 1) == 0)
+        fprintf(stderr, "  [klb] mutex table FULL (%d slots) — sharing one fallback "
+                        "mutex; sync correctness degraded (raise MTX_MAP_SIZE)\n",
+                MTX_MAP_SIZE);
+    return &g_mtx_overflow;
+}
 static mtx_entry *mtx_entry_for(void *g) {
     uintptr_t want = (uintptr_t)g;
     pthread_mutex_t *fresh = NULL;
+    unsigned probes = 0;
     for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
         uintptr_t k = atomic_load(&g_mtx_map[i].key);
         if (k == want) {
             if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
             return &g_mtx_map[i];
         }
-        if (k) continue;
+        if (k) {
+            // Bound the probe: a full table (every slot occupied by a DIFFERENT
+            // key) would otherwise loop forever. One full sweep proves it full.
+            if (++probes >= MTX_MAP_SIZE) {
+                if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
+                return mtx_overflow();
+            }
+            continue;
+        }
         // empty: build the mutex first, so claiming the key publishes a
         // complete entry. Kept across a lost race rather than rebuilt.
         if (!fresh) fresh = mtx_make();
@@ -342,6 +404,124 @@ static void mtx_wait_leave(void) {
     }
 }
 
+// Semaphore-waiter tracking, mirroring g_mtx_waiters. A thread stuck in
+// klb_sem_wait (dispatch_semaphore_wait FOREVER) is invisible to the cond and
+// mutex dumps and often to the sampler (the game/main thread is not sampled), so
+// this is the last place a stalled producer can hide. Populated for the duration
+// of every blocking sem wait; the watchdog dumps whoever is still parked.
+static struct { _Atomic(void *) tid, guest, ra; } g_sem_waiters[64];
+static void sem_wait_enter(void *guest, void *ra) {
+    void *self = (void *)pthread_self();
+    for (int i = 0; i < 64; i++) {
+        void *expect = NULL;
+        if (atomic_compare_exchange_strong(&g_sem_waiters[i].tid, &expect, self)) {
+            atomic_store(&g_sem_waiters[i].guest, guest);
+            atomic_store(&g_sem_waiters[i].ra, ra);
+            return;
+        }
+    }
+}
+static void sem_wait_leave(void) {
+    void *self = (void *)pthread_self();
+    for (int i = 0; i < 64; i++) {
+        void *expect = self;
+        if (atomic_compare_exchange_strong(&g_sem_waiters[i].tid, &expect, NULL))
+            return;
+    }
+}
+
+// Cond-deadlock watchdog. Every ~3s it dumps every cond that has sleepers, with
+// its waiter count, total signals delivered, and how long since the last one.
+// The read at a hang is the whole point: a cond with waiters>0 whose `signals`
+// keeps CLIMBING is a lost wakeup (the signal reached a different host cond than
+// the sleeper is parked on — an aliased/copied condvar); one whose `signals` is
+// FROZEN (or zero) is never signalled at all (a missing signal path, or a wait
+// with no corresponding wake). Default ON for the targets that deadlock in the
+// all-cvwait state so no env is needed on device; KL_TRACE_CONDDUMP overrides.
+static void *cnd_watchdog(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct timespec s = { .tv_sec = 3, .tv_nsec = 0 };
+        nanosleep(&s, NULL);
+        uint64_t now = cnd_now_ns();
+        int shown = 0, total_waiters = 0;
+        for (unsigned i = 0; i < MTX_MAP_SIZE; i++) {
+            int w = atomic_load(&g_cnd_map[i].waiters);
+            if (w <= 0) continue;
+            total_waiters += w;
+            uint64_t sig = atomic_load(&g_cnd_map[i].signals);
+            uint64_t ls  = atomic_load(&g_cnd_map[i].last_sig_ns);
+            double age = ls ? (double)(now - ls) / 1e9 : -1.0;
+            // A cond is a deadlock SUSPECT when it has a sleeper but nothing is
+            // waking it: never signalled, or the last signal is old. Those get
+            // logged unconditionally (with the waiter's call site to symbolise),
+            // healthy re-waiting pools only up to a cap.
+            int stuck = (sig == 0) || (ls && (now - ls) > 5000000000ull);
+            if (stuck || shown < 24) {
+                void *ra  = atomic_load(&g_cnd_map[i].waiter_ra);
+                void *ra2 = atomic_load(&g_cnd_map[i].waiter_ra2);
+                fprintf(stderr, "  [cnd] %#llx waiters=%d signals=%llu "
+                        "last_signal=%.1fs waiter_ra=%p caller=%p%s\n",
+                        (unsigned long long)atomic_load(&g_cnd_map[i].key), w,
+                        (unsigned long long)sig, age, ra, ra2,
+                        stuck ? "   <== STUCK (no wake coming)" : "");
+            }
+            shown++;
+        }
+        if (shown)
+            fprintf(stderr, "  [cnd] --- %d cond(s) sleeping, %d waiter(s) total "
+                    "(signals climbing => lost wakeup; frozen => never signalled)\n",
+                    shown, total_waiters);
+        // Threads currently BLOCKED on a guest mutex (g_mtx_waiters is populated
+        // for the duration of every pthread_mutex_lock that has to wait). This is
+        // where a producer thread hides when it is not on a cond or a semaphore —
+        // e.g. the game thread stalled trying to take a lock a stuck thread holds.
+        // For each, name the waiter's call site and the mutex's current owner +
+        // the site that took it, so a lock-order / held-forever deadlock is legible.
+        int mshown = 0;
+        for (int i = 0; i < 64; i++) {
+            void *tid = atomic_load(&g_mtx_waiters[i].tid);
+            if (!tid) continue;
+            void *g  = atomic_load(&g_mtx_waiters[i].guest);
+            void *ra = atomic_load(&g_mtx_waiters[i].ra);
+            void *owner = NULL, *locksite = NULL; int depth = 0;
+            if (g) { mtx_entry *me = mtx_entry_for(g);
+                     owner = atomic_load(&me->owner);
+                     locksite = atomic_load(&me->locksite);
+                     depth = atomic_load(&me->depth); }
+            fprintf(stderr, "  [mtx] tid=%p BLOCKED on %p (ra=%p) — held by owner=%p "
+                    "locksite=%p depth=%d\n", tid, g, ra, owner, locksite, depth);
+            mshown++;
+        }
+        if (mshown)
+            fprintf(stderr, "  [mtx] --- %d thread(s) blocked on a mutex "
+                    "(waiter ra + holder locksite name the lock-order deadlock)\n",
+                    mshown);
+        // ...and threads parked in a blocking sem_wait (see g_sem_waiters).
+        for (int i = 0; i < 64; i++) {
+            void *tid = atomic_load(&g_sem_waiters[i].tid);
+            if (!tid) continue;
+            fprintf(stderr, "  [sem] tid=%p BLOCKED in sem_wait on %p (ra=%p)\n",
+                    tid, atomic_load(&g_sem_waiters[i].guest),
+                    atomic_load(&g_sem_waiters[i].ra));
+        }
+    }
+    return NULL;
+}
+static void cnd_watchdog_launch(void) {
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    int dflt = t && (strcmp(t, "wrath2") == 0 || strcmp(t, "wanderer") == 0 ||
+                     strcmp(t, "twd2") == 0);
+    if (!kl_env_on("KL_TRACE_CONDDUMP", dflt)) return;
+    pthread_t th;
+    if (pthread_create(&th, NULL, cnd_watchdog, NULL) == 0) pthread_detach(th);
+}
+static void cnd_watchdog_start(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, cnd_watchdog_launch);
+}
+
 // ---------- the return-code convention, and a trap it hides ----------
 //
 // pthread functions do NOT set errno — they RETURN the error code. So the errno
@@ -427,9 +607,16 @@ int klb_pthread_mutex_lock(void *m) {
 int klb_pthread_mutex_unlock(void *m)  {
     if (!m) return mtx_null("unlock");
     mtx_entry *e = mtx_entry_for(m);
-    atomic_fetch_sub(&e->depth, 1);
-    atomic_store(&e->owner, NULL);
-    atomic_store(&e->locksite, NULL);
+    // Our host mutexes are RECURSIVE, so one unlock of a depth>1 hold does NOT
+    // release the host mutex — clearing owner/locksite here would then report a
+    // still-held lock as free (owner=0x0), which is exactly what hid the holder
+    // of the deadlocked allocator lock in the [mtx] dump. Only clear the owner
+    // when this unlock actually drops the last level.
+    int newdepth = atomic_fetch_sub(&e->depth, 1) - 1;
+    if (newdepth <= 0) {
+        atomic_store(&e->owner, NULL);
+        atomic_store(&e->locksite, NULL);
+    }
     return px(pthread_mutex_unlock(mtx_host(e)));
 }
 int klb_pthread_mutex_trylock(void *m) {
@@ -494,7 +681,15 @@ static void dump_thread_stack(FILE *out, void *pt) {
     }
 }
 
+static void kl_tsd_report(FILE *out);    // defined with the key table below
+
 void kl_pthread_report(FILE *out) {
+    // The TSD ceiling, first, because a guest that hit it is already broken in
+    // a way nothing else in this dump names: pthread_key_create hands back
+    // EAGAIN, the guest stores a sentinel key, and the fault lands hundreds of
+    // frames later on a NULL from getspecific. Asgard's Wrath 2 died exactly
+    // that way (FPhysXCPUDispatcher::submitTask, key -1, SIGSEGV at 0x84).
+    kl_tsd_report(out);
     fprintf(out, "-- mutex owners (kl_pthread address map) --\n");
     unsigned shown = 0;
     for (uint32_t i = 0; i < MTX_MAP_SIZE; i++) {
@@ -559,8 +754,35 @@ int klb_pthread_mutexattr_settype(int *a, int t)  { *a = t; return 0; }
 // already waiting on it.
 int klb_pthread_cond_init(void *c, const void *a)  { (void)a; cnd(c); return 0; }
 int klb_pthread_cond_destroy(void *p) { (void)p; return 0; }
-int klb_pthread_cond_signal(void *c)    { return px(pthread_cond_signal(cnd(c))); }
-int klb_pthread_cond_broadcast(void *c) { return px(pthread_cond_broadcast(cnd(c))); }
+int klb_pthread_cond_signal(void *c) {
+    cnd_entry *ce = cnd_entry_for(c);
+    atomic_fetch_add(&ce->signals, 1);
+    atomic_store(&ce->last_sig_ns, cnd_now_ns());
+    return px(pthread_cond_signal(cnd_host(ce)));
+}
+int klb_pthread_cond_broadcast(void *c) {
+    cnd_entry *ce = cnd_entry_for(c);
+    atomic_fetch_add(&ce->signals, 1);
+    atomic_store(&ce->last_sig_ns, cnd_now_ns());
+    return px(pthread_cond_broadcast(cnd_host(ce)));
+}
+// Validated one-record frame walk — see klepton.h. `my_frame` is the caller's
+// __builtin_frame_address(0) (== its x29). Our prologue stored the caller's own
+// frame record at [my_frame] = { caller's saved fp, caller's return address }, so
+// one hop up and +8 is the caller's caller's return address, i.e. what
+// __builtin_return_address(1) would compute — but bounded to this thread's stack
+// so a guest frame that left junk in x29 (batman: 0x18) yields NULL, not a fault.
+void *kl_caller_ra2(void *my_frame) {
+    uintptr_t fp = (uintptr_t)my_frame;
+    if (!fp || (fp & 7)) return NULL;
+    uintptr_t hi = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+    uintptr_t lo = hi - pthread_get_stacksize_np(pthread_self());
+    if (fp < lo || fp + 16 > hi) return NULL;          // [fp],[fp+8] must be in-stack
+    uintptr_t cfp = *(uintptr_t *)fp;                  // caller's saved fp (guest x29)
+    if (cfp <= fp || (cfp & 7) || cfp < lo || cfp + 16 > hi) return NULL;
+    return *(void **)(cfp + 8);                         // caller's caller return addr
+}
+
 int klb_pthread_cond_wait(void *c, void *m) {
     // A cond wait releases the mutex while sleeping; reflect that in the
     // owner table or every sleeper reads as a holder.
@@ -569,7 +791,12 @@ int klb_pthread_cond_wait(void *c, void *m) {
     cnd_sleep_enter(c, m, __builtin_return_address(0));
     cnd_entry *ce = cnd_entry_for(c);
     void *prev_mtx = atomic_exchange(&ce->last_mutex, (void *)mtx_host(e));
+    cnd_watchdog_start();
+    atomic_store(&ce->waiter_ra, __builtin_return_address(0));
+    atomic_store(&ce->waiter_ra2, kl_caller_ra2(__builtin_frame_address(0)));
+    atomic_fetch_add(&ce->waiters, 1);
     int raw = pthread_cond_wait(cnd_host(ce), mtx_host(e));
+    atomic_fetch_sub(&ce->waiters, 1);
     cnd_sleep_leave();
     cnd_wait_failed(raw, c, m, __builtin_return_address(0), prev_mtx);
     int r = px(raw);
@@ -648,13 +875,30 @@ int klb_pthread_cond_timedwait(void *c, void *m, const struct timespec *ts) {
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
     cnd_sleep_enter(c, m, __builtin_return_address(0));
-    int raw = pthread_cond_timedwait(cnd(c), mtx_host(e), ts);
+    cnd_entry *ce = cnd_entry_for(c);
+    cnd_watchdog_start();
+    atomic_store(&ce->waiter_ra, __builtin_return_address(0));
+    atomic_store(&ce->waiter_ra2, kl_caller_ra2(__builtin_frame_address(0)));
+    atomic_fetch_add(&ce->waiters, 1);
+    int raw = pthread_cond_timedwait(cnd_host(ce), mtx_host(e), ts);
+    atomic_fetch_sub(&ce->waiters, 1);
     cnd_sleep_leave();
     if (raw != ETIMEDOUT) cnd_wait_failed(raw, c, m, __builtin_return_address(0), NULL);
     int r = px(raw);
     atomic_store(&e->locksite, __builtin_return_address(0));
     atomic_store(&e->owner, (void *)pthread_self());
     return r;
+}
+// pthread_cond_clockwait(cond, mutex, clockid, abstime) — bionic's API-30 form
+// that names the clock the abstime is in (CLOCK_MONOTONIC or CLOCK_REALTIME)
+// instead of relying on the cond's configured clock. olar (UE5) calls it and it
+// was unresolved -> fatal. Delegate to klb_pthread_cond_timedwait: its abstime
+// rebase already keys off the magnitude (monotonic abstimes are small, realtime
+// ones ~1.7e9), which classifies both clocks correctly, so the clockid is
+// redundant here. Reuses all the timedwait handling (rebase, cap, owner table).
+int klb_pthread_cond_clockwait(void *c, void *m, int clk, const struct timespec *ts) {
+    (void)clk;
+    return klb_pthread_cond_timedwait(c, m, ts);
 }
 int klb_pthread_condattr_init(long *a)                 { *a = 0; return 0; }
 int klb_pthread_condattr_destroy(long *a)              { (void)a; return 0; }
@@ -703,23 +947,153 @@ int klb_pthread_getattr_np(pthread_t t, bionic_attr *a) {
 }
 
 // ---------- keys ----------
+//
+// Guest keys are OURS, not Darwin's, and the difference is the whole point.
+//
+// The obvious shim — one real pthread_key_create per guest key — spends a
+// scarce host resource on an unbounded guest demand, and Darwin's supply is
+// smaller than it looks: external keys are handed out from 258 up to 767, so a
+// bare process gets 510, and this one is not bare. SwiftUI, Metal, ANGLE and
+// MoltenVK all claim keys during dyld's initialisation of THEIR images, before
+// any guest code runs, and kl_x18 deliberately claims a high one for itself
+// (KLX_TSD_SLOT). Whatever is left is what a whole Android game engine gets.
+//
+// It is not enough. Asgard's Wrath 2 exhausted it during its first map load,
+// and the way that failure presents is the reason this table exists rather
+// than a bigger ceiling: a guest does not handle EAGAIN from pthread_key_create
+// in any useful way. UE4's FPhysScene_PhysX::InitPhysScene stores -1 for the
+// failed key and carries on, and FPhysXCPUDispatcher::submitTask then does
+//
+//     ldrsw x8, [x0, #0x84]     // x0 = pthread_getspecific(-1) == NULL
+//
+// on every nested PhysX task — SIGSEGV at 0x84, three minutes in, in guest code
+// a hundred thousand instructions away from the call that actually failed.
+// Returning EAGAIN is a correct answer that gets a process killed, so the fix
+// is to stop running out.
+//
+// The old mapping also LEAKED: the index came from a counter that only ever
+// went up, so key_delete returned the Darwin key to Darwin and kept the guest
+// index forever. A guest that cycles keys — and UE4 cycles one per physics
+// scene — walks the ceiling down on its own.
+//
+// So: one Darwin key holds a per-thread slot array, indices come from a free
+// list, and a delete makes every outstanding value stale at once by bumping the
+// key's sequence number (bionic's design, and for bionic's reason: POSIX says
+// values do not survive a delete, and a recycled index must not hand the next
+// owner the last one's pointer).
 #define KL_MAX_KEYS 512
-static pthread_key_t g_keys[KL_MAX_KEYS];
-static _Atomic int   g_nkeys = 0;
+#define KL_TSD_DTOR_ITERS 4          // POSIX PTHREAD_DESTRUCTOR_ITERATIONS
+
+typedef struct { uint32_t seq; void *val; } kl_tsd_slot;
+
+static pthread_key_t   g_tsd_key;               // the ONE Darwin key we spend
+static pthread_once_t  g_tsd_once = PTHREAD_ONCE_INIT;
+static _Atomic uint32_t g_key_seq[KL_MAX_KEYS]; // odd = live, even = free
+static void (*g_key_dtor[KL_MAX_KEYS])(void *);
+static _Atomic int     g_nkeys_hw;              // high-water, for the report
+static pthread_mutex_t g_key_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Run the guest's destructors for this thread, POSIX-style: repeat while a
+// destructor plants a new value, up to KL_TSD_DTOR_ITERS rounds. Darwin has
+// already cleared its own slot by the time this runs, so re-register the table
+// for the duration or a destructor's own getspecific answers NULL.
+static void tsd_thread_exit(void *p) {
+    kl_tsd_slot *s = p;
+    pthread_setspecific(g_tsd_key, s);
+    for (int round = 0; round < KL_TSD_DTOR_ITERS; round++) {
+        int more = 0;
+        for (int k = 0; k < KL_MAX_KEYS; k++) {
+            void *v = s[k].val;
+            if (!v || s[k].seq != atomic_load(&g_key_seq[k])) { s[k].val = NULL; continue; }
+            void (*d)(void *) = g_key_dtor[k];
+            s[k].val = NULL;
+            if (d) { d(v); more = 1; }
+        }
+        if (!more) break;
+    }
+    pthread_setspecific(g_tsd_key, NULL);
+    free(s);
+}
+static void tsd_init(void) { pthread_key_create(&g_tsd_key, tsd_thread_exit); }
+// No pthread_once here on purpose: every caller has already passed key_live(),
+// and a key cannot be live until klb_pthread_key_create has run the once. This
+// path is hot — UE4's binned allocator reads TLS on every malloc — so it is
+// worth not paying for a second barrier the caller has already crossed.
+static kl_tsd_slot *tsd_table(int make) {
+    kl_tsd_slot *s = pthread_getspecific(g_tsd_key);
+    if (!s && make) {
+        s = calloc(KL_MAX_KEYS, sizeof *s);
+        if (s) pthread_setspecific(g_tsd_key, s);
+    }
+    return s;
+}
+// A key is usable iff its sequence is odd; `seq` also tags the values, so a
+// stale value from before a delete never reads back through a recycled index.
+static inline int key_live(int k, uint32_t *seq) {
+    if (k < 0 || k >= KL_MAX_KEYS) return 0;
+    uint32_t s = atomic_load(&g_key_seq[k]);
+    if (!(s & 1)) return 0;
+    if (seq) *seq = s;
+    return 1;
+}
 int klb_pthread_key_create(int *out, void (*dtor)(void *)) {
-    int i = atomic_fetch_add(&g_nkeys, 1);
-    if (i >= KL_MAX_KEYS || pthread_key_create(&g_keys[i], dtor) != 0) return EAGAIN;
-    *out = i; return 0;
+    pthread_once(&g_tsd_once, tsd_init);
+    pthread_mutex_lock(&g_key_lock);
+    for (int k = 0; k < KL_MAX_KEYS; k++) {
+        if (atomic_load(&g_key_seq[k]) & 1) continue;
+        g_key_dtor[k] = dtor;
+        atomic_fetch_add(&g_key_seq[k], 1);          // even -> odd: live
+        int live = 0;
+        for (int j = 0; j < KL_MAX_KEYS; j++) live += (atomic_load(&g_key_seq[j]) & 1);
+        if (live > atomic_load(&g_nkeys_hw)) atomic_store(&g_nkeys_hw, live);
+        pthread_mutex_unlock(&g_key_lock);
+        *out = k;                                    // ...only ever on success
+        static int trace = -1;
+        if (trace < 0) trace = kl_env_on("KL_TRACE_TSD", 0);
+        if (trace)
+            fprintf(stderr, "  [tsd] key_create -> %d (dtor %p, %d live)\n",
+                    k, (void *)dtor, live);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_key_lock);
+    // Loud, because the guest will not be: EAGAIN here comes back as a NULL
+    // from getspecific hundreds of frames later, in guest code that never
+    // checked. See the header comment.
+    fprintf(stderr, "  [tsd] pthread_key_create EXHAUSTED at %d keys — the guest "
+                    "gets EAGAIN, and a guest that ignores it will fault on a "
+                    "NULL getspecific later\n", KL_MAX_KEYS);
+    return kl_errno_to_linux(EAGAIN);
 }
 int klb_pthread_key_delete(int k) {
-    if (k < 0 || k >= atomic_load(&g_nkeys)) return EINVAL;
-    return px(pthread_key_delete(g_keys[k]));
+    pthread_mutex_lock(&g_key_lock);
+    if (!key_live(k, NULL)) { pthread_mutex_unlock(&g_key_lock); return kl_errno_to_linux(EINVAL); }
+    g_key_dtor[k] = NULL;
+    atomic_fetch_add(&g_key_seq[k], 1);              // odd -> even: free, and
+    pthread_mutex_unlock(&g_key_lock);               // every value now stale
+    return 0;
 }
 void *klb_pthread_getspecific(int k) {
-    return (k >= 0 && k < atomic_load(&g_nkeys)) ? pthread_getspecific(g_keys[k]) : NULL;
+    uint32_t seq;
+    if (!key_live(k, &seq)) return NULL;
+    kl_tsd_slot *s = tsd_table(0);
+    return (s && s[k].seq == seq) ? s[k].val : NULL;
 }
 int klb_pthread_setspecific(int k, const void *v) {
-    return (k >= 0 && k < atomic_load(&g_nkeys)) ? pthread_setspecific(g_keys[k], v) : EINVAL;
+    uint32_t seq;
+    if (!key_live(k, &seq)) return kl_errno_to_linux(EINVAL);
+    kl_tsd_slot *s = tsd_table(1);
+    if (!s) return kl_errno_to_linux(ENOMEM);
+    s[k].seq = seq; s[k].val = (void *)v;
+    return 0;
+}
+// How close the guest came to the ceiling — printed by kl_pthread_report,
+// because "how many keys does this guest want" is a number nobody has, and it
+// is the one that decides whether KL_MAX_KEYS is enough.
+static void kl_tsd_report(FILE *out) {
+    int live = 0;
+    for (int k = 0; k < KL_MAX_KEYS; k++) live += (atomic_load(&g_key_seq[k]) & 1);
+    fprintf(out, "-- guest TSD: %d keys live, %d at high water, ceiling %d --\n",
+            live, atomic_load(&g_nkeys_hw), KL_MAX_KEYS);
 }
 int klb_pthread_once(int *ctl, void (*fn)(void)) {
     if (atomic_load((_Atomic int *)ctl) == 2) return 0;
@@ -740,12 +1114,18 @@ int klb_pthread_once(int *ctl, void (*fn)(void)) {
 #define KL_MAX_THREADS_LIVE 256
 static _Atomic(void *) g_live_threads[KL_MAX_THREADS_LIVE];
 static char            g_live_names[KL_MAX_THREADS_LIVE][24];
+// Parallel to g_live_threads: the mach thread id (pthread_threadid_np) of each
+// live guest thread, so a thread named by tid (XR_KHR_android_thread_settings)
+// can be found and its QoS raised. Same index as g_live_threads.
+static _Atomic(uint64_t) g_live_tids[KL_MAX_THREADS_LIVE];
 static void thread_register(void *self) {
     for (int i = 0; i < KL_MAX_THREADS_LIVE; i++) {
         void *expect = NULL;
         if (atomic_compare_exchange_strong(&g_live_threads[i], &expect, self)) {
             pthread_getname_np(pthread_self(), g_live_names[i],
                                sizeof g_live_names[i]);
+            uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+            atomic_store(&g_live_tids[i], tid);
             return;
         }
     }
@@ -753,8 +1133,10 @@ static void thread_register(void *self) {
 static void thread_unregister(void *self) {
     for (int i = 0; i < KL_MAX_THREADS_LIVE; i++) {
         void *expect = self;
-        if (atomic_compare_exchange_strong(&g_live_threads[i], &expect, NULL))
+        if (atomic_compare_exchange_strong(&g_live_threads[i], &expect, NULL)) {
+            atomic_store(&g_live_tids[i], 0);
             return;
+        }
     }
 }
 static const char *thread_name_of(void *self) {
@@ -767,17 +1149,135 @@ static int thread_is_alive(void *self) {
         if (atomic_load(&g_live_threads[i]) == self) return 1;
     return 0;
 }
+// XR_KHR_android_thread_settings: the guest names a thread (its renderer- or
+// app-main) as scheduling-critical. On visionOS a default-QoS guest thread is
+// scheduled BEHIND the compositor, and for a streaming guest like Steam Link
+// that thread set carries the UDP-receive / AV-decode / submit pipeline — a gap
+// there reads to the sender as network jitter and the bitrate controller backs
+// off. ALVR's visionOS client pins exactly these threads to userInteractive;
+// this does the same, only for the threads the guest explicitly flags, so the
+// compositor is not starved by boosting everything (that is KL_GUEST_QOS's blunt
+// job).
+//
+// Darwin CAN raise another thread's QoS, the old "would be to lie" note in
+// kl_openxr.c notwithstanding: a thread flagging ITSELF (the common case) takes
+// the self door; a thread flagging another takes
+// pthread_override_qos_class_start_np through the live-thread registry above.
+// The override handle is intentionally not kept — the boost is meant to last the
+// thread's life — and a given thread is boosted at most once so overrides do not
+// stack.
+void kl_pthread_boost_qos(uint64_t threadid) {
+#ifdef __APPLE__
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_XR_THREAD_QOS", 1);
+    if (!on) return;
+
+    uint64_t self_tid = 0; pthread_threadid_np(NULL, &self_tid);
+    if (threadid == self_tid) {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        fprintf(stderr, "  [thr] raised self (tid %llu) to USER_INTERACTIVE QoS "
+                        "for a guest-flagged critical thread\n",
+                (unsigned long long)threadid);
+        return;
+    }
+
+    // Dedup: override a given thread at most once.
+    static _Atomic(uint64_t) boosted[32];
+    for (int i = 0; i < 32; i++) if (atomic_load(&boosted[i]) == threadid) return;
+
+    for (int i = 0; i < KL_MAX_THREADS_LIVE; i++) {
+        if (atomic_load(&g_live_tids[i]) != threadid) continue;
+        void *pt = atomic_load(&g_live_threads[i]);
+        if (!pt) return;
+        pthread_override_t ov = pthread_override_qos_class_start_np(
+                                    (pthread_t)pt, QOS_CLASS_USER_INTERACTIVE, 0);
+        if (ov) {
+            for (int k = 0; k < 32; k++) {
+                uint64_t e = 0;
+                if (atomic_compare_exchange_strong(&boosted[k], &e, threadid)) break;
+            }
+            fprintf(stderr, "  [thr] raised tid %llu to USER_INTERACTIVE QoS "
+                            "(cross-thread override) for a guest-flagged thread\n",
+                    (unsigned long long)threadid);
+        }
+        return;
+    }
+    // Not created through our trampoline (e.g. the process main thread) — the
+    // self door already covers the common case, so this is only a note.
+    fprintf(stderr, "  [thr] guest flagged tid %llu, not in the live registry "
+                    "(main thread?) — QoS left as is\n",
+            (unsigned long long)threadid);
+#else
+    (void)threadid;
+#endif
+}
+
 typedef struct { void *(*fn)(void *); void *arg; } tramp;
 static void *thread_tramp(void *p) {
     tramp t = *(tramp *)p; free(p);
     kl_thread_init();
+    // KL_GUEST_QOS=1: every guest thread at USER_INITIATED instead of default.
+    // On visionOS a default-QoS thread is scheduled behind the compositor's
+    // work, and for Steam Link that thread set includes the UDP receive and
+    // AV-decode pipeline - a scheduling gap there queues packets, Steam reads
+    // the queueing as network jitter, and the bitrate controller backs off. A
+    // stream that stutters on a clean link is often this, not the link.
+    // Default OFF: it changes scheduling for every guest, so it is opt-in.
+#ifdef __APPLE__
+    {
+        static int q = -1;
+        if (q < 0) {
+            q = kl_env_on("KL_GUEST_QOS", 0);
+            // Named ONCE either way: this knob's whole use is as an A/B, and a
+            // scheduling change leaves no other trace in a log — the first QoS
+            // run came back unverifiable because nothing said whether the knob
+            // was in force.
+            fprintf(stderr, "  [thr] guest threads at %s QoS (KL_GUEST_QOS=%d)\n",
+                    q ? "USER_INITIATED" : "default", q);
+        }
+        if (q) pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    }
+#endif
     thread_register(pthread_self());
+    // KL_TRACE_THREADS: log this guest thread's tid ON the thread (klb_pthread_create
+    // logs the entry pointer at creation but cannot know the tid yet). The x18
+    // veneer keeps the guest x18 in tsd[KLX_TSD_SLOT] read by a RAW thread-pointer
+    // offset; that slot is inline on some threads and in Darwin's extended TSD on
+    // others, and a raw read of an extended slot faults. Tying a fault's tid back
+    // to the entry pointer here names which pool the broken thread came from, and
+    // the raw-vs-API check says whether this thread is one the veneer can serve.
+    {
+        static int trace = -1;
+        if (trace < 0) trace = kl_env_on("KL_TRACE_THREADS", 0);
+        if (trace) {
+            uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+            pthread_setspecific(KLX_TSD_SLOT, (void *)(uintptr_t)0xC0DEC0DEU);
+            uint64_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+            void *api = pthread_getspecific(KLX_TSD_SLOT);
+            fprintf(stderr, "  [thr] guest tramp tid=%llu entry=%p tp=%p "
+                            "tsd[%d] api=%p (raw-offset check deferred to fault)\n",
+                    (unsigned long long)tid, (void *)t.fn, (void *)tp,
+                    (int)KLX_TSD_SLOT, api);
+            pthread_setspecific(KLX_TSD_SLOT, NULL);
+        }
+    }
     void *r = t.fn(t.arg);
     thread_unregister(pthread_self());
     return r;
 }
 int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
                        void *(*fn)(void *), void *arg) {
+    // A NULL start routine becomes a jump to 0x0 the instant the thread runs,
+    // which visionOS's AMFI kills as a CODESIGNING "invalid page" (an uncatchable
+    // SIGKILL) rather than a signal the fault handler could recover. Refuse it
+    // here — with the entry logged — so a guest that resolved its thread routine
+    // to NULL fails a create call it can check instead of taking the process down.
+    if (!fn) {
+        fprintf(stderr, "  [thr] REFUSED pthread_create with a NULL start routine "
+                        "(arg=%p) — this would jump to 0x0 and AMFI would SIGKILL "
+                        "the process; returning EINVAL instead\n", arg);
+        return 22;   // EINVAL
+    }
     pthread_attr_t da;
     pthread_attr_init(&da);
     if (ga) {
@@ -966,7 +1466,9 @@ int klb_sem_post(int *s) {
 int klb_sem_wait(int *s) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
+    sem_wait_enter(s, __builtin_return_address(0));
     dispatch_semaphore_wait(k->d, DISPATCH_TIME_FOREVER);
+    sem_wait_leave();
     atomic_fetch_sub(&k->count, 1);
     return 0;
 }

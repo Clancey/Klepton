@@ -18,9 +18,11 @@
 #include <time.h>
 #include <unistd.h>
 #include "kl_ndk.h"
+#include "kl_obbmap.h"
 // For kl_jni_locale_parts — AConfiguration and java.util.Locale are two doors
 // onto one fact and must not answer differently.
 #include "kl_jni.h"
+#include "kl_openxr.h"   // the XR surface-swapchain seam, for ANativeWindow_fromSurface
 
 // ================================================================== ALooper
 enum {
@@ -289,7 +291,25 @@ static int32_t kl_ANativeWindow_getHeight(kl_native_window *w) { return w ? w->h
 static int32_t kl_ANativeWindow_getFormat(kl_native_window *w) { return w ? w->format : 0; }
 
 static void *kl_ANativeWindow_fromSurface(void *env, void *surface) {
-    (void)env; (void)surface;
+    (void)env;
+    // XR_KHR_android_surface_swapchain: a Surface handed back by
+    // xrCreateSwapchainAndroidSurfaceKHR is NOT the activity's window — it is the
+    // producer end of a specific XR swapchain (a guest's game screen). Resolving
+    // it to g_window would send the guest's GL rendering to the main window
+    // instead of the swapchain, which is exactly why nothing reached the display.
+    // Give it its own ANativeWindow, sized to the swapchain and carrying the
+    // Surface as its owner so kl_egl can find the swapchain from the window.
+    if (surface) {
+        void *sc = kl_xr_swapchain_for_surface(surface);
+        if (sc) {
+            int32_t w = 0, h = 0;
+            kl_xr_android_surface_size(sc, &w, &h);
+            void *win = kl_ndk_window_new(w, h, 1 /*RGBA_8888*/, surface);
+            fprintf(stderr, "  [ndk] ANativeWindow_fromSurface(%p) -> XR game "
+                            "surface window %p (%dx%d)\n", surface, win, w, h);
+            return win;
+        }
+    }
     kl_ANativeWindow_acquire(&g_window);
     return &g_window;
 }
@@ -363,6 +383,7 @@ static void *kl_AAssetManager_open(void *mgr, const char *fname, int mode) {
     char path[1200];
     snprintf(path, sizeof path, "%s/%s", g_asset_root, fname);
     FILE *f = fopen(path, "rb");
+    if (!f) f = kl_obbmap_fopen(path, "rb");   // audio banks live only in the OBB
     if (!f) return NULL;
     kl_asset *a = calloc(1, sizeof *a);
     if (!a) { fclose(f); return NULL; }

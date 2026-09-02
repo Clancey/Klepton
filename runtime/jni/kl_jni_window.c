@@ -348,6 +348,21 @@ static klj_val klj_AudioManager_isBluetoothA2dpOn(void *env, void *self,
     return (klj_val){.j = 0};
 }
 
+// The other two of the game's once-a-second audio-route poll. Both answered
+// the way a headset with no Bluetooth route answers: no SCO link, and
+// isMusicActive false - the poll is asking about OTHER apps' playback, which
+// does not exist here.
+static klj_val klj_AudioManager_isBluetoothScoOn(void *env, void *self,
+                                                 const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_AudioManager_isMusicActive(void *env, void *self,
+                                              const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
 // ---------------------------------------------------------- window insets
 //
 // Unity 2018.4 asks the decor view for its insets to compute a safe area; the
@@ -451,6 +466,23 @@ static klj_val klj_Context_unbindService(void *env, void *self, const klj_val *a
     return (klj_val){.l = NULL};
 }
 
+// Google VR sample PermissionHelper (Into the Radius): checkPermission(name)Z
+// and acquirePermissions([name])V. Answered from the same manifest permission
+// model as Context.checkPermission — a boolean here, granted only for what the
+// manifest declares — and acquiring is a no-op (there is no user to prompt).
+static klj_val klj_PermissionHelper_check(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
+    int granted = klj_permission_state(p, &why);
+    KLJ_LOG("PermissionHelper.checkPermission(\"%s\") -> %s%s", p,
+            granted ? "true" : "false", why);
+    return (klj_val){.j = (uint64_t)(granted != 0)};
+}
+static klj_val klj_PermissionHelper_acquire(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("PermissionHelper.acquirePermissions(...) — no user to prompt; no-op");
+    return (klj_val){.l = NULL};
+}
 static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     // Answered from the SAME manifest model as checkSelfPermission below. It
@@ -790,6 +822,8 @@ const klj_binding klj_bind_window[] = {
     {"com/unity3d/player/UnityPlayer", "getLaunchURL", "()Ljava/lang/String;", klj_UnityPlayer_getLaunchURL},
     {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
     {"android/media/AudioManager", "isBluetoothA2dpOn", "()Z", klj_AudioManager_isBluetoothA2dpOn},
+    {"android/media/AudioManager", "isBluetoothScoOn", "()Z", klj_AudioManager_isBluetoothScoOn},
+    {"android/media/AudioManager", "isMusicActive", "()Z", klj_AudioManager_isMusicActive},
     // Unity 2018.4 reads the device's audio configuration off the hidden
     // AudioSystem class instead of AudioManager.getProperty(). Same numbers.
     {"android/media/AudioSystem", "getPrimaryOutputSamplingRate", "()I", klj_AudioSystem_getPrimaryOutputSamplingRate},
@@ -801,6 +835,10 @@ const klj_binding klj_bind_window[] = {
     {"android/view/WindowInsets", "getDisplayCutout", "()Landroid/view/DisplayCutout;", klj_WindowInsets_getDisplayCutout},
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
     {"android/content/Context", "checkCallingOrSelfPermission", "(Ljava/lang/String;)I", klj_Context_checkPermission},
+    {"com/google/vr/sdk/samples/permission/PermissionHelper", "checkPermission",
+     "(Ljava/lang/String;)Z", klj_PermissionHelper_check},
+    {"com/google/vr/sdk/samples/permission/PermissionHelper", "acquirePermissions",
+     "([Ljava/lang/String;)V", klj_PermissionHelper_acquire},
     {"android/content/Context", "bindService", "(Landroid/content/Intent;Landroid/content/ServiceConnection;I)Z", klj_Context_bindService},
     {"android/content/Context", "unbindService", "(Landroid/content/ServiceConnection;)V", klj_Context_unbindService},
     {0}

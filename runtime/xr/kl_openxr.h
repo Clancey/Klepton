@@ -40,11 +40,24 @@
 #ifndef KL_OPENXR_H
 #define KL_OPENXR_H
 #include <stdio.h>
+#include <stdint.h>
 
 // Resolve an xr* import. NULL if the name is not one we know, so the
 // unresolved-import report still works — see the note in kl_shim_lookup about
 // a gateway that can never say no.
 void *kl_openxr_lookup(const char *name);
+
+// XR_KHR_android_surface_swapchain seam, reached from kl_ndk and kl_egl:
+//   - kl_xr_swapchain_for_surface: which surface-backed swapchain a
+//     android/view/Surface jobject belongs to (NULL if none). kl_ndk uses it in
+//     ANativeWindow_fromSurface; kl_egl in eglCreateWindowSurface.
+//   - kl_xr_android_surface_size: that swapchain's pixel size.
+//   - kl_xr_android_surface_present: copy the guest's finished default
+//     framebuffer into the swapchain's next image and name it released, so the
+//     xrEndFrame quad path composites it. kl_egl calls this from eglSwapBuffers.
+void *kl_xr_swapchain_for_surface(void *surface);
+void  kl_xr_android_surface_size(void *swapchain, int32_t *w, int32_t *h);
+int   kl_xr_android_surface_present(void *swapchain);
 
 // The DLOPEN door, for a guest that opens the loader rather than importing from
 // it. libUnityOpenXR.so does exactly that, and unlike the other synthetic

@@ -120,6 +120,10 @@ void kl_target_apply_host(const kl_target *t, const char *libdir_override) {
     // synthesize() note above. KL_FILES_DIR still overrides it outright, which
     // is how a run gets a scratch profile.
     kl_jni_set_files_dir(kl_userdata_dir(t->userdata));
+    // ...and the OBB layout, so kl_jni_obb_dir does not re-resolve it from the
+    // environment. Harmless on host (KL_TARGET is usually set there) but the
+    // one source of truth is this target, not the shell.
+    kl_jni_set_obb_rel(t->obb);
     // The raw "<apk>/assets/..." path map is derived from the assets
     // directory inside kl_jni's init, so nothing to do here.
 }

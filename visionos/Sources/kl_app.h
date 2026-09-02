@@ -120,7 +120,16 @@ int  kl_app_guest_state(void);
 // than read from the environment, because an app launched by hand from the Home
 // View has no environment. KL_TARGET overrides it.
 const char *kl_app_target_name(void);
+// The target name even BEFORE kl_app_configure runs (g_target is nil until then):
+// the build's compile-time default, honouring a KL_TARGET override. Lets the
+// launcher UI identify itself on the first render, not only after a boot.
+const char *kl_app_target_name_or_default(void);
 int         kl_app_target_is_steamlink(void);
+// Whether this target should open the immersive space FULLY immersive by default
+// (no passthrough) rather than .mixed. True for the native OpenXR VR kind
+// (GTA Vice City), which is an in-world game meant to fill the view — .mixed
+// leaves it a window in passthrough. KL_FULL in the environment overrides.
+int         kl_app_target_wants_full(void);
 
 // ...and the question the COMPOSITOR is really asking, which is not the same
 // one. Three of the four doors here hand the frame loop to the guest: Steam
@@ -153,6 +162,10 @@ int         kl_app_target_owns_frame_loop(void);
 // the same path a hand-carried one takes), so nothing has to pass it along.
 int         kl_app_vrlink_pending(void);
 const char *kl_app_vrlink_sargs(void);
+
+// Absolute path of the staged asset tree (<container>/<tree>/assets), valid
+// after kl_app_configure. The compositor reads the loading videos from here.
+const char *kl_app_assets_dir(void);
 
 // Absolute path of the log kl_app_boot writes, valid after kl_app_configure.
 // The Swift side displays it and offers it for export.

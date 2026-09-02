@@ -314,6 +314,24 @@ static int klvt_rebuild(kl_vtdec *d) {
     }
 
     d->n_sess_created++;
+
+    // Real-time decode. This is a LIVE stream (Steam Link / Moonlight), so tell
+    // VideoToolbox to decode each frame on time rather than batch for throughput
+    // or power efficiency. Without it the decoder periodically falls behind and
+    // the guest fails to acquire a frame in time — the "[SVLDecoder] Failed to
+    // acquire latest image" stutter, correlated with audio jitter-buffer fades.
+    // ALVR's visionOS client sets the same flag. On by default; KL_VTDEC_REALTIME=0
+    // restores the default (throughput) mode for A/B.
+    {
+        const char *rt = getenv("KL_VTDEC_REALTIME");
+        if (!rt || strcmp(rt, "0") != 0) {
+            OSStatus rst = VTSessionSetProperty(d->sess,
+                               kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
+            fprintf(stderr, "  [vtdec] real-time decode: %s (OSStatus %d)\n",
+                    rst == noErr ? "on" : "requested but refused", (int)rst);
+        }
+    }
+
     fprintf(stderr, "  [vtdec] %s decoder ready: %dx%d -> %s%s\n",
             d->codec == KLVT_HEVC ? "HEVC" : "H.264", dim.width, dim.height,
             d->bgra ? "BGRA" : "native format (none requested)",

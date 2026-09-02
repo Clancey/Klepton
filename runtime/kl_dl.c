@@ -10,6 +10,8 @@
 #include "kl_fault.h"
 #include <wchar.h>
 #include "kl_egl.h"
+#include "guest/kl_driver.h"
+#include "kl_jni.h"
 #include "kl_opensl.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
@@ -84,13 +86,23 @@ int kl_dl_iterate_phdr(int (*cb)(void *, size_t, void *), void *data) {
 
 // Register an image so guest dlsym/dladdr can see it (also used for the root libs).
 void kl_register_image(const char *soname, kl_image *img) {
+    const char *base = basename_of(soname);
     pthread_mutex_lock(&g_lock);
     if (g_nimgs < KL_MAX_IMAGES) {
-        snprintf(g_imgs[g_nimgs].soname, sizeof g_imgs[0].soname, "%s", basename_of(soname));
+        snprintf(g_imgs[g_nimgs].soname, sizeof g_imgs[0].soname, "%s", base);
         g_imgs[g_nimgs].img = img;
         g_nimgs++;
     }
     pthread_mutex_unlock(&g_lock);
+    // libgl4es IS the guest's GL whenever it is present — it is a GL 1.x-over-GLES
+    // translator that only works if it sees the WHOLE gl* stream (kl_shim.c Tier
+    // 4b). JKXR set this from its own loader; targets that pull gl4es in as a plain
+    // DT_NEEDED (hl1's GLES3JNI engine, whose menu is immediate-mode glBegin/
+    // glVertex2f/glOrtho) never did, so those calls fell through to ANGLE's
+    // abort-stub and the menu drew nothing. Detecting the ONE unambiguous name
+    // here — not searching for any GL library, which klepton.h warns breaks Steam
+    // Link/VRChat/RE4 — routes them to gl4es for every driver.
+    if (!strcmp(base, "libgl4es.so")) kl_shim_set_guest_gl(img);
 }
 
 kl_image *kl_find_image(const char *soname) {
@@ -104,12 +116,189 @@ kl_image *kl_find_image(const char *soname) {
 // binding (kl_image.c) for symbols the shim does not serve. Registration order
 // is dependencies-first, so the first hit is what Android's linker would have
 // bound (nearest dependency wins).
+// KL_TRACE_FMOD=1: interpose FMOD Studio's bank-load and event-start calls to
+// answer the one question a silent FMOD guest (vampire) poses — do the banks
+// LOAD and do events START? FMOD runs as real translated code and binds these
+// against libfmodstudio at relocation time, so the only seam is here, as the
+// import is resolved. Off by default (an indirection on every FMOD call is not
+// something a normal run should carry); when on, each is logged a few times and
+// forwarded to the real function, which is stored per-name at bind time.
+static int kl_fmod_trace_default(void);   // defined below
+
+static int (*g_fmod_loadBankMemory)(void *, const char *, int, int, uint32_t, void **);
+static int (*g_fmod_loadBankFile)(void *, const char *, uint32_t, void **);
+static int (*g_fmod_evtStart)(void *);
+static int (*g_fmod_createInstance)(void *, void **);
+static int (*g_fmod_studioCreate)(void **, uint32_t);
+static int (*g_fmod_studioInit)(void *, int, uint32_t, uint32_t, void *);
+static int (*g_fmod_setOutput)(void *, int);
+static int (*g_fmod_mixerSuspend)(void *);
+static int (*g_fmod_mixerResume)(void *);
+static int (*g_fmod_busSetMute)(void *, int);
+static int (*g_fmod_busSetVolume)(void *, float);
+
+// Trace decision, taken at CALL time (not install time). The wrappers are now
+// installed unconditionally the moment the FMOD symbol resolves — that is the
+// only chance to catch it, and it happens during libUE4's relocation which can
+// precede kl_driver_init() setting the target. By call time the target is always
+// set, so the per-target default (vampire) resolves correctly here.
+static int klf_trace(void) {
+    static int on = -1;
+    if (on < 0) {   // do NOT latch to the default before the target is known
+        if (getenv("KL_TRACE_FMOD")) on = kl_env_on("KL_TRACE_FMOD", 0);
+        else if (kl_driver_target_name()) on = kl_fmod_trace_default();
+    }
+    return on > 0;
+}
+static int klf_loadBankMemory(void *self, const char *buf, int len, int mode,
+                              uint32_t flags, void **bank) {
+    int r = g_fmod_loadBankMemory ? g_fmod_loadBankMemory(self, buf, len, mode, flags, bank) : -1;
+    static int said; if (klf_trace() && said < 32) { said++;
+        fprintf(stderr, "  [fmod] loadBankMemory(len=%d) -> result %d, bank %p\n",
+                len, r, bank ? *bank : NULL); }
+    return r;
+}
+static int klf_loadBankFile(void *self, const char *fn, uint32_t flags, void **bank) {
+    int r = g_fmod_loadBankFile ? g_fmod_loadBankFile(self, fn, flags, bank) : -1;
+    static int said; if (klf_trace() && said < 32) { said++;
+        fprintf(stderr, "  [fmod] loadBankFile(\"%s\") -> result %d, bank %p\n",
+                fn ? fn : "(null)", r, bank ? *bank : NULL); }
+    return r;
+}
+static int klf_evtStart(void *self) {
+    int r = g_fmod_evtStart ? g_fmod_evtStart(self) : -1;
+    static unsigned n; if (klf_trace() && n < 32) { n++;
+        fprintf(stderr, "  [fmod] EventInstance::start() -> result %d (event #%u)\n", r, n); }
+    return r;
+}
+static int klf_createInstance(void *self, void **inst) {
+    int r = g_fmod_createInstance ? g_fmod_createInstance(self, inst) : -1;
+    static unsigned n; if (klf_trace() && n < 16) { n++;
+        fprintf(stderr, "  [fmod] EventDescription::createInstance() -> result %d\n", r); }
+    return r;
+}
+// Studio::System lifecycle — to see whether the plugin even brings the Studio
+// system up (banks/events live under it). If create/initialize appear but no
+// loadBankFile does, the plugin inits FMOD then declines to load banks (the game
+// side is inert); if they never appear, the FMOD plugin itself never started.
+static int klf_studioCreate(void **sys, uint32_t hdr) {
+    int r = g_fmod_studioCreate ? g_fmod_studioCreate(sys, hdr) : -1;
+    static int said; if (klf_trace() && !said) { said = 1;
+        fprintf(stderr, "  [fmod] Studio::System::create() -> result %d, sys %p\n",
+                r, sys ? *sys : NULL); }
+    return r;
+}
+static int klf_studioInit(void *self, int max, uint32_t sflags, uint32_t cflags, void *ed) {
+    int r = g_fmod_studioInit ? g_fmod_studioInit(self, max, sflags, cflags, ed) : -1;
+    static int said; if (klf_trace() && !said) { said = 1;
+        fprintf(stderr, "  [fmod] Studio::System::initialize(max=%d, sflags=0x%x, "
+                "cflags=0x%x) -> result %d\n", max, sflags, cflags, r); }
+    return r;
+}
+// Audio-control traces: is the game muting/suspending the mix, or picking a
+// silent output driver? "Banks load + events start but the mix is all-zero"
+// points here. setOutput's arg is FMOD_OUTPUTTYPE (2=NOSOUND, and the Android
+// output types above it); mixerSuspend with no resume = a deliberately silenced
+// mixer; Bus::setMute(true)/setVolume(0) on the master = a muted master bus.
+static int klf_setOutput(void *self, int type) {
+    int r = g_fmod_setOutput ? g_fmod_setOutput(self, type) : -1;
+    if (klf_trace()) fprintf(stderr, "  [fmod] System::setOutput(type=%d) -> result %d\n", type, r);
+    return r;
+}
+static int klf_mixerSuspend(void *self) {
+    int r = g_fmod_mixerSuspend ? g_fmod_mixerSuspend(self) : -1;
+    if (klf_trace()) fprintf(stderr, "  [fmod] System::mixerSuspend() -> result %d\n", r);
+    return r;
+}
+static int klf_mixerResume(void *self) {
+    int r = g_fmod_mixerResume ? g_fmod_mixerResume(self) : -1;
+    if (klf_trace()) fprintf(stderr, "  [fmod] System::mixerResume() -> result %d\n", r);
+    return r;
+}
+static int klf_busSetMute(void *self, int mute) {
+    int r = g_fmod_busSetMute ? g_fmod_busSetMute(self, mute) : -1;
+    if (klf_trace()) fprintf(stderr, "  [fmod] Bus::setMute(%d) -> result %d\n", mute, r);
+    return r;
+}
+static int klf_busSetVolume(void *self, float v) {
+    int r = g_fmod_busSetVolume ? g_fmod_busSetVolume(self, v) : -1;
+    if (klf_trace()) fprintf(stderr, "  [fmod] Bus::setVolume(%.3f) -> result %d\n", (double)v, r);
+    return r;
+}
+// Default the FMOD trace ON for titles whose audio is a confirmed FMOD-internal
+// silence — vampire mixes 1700+ all-zero buffers though the whole OpenSL ->
+// CoreAudio path is proven working (40 s played, 0 underruns), so the one thing
+// left to see is whether its banks LOAD and its events START, which only this
+// interposition can answer. On device the user cannot set env, so it has to be
+// the default there; KL_TRACE_FMOD still overrides in either direction.
+static int kl_fmod_trace_default(void) {
+    static const char *on[] = { "vampire" };
+    const char *t = kl_driver_target_name();
+    if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
+        if (strcmp(t, on[i]) == 0) return 1;
+    return 0;
+}
+
+static void *kl_fmod_interpose(const char *name, void *real) {
+    // Install UNCONDITIONALLY when an FMOD symbol resolves — this is the only
+    // moment we can substitute the address, and it happens during libUE4's
+    // relocation, which can precede kl_driver_init() setting the target (that
+    // timing is why the earlier on-gated versions never armed for vampire). The
+    // wrappers merely forward and only LOG when klf_trace() says so, checked at
+    // call time when the target is certainly set — so installing for every FMOD
+    // title is harmless (an unmeasurable indirection on bank-load/event-start,
+    // never a per-sample path). The one-time install line proves the seam caught
+    // FMOD at all, independent of whether the game ever calls the function.
+    if (!real) return NULL;
+    void *wrap = NULL;
+    if (!strcmp(name, "_ZN4FMOD6Studio6System14loadBankMemoryEPKci28FMOD_STUDIO_LOAD_MEMORY_MODEjPPNS0_4BankE")) {
+        g_fmod_loadBankMemory = (int (*)(void *, const char *, int, int, uint32_t, void **))real;
+        wrap = (void *)klf_loadBankMemory; }
+    else if (!strcmp(name, "_ZN4FMOD6Studio6System12loadBankFileEPKcjPPNS0_4BankE")) {
+        g_fmod_loadBankFile = (int (*)(void *, const char *, uint32_t, void **))real;
+        wrap = (void *)klf_loadBankFile; }
+    else if (!strcmp(name, "_ZN4FMOD6Studio13EventInstance5startEv")) {
+        g_fmod_evtStart = (int (*)(void *))real;
+        wrap = (void *)klf_evtStart; }
+    else if (!strcmp(name, "_ZNK4FMOD6Studio16EventDescription14createInstanceEPPNS0_13EventInstanceE")) {
+        g_fmod_createInstance = (int (*)(void *, void **))real;
+        wrap = (void *)klf_createInstance; }
+    else if (!strcmp(name, "_ZN4FMOD6Studio6System6createEPPS1_j")) {
+        g_fmod_studioCreate = (int (*)(void **, uint32_t))real;
+        wrap = (void *)klf_studioCreate; }
+    else if (!strcmp(name, "_ZN4FMOD6Studio6System10initializeEijjPv")) {
+        g_fmod_studioInit = (int (*)(void *, int, uint32_t, uint32_t, void *))real;
+        wrap = (void *)klf_studioInit; }
+    else if (!strcmp(name, "_ZN4FMOD6System9setOutputE15FMOD_OUTPUTTYPE")) {
+        g_fmod_setOutput = (int (*)(void *, int))real;
+        wrap = (void *)klf_setOutput; }
+    else if (!strcmp(name, "_ZN4FMOD6System12mixerSuspendEv")) {
+        g_fmod_mixerSuspend = (int (*)(void *))real;
+        wrap = (void *)klf_mixerSuspend; }
+    else if (!strcmp(name, "_ZN4FMOD6System11mixerResumeEv")) {
+        g_fmod_mixerResume = (int (*)(void *))real;
+        wrap = (void *)klf_mixerResume; }
+    else if (!strcmp(name, "_ZN4FMOD6Studio3Bus7setMuteEb")) {
+        g_fmod_busSetMute = (int (*)(void *, int))real;
+        wrap = (void *)klf_busSetMute; }
+    else if (!strcmp(name, "_ZN4FMOD6Studio3Bus9setVolumeEf")) {
+        g_fmod_busSetVolume = (int (*)(void *, float))real;
+        wrap = (void *)klf_busSetVolume; }
+    if (wrap)
+        // Unconditional (once per symbol): a run always shows the seam fired even
+        // if the game never calls the function — which, for a silent FMOD title
+        // that loads no banks, is itself the answer.
+        fprintf(stderr, "  [fmod] interpose installed for %s\n", name);
+    return wrap;
+}
+
 void *kl_guest_sym_global(const char *name) {
     void *v = NULL;
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nimgs && !v; i++)
         v = kl_sym(g_imgs[i].img, name);
     pthread_mutex_unlock(&g_lock);
+    if (v) { void *w = kl_fmod_interpose(name, v); if (w) return w; }
     return v;
 }
 
@@ -117,17 +306,106 @@ void *kl_guest_sym_global(const char *name) {
 // image's relocation-time imports can bind against the images it needs
 // (kl_guest_sym_global). Names with no file in the library path are assumed
 // shim-served (libc/libm/libdl/liblog/... or a synthetic gateway) and skipped.
+// Names Klepton serves from its own shims rather than from a bundled file, so
+// a missing file for one of these is expected, not a packaging error.
+static int kl_dep_is_shim_served(const char *name) {
+    static const char *shim[] = {
+        "libc.so", "libm.so", "libdl.so", "liblog.so", "libstdc++.so",
+        "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so", "libEGL.so",
+        "libandroid.so", "libOpenSLES.so", "libaaudio.so", "libvulkan.so",
+        "libz.so", "libjnigraphics.so", "libnativewindow.so", "libmediandk.so",
+        "libamidi.so", "libcamera2ndk.so", "libnativehelper.so",
+        // Served synthetically by Klepton's own shims / replaced outright, so
+        // there is deliberately no file for them and their symbols bind through
+        // kl_guest_sym_global — not a packaging gap.
+        "libOVRPlugin.so", "libovrplatformloader.so", "libvrapi.so",
+        "libopenxr_loader.so", "libOpenMAXAL.so",
+    };
+    for (unsigned i = 0; i < sizeof shim / sizeof shim[0]; i++)
+        if (!strcmp(name, shim[i])) return 1;
+    return 0;
+}
+
+// FMOD's Android platform layer (the AudioTrack/AudioManager output, and the
+// JavaVM it needs for them) is set up in libfmod's JNI_OnLoad — which on Android
+// is called by System.loadLibrary("fmod"). Here libfmod is pulled in through
+// libUE4's DT_NEEDED chain and loaded eagerly, so only its DT_INIT runs, never
+// JNI_OnLoad; FMOD then has no platform object and FMOD::getGlobals returns
+// FMOD_ERR_INTERNAL (28), which cascades to Studio::System::create failing and
+// the whole game going silent (vampire: create -> 28, no banks, no events).
+// Disassembling libfmod pinned it to a null object at getGlobals+0xbc that only
+// JNI_OnLoad populates. So call it once, with the synthetic JavaVM, for the FMOD
+// core library. Targeted by basename: libfmodstudio exports no JNI_OnLoad (a
+// no-op lookup), and no other DT_NEEDED lib is auto-driven this way.
+static void kl_maybe_jni_onload(const char *path, kl_image *img) {
+    const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+    if (strncmp(b, "libfmod", 7) != 0) return;
+    int (*onload)(void *, void *) = (int (*)(void *, void *))kl_sym(img, "JNI_OnLoad");
+    if (!onload) return;
+    int r = onload(kl_jni_vm(), NULL);
+    fprintf(stderr, "  [klepton] %s JNI_OnLoad(vm) -> 0x%x (FMOD Android platform "
+            "init; without this FMOD::getGlobals fails INTERNAL and audio is silent)\n",
+            b, r);
+}
+
 kl_image *kl_load_recursive(const char *path) {
     kl_image *have = kl_find_image(path);
     if (have) return have;                       // cycle guard / already loaded
 
     char names[32][128];
     int nn = kl_list_needed(path, names, 32);
+    if (kl_env_on("KL_TRACE_NEEDED", 1)) {
+        fprintf(stderr, "  [dl] %s: %d DT_NEEDED\n", path, nn);
+        for (int i = 0; i < nn; i++) fprintf(stderr, "  [dl]     needs %s\n", names[i]);
+        fflush(stderr);
+    }
     for (int i = 0; i < nn; i++) {
+        // The OpenXR loader ships as a real file, and some guests
+        // pull it in through DT_NEEDED rather than dlopen. Loading it would run
+        // the real Khronos loader, which then hunts for an Android runtime
+        // broker that does not exist here and fails the app's OpenXR init with
+        // no call ever reaching us. Treat it as shim-served exactly as the
+        // dlopen door does (kl_openxr_dlopen): skip the file so its xr* imports
+        // bind to the synthetic runtime through kl_guest_sym_global.
+        if (kl_openxr_claims(names[i])) {
+            if (kl_env_on("KL_TRACE_NEEDED", 1))
+                fprintf(stderr, "  [dl]     %s -> openxr-served (skip)\n", names[i]);
+            continue;
+        }
+        // Shim-served libraries (libGLES*/libEGL/libvulkan/libc/liblog/...) are
+        // provided by Klepton's own gateways and must NOT be loaded as guest
+        // images — their imports bind through kl_guest_sym_global to the shims,
+        // exactly as the dlopen door serves them. Checked BEFORE kl_can_load
+        // because a host framework of the same name may exist in the app bundle
+        // (ANGLE ships libGLESv2.framework for Klepton's own GL): kl_can_load
+        // would then call it "loadable" and we would try to load the host ANGLE
+        // dylib as a guest image, which has no __TEXT,__klelf section and fails —
+        // taking the dependent plugin down with it. That is exactly how Steam
+        // Link's Qt "virtual" platform plugin (DT_NEEDED libGLESv2.so) died.
+        if (kl_dep_is_shim_served(names[i])) {
+            if (kl_env_on("KL_TRACE_NEEDED", 1))
+                fprintf(stderr, "  [dl]     %s -> shim-served (skip)\n", names[i]);
+            continue;
+        }
         char full[1024];
         if (strchr(names[i], '/')) snprintf(full, sizeof full, "%s", names[i]);
         else snprintf(full, sizeof full, "%s/%s", g_libdir, names[i]);
-        if (access(full, R_OK) != 0) continue;   // shim-served, not a file
+        // Framework-aware, NOT a raw access() on "<dir>/libfoo.so": on device the
+        // guest libraries ship as translated frameworks (libfoo.framework/libfoo),
+        // so a plain access() finds NONE of them and every bundled dependency is
+        // silently skipped — which is how Wrath2 lost libfmod (its FMOD imports
+        // went unresolved and the first FMOD call aborted in kl_unresolved_named).
+        // kl_can_load resolves the framework/dylib the same way kl_load_auto will.
+        if (!kl_can_load(full)) {
+            // Shim-served names already continued above, so anything reaching here
+            // that is not loadable is a genuine packaging gap worth naming.
+            fprintf(stderr, "  [klepton] DT_NEEDED %s of %s is neither loadable "
+                    "nor shim-served — its imports will be UNRESOLVED\n",
+                    names[i], path);
+            continue;
+        }
+        if (kl_env_on("KL_TRACE_NEEDED", 1))
+            fprintf(stderr, "  [dl]     %s -> loading (%s)\n", names[i], full);
         if (!kl_load_recursive(full)) {
             fprintf(stderr, "  [klepton] dependency %s of %s failed to load: %s\n",
                     names[i], path, kl_error());
@@ -139,6 +417,7 @@ kl_image *kl_load_recursive(const char *path) {
     if (!img) return NULL;
     kl_register_image(path, img);
     kl_run_init(img);
+    kl_maybe_jni_onload(path, img);
     return img;
 }
 
@@ -209,12 +488,13 @@ void kl_dl_report_images(FILE *f) {
 // one library over and one cause deeper: that one is cured by asking
 // kl_can_load instead of stat(), and this is what kl_can_load itself cannot
 // see.
+static int kl_core_shim_claims(const char *path);
 int kl_can_dlopen(const char *path) {
     if (!path) return 0;
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
            kl_ovrplat_claims(path) || kl_mediandk_claims(path) ||
            kl_vulkan_claims(path) || kl_aaudio_claims(path) ||
-           kl_openxr_claims(path) || kl_can_load(path);
+           kl_openxr_claims(path) || kl_core_shim_claims(path) || kl_can_load(path);
 }
 
 // KL_DLOPEN_REFUSE=<substr>[,<substr>...] — refuse these by name, as if the
@@ -231,11 +511,100 @@ int kl_can_dlopen(const char *path) {
 // and makes the rest of the arc reachable, and the A/B is one run.
 //
 // Nothing defaults to being refused, and a refusal is always named.
+// Per-target default dlopen refusals: guest plugins that trip visionOS AMFI
+// (an uncatchable SIGKILL the instant the dylib's code is executed — a capture
+// or telemetry SDK mapping/patching executable pages) and are not essential to
+// running the app. Baked in per target so no KL_DLOPEN_REFUSE env is needed;
+// KL_DLOPEN_REFUSE still adds to these. Each was identified by the app dying
+// with a bare signal 9 immediately after the named dylib loaded.
+static int kl_target_default_refused(const char *path) {
+    const char *t = kl_driver_target_name();
+    if (!path) return 0;
+    // GLOBAL AMFI-trippers: Meta SDK native plugins that map/patch executable
+    // pages and take an uncatchable SIGKILL the instant their init runs, on
+    // EVERY guest that ships them — not gameplay (spatial audio, telemetry,
+    // metrics). Refused by name regardless of target, because "which guest"
+    // was never the discriminator; the library is. ZIX (Unity 6) died in
+    // kl_run_init on libMetaXRAudioUnity exactly as missioniss did, and the
+    // same set rides in atf/intoblack/etc., so this stops chasing it per
+    // target. A missing optional audio/telemetry plugin is a load the guest
+    // already tolerates.
+    if (t) {
+        static const char *const global[] = {
+            "MetaXRAudioUnity", "SDKTelemetry", "OVRMetricsTool",
+            "ConstellusUnityPlugin", "plugin_hmd_capture",
+        };
+        for (unsigned i = 0; i < sizeof global / sizeof global[0]; i++)
+            if (strstr(path, global[i])) {
+                static const char *gsaid[8]; static unsigned gn;
+                int seen = 0;
+                for (unsigned k = 0; k < gn; k++) if (gsaid[k] == global[i]) { seen = 1; break; }
+                if (!seen && gn < 8) {
+                    gsaid[gn++] = global[i];
+                    fprintf(stderr, "  [klepton] guest dlopen(\"%s\") REFUSED (global "
+                                    "default: '%s' is a Meta SDK plugin that trips "
+                                    "visionOS AMFI) — the guest sees a library that is "
+                                    "not installed\n", path, global[i]);
+                }
+                return 1;
+            }
+    }
+    // KL_REFUSE_EOS=1 (A/B, default off): refuse Epic Online Services. zix
+    // stalls forever entering its first map after "EOSSDKComponent inited",
+    // polling Horizon messages with "[EOS SDK] ... local user being null" — the
+    // shape of a login/session async that can never complete here. Refusing the
+    // load makes the component fail its init and the game take its offline
+    // path; whether zix tolerates that is exactly what the A/B answers. Not a
+    // per-target default until it proves out.
+    if (kl_env_on("KL_REFUSE_EOS", 0) && strstr(path, "libEOSSDK")) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [klepton] guest dlopen(\"%s\") REFUSED "
+                            "(KL_REFUSE_EOS=1) — the guest sees a library that "
+                            "is not installed\n", path);
+        return 1;
+    }
+    if (!t) return 0;
+    struct { const char *target, *sub; } d[] = {
+        // (plugin_hmd_capture, ConstellusUnityPlugin, MetaXRAudioUnity,
+        // SDKTelemetry, OVRMetricsTool are refused GLOBALLY above — they trip
+        // AMFI on every guest, not just the one they were first seen on.)
+        //
+        // Not AMFI here but the same treatment for the same reason: Meta's FBNS
+        // push-notification client (folly-based) throws an UNCAUGHT exception on
+        // any network failure — online it chokes parsing a resolved Facebook
+        // IPv6, offline it throws std::system_error on the failed DNS — and takes
+        // the whole process down (SIGABRT). It is push notifications, not
+        // gameplay, and Asgard's Wrath 2 only starts it once it believes a user
+        // is signed in (KL_PLAT_USER). Refusing the load lets the game skip it.
+        { "wrath2",     "libFbnsPlugin"      },   // Meta push (FBNS) — aborts offline and on
+    };
+    for (unsigned i = 0; i < sizeof d / sizeof d[0]; i++)
+        if (strcmp(t, d[i].target) == 0 && strstr(path, d[i].sub)) {
+            static const char *said[16]; static unsigned nsaid;
+            int seen = 0;
+            for (unsigned k = 0; k < nsaid; k++) if (said[k] == d[i].sub) { seen = 1; break; }
+            if (!seen && nsaid < 16) {
+                said[nsaid++] = d[i].sub;
+                fprintf(stderr, "  [klepton] guest dlopen(\"%s\") REFUSED (per-target "
+                                "default for '%s': '%s' trips visionOS AMFI) — the guest "
+                                "sees a library that is not installed\n", path, t, d[i].sub);
+            }
+            return 1;
+        }
+    return 0;
+}
+
 static int kl_dlopen_refused(const char *path) {
+    if (!path) return 0;
+    // Baked per-target defaults are checked FIRST and unconditionally — they
+    // must fire even when no KL_DLOPEN_REFUSE env var is set, which is the whole
+    // point of baking them in.
+    if (kl_target_default_refused(path)) return 1;
     static const char *list;
     static int inited;
     if (!inited) { inited = 1; list = kl_env_str("KL_DLOPEN_REFUSE", NULL); }
-    if (!list || !*list || !path) return 0;
+    if (!list || !*list) return 0;
     for (const char *p = list; *p; ) {
         const char *comma = strchr(p, ',');
         size_t n = comma ? (size_t)(comma - p) : strlen(p);
@@ -284,6 +653,49 @@ static void kl_dlopen_note_miss(const char *path) {
 
 static void kl_dl_trace_shims(void);
 
+// The Android system libraries that are ALWAYS resident on a device. Their
+// DT_NEEDED edges are already "shim-served (skip)" (kl_load_recursive), but an
+// explicit runtime dlopen() by name is a different door: there is no file to
+// open, so it fell through to kl_load_recursive, failed, and returned NULL.
+//
+// That NULL is never what a device gives. On Android these are loaded before the
+// first guest instruction runs, so dlopen("libc.so") returns a live handle and
+// dlsym() off it resolves through libc — which here is exactly the shim table.
+// Missioniss booted into libunity's pthread_once lazy-init, which dlopen()s
+// "libc.so" to cache a libc entry point; the NULL both broke that init AND drove
+// the failure-diagnostic frame walk into libunity's chainless .text (the 0x7
+// fault). Serving the handle removes both: klb_dlsym routes it to the shim
+// lookup + global image search, the same resolution a NULL/RTLD_DEFAULT handle
+// gets, so a name the shim serves comes back and one it does not returns a clean
+// dlerror instead of a crash.
+//
+// Matched by basename so a full path into the guest lib dir claims too. Not
+// gated: returning a handle for a system library that is definitionally present
+// is correct on every target, and nothing here changes a symbol's answer.
+static const char *const kl_core_shim_libs[] = {
+    "libc.so", "libdl.so", "libm.so", "liblog.so", "libandroid.so",
+    "libz.so", "libc++.so", "libc++_shared.so", "libstdc++.so",
+};
+static const int g_core_shim_handle = 0;             // address is the sentinel
+
+static int kl_core_shim_claims(const char *path) {
+    if (!path) return 0;
+    // Unity ONLY. libunity explicitly dlopen()s "libc.so" and NULL crashes it
+    // (see above). UE4/UE5 guests (olar, wrath2, hl2) also dlopen these system
+    // libs but were FINE with the old dlopen->NULL — serving them a handle made
+    // their dlsym-through-it resolve libc/pthread differently and DEADLOCK them
+    // (olar/wrath2 hung in cond_wait). Restrict the handle to the guest kind that
+    // needs it so UE titles keep their proven-working NULL behavior.
+    extern kl_guest_kind kl_driver_kind(void);
+    if (kl_driver_kind() != KL_GUEST_UNITY) return 0;
+    const char *b = basename_of(path);
+    for (size_t i = 0; i < sizeof kl_core_shim_libs / sizeof kl_core_shim_libs[0]; i++)
+        if (strcmp(b, kl_core_shim_libs[i]) == 0) return 1;
+    return 0;
+}
+
+static int kl_core_shim_is_handle(void *h) { return h == (void *)&g_core_shim_handle; }
+
 void *klb_dlopen(const char *path, int flags) {
     (void)flags;
     { static int once; if (!once) { once = 1; kl_dl_trace_shims(); } }
@@ -296,8 +708,8 @@ void *klb_dlopen(const char *path, int flags) {
     int missed = kl_dlopen_missed(path);
     pthread_mutex_unlock(&g_lock);
     if (missed) {
-        snprintf(g_dlerr, sizeof g_dlerr, "klepton: cannot load %s: %s",
-                 path, "No such file or directory");
+        const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
+        snprintf(g_dlerr, sizeof g_dlerr, "dlopen failed: library \"%s\" not found", base);
         return NULL;
     }
     // GL libraries have no file to open — they are served by kl_egl.c. This has
@@ -332,6 +744,13 @@ void *klb_dlopen(const char *path, int flags) {
     // runtime broker. See kl_openxr.c.
     void *xrl = kl_openxr_dlopen(path);
     if (xrl) return xrl;
+    // The always-resident Android system libraries (libc/libdl/libm/...). No file
+    // to open; served with a handle whose dlsym routes to the shim table. Must
+    // come before the file-load fallthrough, which would fail and hand back NULL.
+    if (kl_core_shim_claims(path)) {
+        fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> shim-served handle\n", path);
+        return (void *)&g_core_shim_handle;
+    }
     pthread_mutex_lock(&g_lock);
     kl_image *found = kl_find_image(path);           // already loaded? refcount is coarse
     pthread_mutex_unlock(&g_lock);
@@ -343,7 +762,14 @@ void *klb_dlopen(const char *path, int flags) {
 
     kl_image *img = kl_load_recursive(full);
     if (!img) {
-        snprintf(g_dlerr, sizeof g_dlerr, "klepton: cannot load %s: %s", full, kl_error());
+        // Keep dlerror() SHORT and Android-shaped: a guest's own load-failure
+        // path copies this into a fixed buffer sized for Android's terse
+        // "dlopen failed: library "libX.so" not found" — Half-Life's lambda1vr
+        // (trying an absent libvgui_support.so) does, and our old full-container-
+        // path spelling (~150 chars) overflowed its 1024-byte buffer into a
+        // __strlen_chk abort. The full detail still goes to the log below.
+        const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
+        snprintf(g_dlerr, sizeof g_dlerr, "dlopen failed: library \"%s\" not found", base);
         fprintf(stderr, "  [klepton] guest dlopen(\"%s\") FAILED: %s\n", path, kl_error());
         // KL_TRACE_DLOPEN_FRAMES=1 — who asked. A P/Invoke that cannot resolve
         // throws from IL2CPP's resolver, and the managed method that declared it
@@ -382,6 +808,32 @@ void *klb_dlopen(const char *path, int flags) {
 
 static void *kl_dl_interpose(const char *name, void *real);
 
+// KL_TRACE_DLSYM=1: name every dlsym that comes back NULL, with the guest image
+// that asked. A NULL returned here and then CALLED is the jump-to-0x0 AMFI kills
+// as an "Invalid Page" (OLAR) — uncatchable, so the crash report cannot name the
+// culprit, but the last line this prints before the kill does.
+// Default the dlsym-NULL trace ON for titles stuck in the jump-to-0x0 SIGKILL
+// with nothing else naming the culprit — olar dies right after libmrutilitykit
+// shared loads, and on device the user cannot set env, so it has to be the
+// default there. KL_TRACE_DLSYM still overrides either way.
+static int kl_dlsym_trace_default(void) {
+    static const char *on[] = { "olar" };
+    const char *t = kl_driver_target_name();
+    if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
+        if (strcmp(t, on[i]) == 0) return 1;
+    return 0;
+}
+static void *klb_dlsym_null(const char *name) {
+    if (kl_env_on("KL_TRACE_DLSYM", kl_dlsym_trace_default())) {
+        size_t off = 0;
+        const char *who = kl_addr_image(__builtin_return_address(0), &off);
+        fprintf(stderr, "  [dlsym] '%s' -> NULL (undefined) — asked from %s+0x%zx; "
+                        "calling this is a jump-to-0x0\n",
+                name ? name : "(null)", who ? who : "(host)", off);
+    }
+    return NULL;
+}
+
 void *klb_dlsym(void *handle, const char *name) {
     if (kl_egl_is_handle(handle)) return kl_egl_sym(name);
     if (kl_opensl_is_handle(handle)) return kl_opensl_sym(name);
@@ -391,6 +843,17 @@ void *klb_dlsym(void *handle, const char *name) {
     if (kl_vulkan_is_handle(handle)) return kl_vulkan_sym(name);
     if (kl_aaudio_is_handle(handle)) return kl_aaudio_sym(name);
     if (kl_openxr_is_handle(handle)) return kl_openxr_sym(name);
+    // A core system-library handle (libc.so &c.) resolves like RTLD_DEFAULT: the
+    // shim serves libc, and the global image search covers anything a guest .so
+    // exported. A name neither has is a clean undefined-symbol dlerror, not a
+    // fault — which is the whole point of serving the handle rather than NULL.
+    if (kl_core_shim_is_handle(handle)) {
+        void *s = kl_shim_lookup(name);
+        if (s) return s;
+        s = kl_guest_sym_global(name);
+        if (!s) snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
+        return s;
+    }
     if (handle == NULL || handle == (void *)-1) {    // RTLD_DEFAULT / RTLD_NEXT
         void *s = kl_shim_lookup(name);
         if (s) return s;
@@ -399,11 +862,25 @@ void *klb_dlsym(void *handle, const char *name) {
             if (v) return v;
         }
         snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
+        return klb_dlsym_null(name);
+    }
+    // Anything left is meant to be a real loaded image. Validate it before
+    // dereferencing: a guest's linker-hook init probes dlsym(handle=1,
+    // "__loader_android_*") for bionic dynamic-linker internals that do not
+    // exist here, and casting an invented handle to kl_image* faults inside
+    // kl_sym. A NULL return is the honest "no such symbol" the caller handles.
+    int known = 0;
+    for (int i = 0; i < g_nimgs; i++)
+        if ((void *)g_imgs[i].img == handle) { known = 1; break; }
+    if (!known) {
+        snprintf(g_dlerr, sizeof g_dlerr,
+                 "klepton: dlsym on unknown handle %p (symbol %s)", handle, name);
         return NULL;
     }
     void *v = kl_sym((kl_image *)handle, name);
-    if (!v) snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
-    if (v) { void *w = kl_dl_interpose(name, v); if (w) return w; }
+    if (!v) { snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
+              return klb_dlsym_null(name); }
+    { void *w = kl_dl_interpose(name, v); if (w) return w; }
     return v;
 }
 
