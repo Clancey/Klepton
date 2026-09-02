@@ -762,7 +762,7 @@ int kl_slink_vr_create(FILE *out) {
     snprintf(path, sizeof path, "%s/%s", g_libdir, SL_VR_LIB);
     kl_image *scene = kl_find_image(path);
     if (!scene) return slink_fail("libvrlink_scene.so is not in the registry");
-    if (kl_na_create(scene, SL_VR_FN, out) != 0)
+    if (kl_na_create(scene, SL_VR_FN, NULL, out) != 0)
         return slink_fail("libvrlink_scene.so exports no " SL_VR_FN);
     return 0;
 }

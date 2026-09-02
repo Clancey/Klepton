@@ -106,6 +106,16 @@ final class KleptonChroma: ObservableObject {
     /// than waiting for a relaunch.
     var upperLimbVisibility: Visibility { settings.handMatting ? .automatic : .hidden }
 
+    /// Whether the immersive space opens FULLY immersive (no passthrough). This
+    /// lives here — on the object the scene already observes — rather than in a
+    /// static read at scene-build time, because that default depends on the guest
+    /// target (kl_app_target_wants_full), which is only known AFTER
+    /// kl_app_configure runs, well after SwiftUI first evaluates the scene. Boot
+    /// sets it once configure has resolved the target; publishing it re-evaluates
+    /// the scene so .full takes hold before the space opens. Default false keeps
+    /// .mixed until the target says otherwise.
+    @Published var immersionFull = false
+
     private func publish() {
         var rgb = [settings.color.x, settings.color.y, settings.color.z]
         kl_reproject_set_chroma(settings.enabled ? 1 : 0, &rgb,

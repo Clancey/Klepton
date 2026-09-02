@@ -72,6 +72,8 @@ typedef struct {
     uint64_t    running, waiting, other_state;
     unsigned    stacks_printed;
     counts      leaf, guest, managed;
+    const void *last_chain[16];   // this thread's most recent sampled pcs
+    unsigned    last_nf;
 } thread_rec;
 
 static pthread_t       g_thread;
@@ -414,6 +416,37 @@ static void sample_once(void) {
                 }
             }
         }
+        {   // Remember this thread's latest chain for the periodic report:
+            // the render-loop threads bounce between two waits and never
+            // qualify for the parked dumps, and theirs is exactly the chain
+            // the stalled-frame investigations keep needing.
+            thread_rec *tr = thread_rec_for(act);
+            if (tr) {
+                unsigned keep = nf < 16 ? nf : 16;
+                for (unsigned f = 0; f < keep; f++) tr->last_chain[f] = frames[f];
+                tr->last_nf = keep;
+            }
+        }
+        // ...and the same for a thread that NEVER reaches managed code (a
+        // metadata version the resolver cannot read makes that every thread):
+        // parked is parked, and the native chain still names the wait. Gated
+        // on one distinct LEAF across 200+ samples so a healthy worker that
+        // bounces between waits never qualifies.
+        if (!managed && t_stack_trace_enabled()) {
+            thread_rec *tr = thread_rec_for(act);
+            if (tr && tr->stacks_printed < KL_SAMPLE_STACKS_MAX &&
+                tr->samples > 200 && tr->leaf.n == 1 && nf > 2) {
+                tr->stacks_printed++;
+                char lb[160];
+                fprintf(stderr, "  [sample] thread %s parked (native) in %s; chain:\n",
+                        tr->name, label_pc(frames[0], lb, sizeof lb));
+                for (unsigned f = 0; f < nf; f++) {
+                    char b[160];
+                    fprintf(stderr, "    #%-2d %s\n", f,
+                            label_pc(frames[f], b, sizeof b));
+                }
+            }
+        }
 
         char lbuf[160], gbuf[160];
         const char *leaf  = label_pc(frames[0], lbuf, sizeof lbuf);
@@ -532,6 +565,10 @@ void kl_sample_report(FILE *out) {
         for (unsigned k = 0; k < show->n && k < 3; k++)
             fprintf(out, "      %5.1f%%  %s\n", 100.0 * show->v[k].n / t->samples,
                     show->v[k].label);
+        for (unsigned f = 0; f < t->last_nf; f++) {
+            char b[160];
+            fprintf(out, "        @%-2d %s\n", f, label_pc(t->last_chain[f], b, sizeof b));
+        }
     }
     fflush(out);
 }

@@ -32,6 +32,7 @@ staged into. ANGLE is deliberately NOT per-target: it is the same renderer for
 every guest and `mkangle.sh` writes it once, into Frameworks/ itself.
 """
 import sys
+import shlex
 
 TARGETS = {
     "beatsaber": {
@@ -70,7 +71,7 @@ TARGETS = {
         # libunity -> the Android lifecycle; "steamlink" is kl_slink's doors.
         "kind":    "unity",
         "product": "Klepton",
-        "display": "Klepton",
+        "display": "Beat Saber",
     },
     "superhot": {
         # SUPERHOT VR — Unity + IL2CPP + the Oculus Mobile SDK, i.e. the same
@@ -96,7 +97,7 @@ TARGETS = {
         "entry":   "libmain",
         "kind":    "unity",
         "product": "KleptonSuperhot",
-        "display": "Klepton SUPERHOT",
+        "display": "SUPERHOT",
     },
     "bonelab": {
         # BONELAB — Unity 2021.3.16f1 + IL2CPP, and the same front door again
@@ -135,7 +136,7 @@ TARGETS = {
         "entry":   "libmain",
         "kind":    "unity",
         "product": "KleptonBonelab",
-        "display": "Klepton BONELAB",
+        "display": "BONELAB",
     },
     "vrchat": {
         # VRChat — Unity 2022.3.22f2-DWR + IL2CPP, and the FIFTH target. It is
@@ -175,7 +176,7 @@ TARGETS = {
         "entry":   "libmain",
         "kind":    "unity",
         "product": "KleptonVRChat",
-        "display": "Klepton VRChat",
+        "display": "VRChat",
     },
     "openbrush": {
         # Open Brush — Unity 2022.3.62f2 + IL2CPP, and the SIXTH target. Two
@@ -225,7 +226,7 @@ TARGETS = {
         "entry":   "libmain",
         "kind":    "unity",
         "product": "KleptonOpenBrush",
-        "display": "Klepton Open Brush",
+        "display": "Open Brush",
     },
     "re4": {
         # Resident Evil 4 VR — and the SEVENTH target, which is the first one
@@ -302,7 +303,109 @@ TARGETS = {
         "entry":   "libUE4",
         "kind":    "ue4",
         "product": "KleptonRE4",
-        "display": "Klepton RE4",
+        "display": "Resident Evil 4",
+    },
+    "redmatter2": {
+        # Red Matter 2 (Vertical Robot), package com.VerticalRobot.RedMatter2 —
+        # UE4 through com.epicgames.ue4.GameActivity, RE4/wrath2's shape. Audio
+        # is the Oculus spatializer alone (libovraudio64 in DT_NEEDED, no FMOD,
+        # no Wwise), which the optional-if-absent chain handles by skipping the
+        # FMOD members. No Frida payload; `libs: None` finds nothing to strip.
+        "libs":    None,
+        "srcdir":  "redmatter2/lib/arm64-v8a",
+        "tree":    "redmatter2",
+        "apk":     "redmatter2.apk",
+        "assets":  "redmatter2/assets",
+        "qtplugins": "",
+        # UE4 builds <external>/Android/obb/<package>/ itself — RE4's layout.
+        "obb":     "Android/obb/com.VerticalRobot.RedMatter2",
+        "entry":   "libUE4",
+        "kind":    "ue4",
+        "product": "KleptonRedMatter2",
+        "display": "Red Matter 2",
+    },
+    "zix": {
+        # ZIX (Hidden Gem), package com.HiddenGemIO.ZIX — Unity + IL2CPP, the
+        # libmain front door. Two things worth knowing before its first run:
+        # audio is Wwise (libAkUnitySoundEngine), and XR ships BOTH stacks —
+        # libOVRPlugin next to libUnityOpenXR/libopenxr_loader — so which path
+        # the boot takes is worth reading out of the log rather than assuming.
+        # EOS (libEOSSDK) is aboard for the online half.
+        "libs":    None,
+        "srcdir":  "zix/lib/arm64-v8a",
+        "tree":    "zix",
+        "apk":     "zix.apk",
+        "assets":  "zix/assets",
+        "qtplugins": "",
+        # Flat Unity layout: Context.getObbDirs() answers <files>/obb.
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonZIX",
+        "display": "ZIX",
+    },
+    "vampire": {
+        # Vampire: The Masquerade — Justice (Fast Travel Games), package
+        # com.fasttravelgames.lollipop (the codename, not a typo) — UE4,
+        # GameActivity door, wrath2's shape exactly: FMOD audio plus the Oculus
+        # spatializer, playcore for the OBB half. libbhaptics-native-lib is a
+        # vest-haptics SDK; nothing here needs to speak it for the game to run.
+        "libs":    None,
+        "srcdir":  "vampire/lib/arm64-v8a",
+        "tree":    "vampire",
+        "apk":     "vampire.apk",
+        "assets":  "vampire/assets",
+        "qtplugins": "",
+        "obb":     "Android/obb/com.fasttravelgames.lollipop",
+        "entry":   "libUE4",
+        "kind":    "ue4",
+        "product": "KleptonVampire",
+        "display": "Vampire: The Masquerade - Justice",
+    },
+    "vicecity": {
+        # GTA Vice City VR (GTAVCVR) — a reVC/re3 (open-source re-implementation)
+        # VR port. A plain Android NativeActivity + OpenXR native app: the entry is
+        # ANativeActivity_onCreate in libmiamivr.so ("Miami" = Vice City) and the
+        # game runs its own loop on the android_main thread, so it is the new
+        # "native" kind, not Unity/UE4. No OBB and no assets/ inside the APK — the
+        # whole data set is the loose files/gamedata tree (gta3.img, cuts.img,
+        # txd, TEXT, Audio, reVC.ini, vr_settings.ini), staged through files/.
+        "libs":    None,
+        "srcdir":  "vicecity/lib/arm64-v8a",
+        "tree":    "vicecity",
+        "apk":     "vicecity.apk",
+        # The APK ships no assets/; stage_assets.sh stages it present-or-absent.
+        "assets":  "vicecity/assets",
+        "qtplugins": "",
+        # No OBB — the shared "nothing here" answer, as jkxr uses.
+        "obb":     "obb",
+        # The game data: userdata/vicecity/files/gamedata -> android-files/files.
+        "stage_files": "files",
+        "entry":   "libmiamivr",
+        "kind":    "native",
+        "product": "KleptonViceCity",
+        "display": "Vice City",
+    },
+    "intotheradius": {
+        # Into the Radius (CM Games), package com.CMGames.IntoTheRadius — UE4
+        # through com.epicgames.ue4.GameActivity, RE4/wrath2's shape. Split
+        # binary (a DownloaderActivity fronts the OBB). Ships bhaptics haptics
+        # and Sentry crash reporting (libsentry/libsentry-android) beside the
+        # engine; neither is needed to run, and Sentry's native uploader is the
+        # kind of thing to watch if a run dies right after it initialises.
+        "libs":    None,
+        "srcdir":  "intotheradius/lib/arm64-v8a",
+        "tree":    "intotheradius",
+        "apk":     "intotheradius.apk",
+        "assets":  "intotheradius/assets",
+        "qtplugins": "",
+        # UE4 builds <external>/Android/obb/<package>/ itself — the Android
+        # layout, like RE4/wrath2.
+        "obb":     "Android/obb/com.CMGames.IntoTheRadius",
+        "entry":   "libUE4",
+        "kind":    "ue4",
+        "product": "KleptonIntoTheRadius",
+        "display": "Into the Radius",
     },
     # ---- JKXR: ONE APK, TWO GAMES, TWO ROWS ----
     #
@@ -373,7 +476,7 @@ TARGETS = {
         "entry":   "libopenjk_ja",
         "kind":    "jkxr",
         "product": "KleptonJKXRAcademy",
-        "display": "Klepton JK Academy",
+        "display": "JK Academy",
     },
     "jkxr_jo": {
         "libs":    None,
@@ -387,7 +490,7 @@ TARGETS = {
         "entry":   "libopenjk_jo",
         "kind":    "jkxr",
         "product": "KleptonJKXROutcast",
-        "display": "Klepton JK Outcast",
+        "display": "JK Outcast",
     },
     "steamlink-vr": {
         # BOTH front doors, because the app runs both: the 2D shell pairs in a
@@ -453,7 +556,90 @@ TARGETS = {
         # host having deauthorized us and costs a re-pair to disbelieve.
         "userdata": "steamlink",
         "product": "KleptonSteamLink",
-        "display": "Klepton Steam Link",
+        "display": "Steam Link",
+    },
+
+
+    # ---- SDL2 + OpenXR VR engine ports (SCAFFOLD) ----
+    #
+    # Four targets over two engines that Klepton has not run before, added as
+    # rows so each BUILDS, stages and boots to a first log; the engine drivers
+    # (kl_xash / kl_source) are not written yet, so the "xash"/"source" kinds
+    # currently share the NativeActivity harness (kl_native) — enough to load the
+    # guest libraries and print DT_NEEDED, the shim gap and where the real entry
+    # is (SDL_main / drbeef's GLES3JNILib), which is what the drivers get built
+    # against. None boots the game yet; that is the per-engine work these rows set
+    # up. No OBB (the shared "obb" = nothing-here answer); the whole data set is
+    # the loose tree the user staged under userdata/<name>/<stage_files>.
+    #
+    #   Xash3D / GoldSrc:
+    "cs1": {
+        # Counter-Strike VR (com.lvonasek.csvr) — Xash3D + SDL2, entry libxash
+        # (SDL_main). Data: userdata/cs1/xash (valve + cstrike) -> android-files/xash.
+        "libs":    None,
+        "srcdir":  "cs1/lib/arm64-v8a",
+        "tree":    "cs1",
+        "apk":     "cs1.apk",
+        "assets":  "cs1/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "stage_files": "xash",
+        "entry":   "libxash",
+        "kind":    "sdl2",
+        "product": "KleptonCSVR",
+        "display": "Counter Strike",
+    },
+    "hl1": {
+        # Half-Life VR / Lambda1VR (com.drbeef.lambda1vr) — Xash3D, drbeef's
+        # GLES3JNILib exports (same shape as jkxr), entry libxash. Data:
+        # userdata/hl1/xash (valve + HLGOLD + commandline.txt) -> android-files/xash.
+        "libs":    None,
+        "srcdir":  "hl1/lib/arm64-v8a",
+        "tree":    "hl1",
+        "apk":     "hl1.apk",
+        "assets":  "hl1/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "stage_files": "xash",
+        "entry":   "libxash",
+        "kind":    "gles3jni",
+        "product": "KleptonHalfLifeVR",
+        "display": "Half Life",
+    },
+    #   Source engine:
+    "hl2": {
+        # Half-Life 2 VR (com.valvesoftware.source.vrtest) — Source + SDL2
+        # (org.libsdl.app.SDLActivity), entry liblauncher (SDL_main), libsourcevr
+        # for the XR seam. Data: userdata/hl2/srceng (hl2, ep2, episodic, platform)
+        # -> android-files/srceng.
+        "libs":    None,
+        "srcdir":  "hl2/lib/arm64-v8a",
+        "tree":    "hl2",
+        "apk":     "hl2.apk",
+        "assets":  "hl2/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "stage_files": "srceng",
+        "entry":   "liblauncher",
+        "kind":    "sdl2",
+        "product": "KleptonHalfLife2VR",
+        "display": "Half Life 2",
+    },
+    "portal": {
+        # Portal VR (com.portalVR.source) — Source + SDL2, entry liblauncher.
+        # Data: userdata/portal/Source (portal, hl2, platform) -> android-files/Source.
+        "libs":    None,
+        "srcdir":  "portal/lib/arm64-v8a",
+        "tree":    "portal",
+        "apk":     "portal.apk",
+        "assets":  "portal/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "stage_files": "Source",
+        "entry":   "liblauncher",
+        "kind":    "sdl2",
+        "product": "KleptonPortalVR",
+        "display": "Portal",
     },
 }
 
@@ -597,10 +783,12 @@ def main(argv):
             return 1
         print(t[argv[2]])
         return 0
-# Shell-sourceable. Quoted because `libs` has spaces in it and an unquoted
-# eval would turn one assignment into a command.
+# Shell-sourceable. shlex.quote so a value with spaces (`libs`) or a shell
+# metacharacter (an apostrophe in a display name like "Assassin's Creed Nexus")
+# survives `eval` intact instead of splitting the assignment or leaving an
+# unbalanced quote.
     for k, v in t.items():
-        print(f"KLT_{k.upper()}='{v}'")
+        print(f"KLT_{k.upper()}={shlex.quote(str(v))}")
     return 0
 
 

@@ -123,5 +123,14 @@ const klj_binding klj_bind_jkxr[] = {
     {"com/drbeef/jkxr/GLES3JNIActivity", "haptic_endframe", "()V", jkxr_haptic_endframe},
     {"com/drbeef/jkxr/GLES3JNIActivity", "haptic_enable",   "()V", jkxr_haptic_enable},
     {"com/drbeef/jkxr/GLES3JNIActivity", "haptic_disable",  "()V", jkxr_haptic_disable},
+    // Team Beef's shared external-haptics service (com.drbeef.externalhapticsservice
+    // .HapticsAPI) — the SAME accessory-haptics channel, used by the non-JKXR ports
+    // (cs1's Xash calls HapticsAPI.enable/event/endFrame). Route to the same
+    // handlers; the accessory devices (bHaptics/ForceTube) are not present, so these
+    // record state and drive the per-hand CoreHaptics fallback like every target.
+    {"com/drbeef/externalhapticsservice/HapticsAPI", "enable",   "()V", jkxr_haptic_enable},
+    {"com/drbeef/externalhapticsservice/HapticsAPI", "endframe", "()V", jkxr_haptic_endframe},
+    {"com/drbeef/externalhapticsservice/HapticsAPI", "event",
+     "(Ljava/lang/String;IIIFF)V", jkxr_haptic_event},
     {0}
 };

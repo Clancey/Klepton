@@ -26,7 +26,9 @@
 #include "klepton.h"
 #include "kl_jni.h"
 #include "kl_fault.h"
+#include "guest/kl_driver.h"   // the target name, for per-target JNI defaults
 #include "kl_target.h"   // the default target's userdata key
+#include "kl_driver.h"   // kl_driver_target_name() — per-target Build identity
 #include "kl_env.h"
 #include "kl_cacerts.h"  // the root anchors behind javax.net.ssl, below
 #include "kl_ovrp.h"
@@ -251,6 +253,18 @@ void *kl_jni_new_object(const char *class_name) {
     return o;
 }
 
+// Pin a host-made object so it is never retired at a local-frame pop — the C
+// equivalent of the guest calling NewGlobalRef. For objects the host hands back
+// and KEEPS a pointer to (a cached SharedPreferences stored in a global table):
+// without this the object dies at the next PopLocalFrame and the stored pointer
+// comes back as "GetObjectClass on an untagged pointer" when the guest reuses it.
+void kl_jni_pin_object(void *obj) {
+    pthread_mutex_lock(&g_lock);
+    klj_object *o = klj_as_object(obj);
+    if (o) o->pinned++;
+    pthread_mutex_unlock(&g_lock);
+}
+
 
 // Same as kl_jni_new_object, but carries a payload. Used for the object
 // kinds the host has to *construct* rather than merely hand back: JNIBridge
@@ -300,6 +314,17 @@ void *kl_jni_native(const char *cls, const char *name, const char *sig) {
         if (strcmp(g_natives[i].cls, cls) == 0 && strcmp(g_natives[i].name, name) == 0 &&
             (!sig || strcmp(g_natives[i].sig, sig) == 0))
             return g_natives[i].fn;
+    return NULL;
+}
+
+// The registered signature for cls.name, or NULL if never registered. The
+// bring-up diagnostic behind it: when a signature-specific lookup misses, the
+// caller prints this verbatim so the log shows the exact bytes RegisterNatives
+// stored instead of leaving two indistinguishable failure modes.
+const char *kl_jni_native_sig(const char *cls, const char *name) {
+    for (unsigned i = 0; i < g_nnatives; i++)
+        if (strcmp(g_natives[i].cls, cls) == 0 && strcmp(g_natives[i].name, name) == 0)
+            return g_natives[i].sig;
     return NULL;
 }
 
@@ -413,8 +438,29 @@ void *kl_jni_class(const char *name) { return klj_FindClass(NULL, name); }
         // and a signature. java/lang/Object is the least wrong class to hand
         // back; anything done with it afterwards is invented, hence
         // KL_PERMISSIVE only.
-        if (kl_permissive()) {
-            KLJ_LOG("KL_PERMISSIVE: answering java/lang/Object so the NEXT call "
+        // KL_JNI_SOFT_NULLCLASS survives this specific abort WITHOUT the global
+        // KL_PERMISSIVE (which would make every OVRPlugin getter return 0 and
+        // black out the XR surface). AC Nexus's UbiServices entitlement check
+        // in the menu scene hits GetObjectClass(NULL); answering Object lets the
+        // NEXT call (a GetMethodID) name the method it wanted, turning "some
+        // jobject is NULL" into a concrete UbiServices JNI call to implement.
+        // Default ON for AC Nexus — the target this branch was written from
+        // (its UbiServices SDK hits GetObjectClass(NULL) on every boot, and the
+        // knob had to be remembered by hand on every run; one forgotten run
+        // read as a fresh crash). KL_JNI_SOFT_NULLCLASS=0 still turns it off.
+        int soft_default = 0;
+        {
+            const char *t = kl_driver_target_name();
+            if (t && strcmp(t, "acnexusvr") == 0) soft_default = 1;
+            // hl2's libsourcevr does GetObjectClass on an untagged pointer while
+            // reading a saved setting (getSharedPreferences -> getInt) in the menu
+            // — the same shape as AC Nexus's UbiServices check. Answering Object
+            // lets it past (or the next call names what it wanted) instead of
+            // aborting the whole run on one menu preference read.
+            if (t && strcmp(t, "hl2") == 0) soft_default = 1;
+        }
+        if (kl_permissive() || kl_env_on("KL_JNI_SOFT_NULLCLASS", soft_default)) {
+            KLJ_LOG("soft null-class: answering java/lang/Object so the NEXT call "
                     "names what the guest wanted from it");
             pthread_mutex_lock(&g_lock);
             void *c = klj_intern_class_locked("java/lang/Object")->as_object;
@@ -975,6 +1021,20 @@ static const klj_binding *klj_find_binding(const char *cls, const char *name,
 
 static const klj_binding *klj_resolve_binding(const char *cls, const char *name,
                                               const char *sig) {
+    // UE5 renamed the activity package com.epicgames.ue4 -> com.epicgames.unreal
+    // (Wanderer, libUnreal). The whole AndroidThunkJava_* binding surface is
+    // keyed on the ue4 name, so alias the unreal class onto it rather than
+    // duplicating ~40 rows — the natives are identical, only the package moved.
+    // UE5 renamed the whole com.epicgames.ue4.* package to com.epicgames.unreal.*
+    // (Wanderer, OLAR). The binding surface is keyed on the ue4 spelling, so alias
+    // ANY com/epicgames/unreal/X onto com/epicgames/ue4/X — GameActivity,
+    // MessageBox01, the receivers, MediaPlayer14 — rather than duplicating rows.
+    if (strncmp(cls, "com/epicgames/unreal/", 21) == 0) {
+        char alias[256];
+        snprintf(alias, sizeof alias, "com/epicgames/ue4/%s", cls + 21);
+        const klj_binding *b = klj_find_binding(alias, name, sig);
+        if (b) return b;
+    }
     for (const char *cur = cls; cur; ) {
         const klj_binding *b = klj_find_binding(cur, name, sig);
         if (b) return b;
@@ -1364,7 +1424,26 @@ static const char *klj_field_sval(const klj_field *f) {
     char env[64];
     snprintf(env, sizeof env, "KL_BUILD_%s", f->name);
     const char *v = getenv(env);
-    return v ? v : f->sval;
+    if (v) return v;
+    // Per-target hardware identity. The default (g_fields) is a Quest 2; a title
+    // that GATES on newer hardware refuses to run on it. batman (Batman: Arkham
+    // Shadow) is Quest 3 / 3S exclusive: on the Quest 2 we present it pops "Your
+    // device does not match the hardware requirements", abandons Vulkan, and falls
+    // back to a GLES2 context whose shaders it does not ship (E/Unity "shader
+    // compiler platform 5 is not available in shader blob") — so nothing renders
+    // and the frame loop waits forever. Present a Quest 3 (codename eureka) for it.
+    // Kept on the Android-10/API-29 base the rest of the surface is built for, so
+    // only the hardware identity changes; if a run shows batman also gates on the
+    // OS version, bump SDK_INT/RELEASE for it too.
+    const char *t = kl_driver_target_name();
+    if (t && strcmp(t, "batman") == 0) {
+        if (!strcmp(f->name, "MODEL"))    return "Quest 3";
+        if (!strcmp(f->name, "DEVICE"))   return "eureka";
+        if (!strcmp(f->name, "PRODUCT"))  return "eureka";
+        if (!strcmp(f->name, "FINGERPRINT"))
+            return "oculus/eureka/eureka:10/SQ3A.220605.009.A1/1:user/release-keys";
+    }
+    return f->sval;
 }
 
 // Interned jstrings for constant object fields, parallel to g_fields so the
@@ -1445,8 +1524,14 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
     }
     const klj_val *written = klj_find_write(obj, fid);
     if (written) return *written;
+    // UE5's unreal-package GameActivity aliases onto ue4 for FIELDS too, the
+    // same way klj_resolve_binding does for methods — g_fields keys the whole
+    // GameActivity static surface (ANDROID_BUILD_VERSION, ...) on the ue4 name.
+    const char *wcls = w->cls;
+    if (strcmp(wcls, "com/epicgames/unreal/GameActivity") == 0)
+        wcls = "com/epicgames/ue4/GameActivity";
     for (const klj_field *f = g_fields; f->cls; f++) {
-        if (strcmp(f->cls, w->cls) || strcmp(f->name, w->name) || strcmp(f->sig, w->sig))
+        if (strcmp(f->cls, wcls) || strcmp(f->name, w->name) || strcmp(f->sig, w->sig))
             continue;
         if (f->fn) return f->fn();
         if (want == 'L') {
@@ -1526,6 +1611,29 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/content/DialogInterface", "BUTTON_NEUTRAL",  -3),
     KLJ_FINT("android/media/AudioManager", "GET_DEVICES_OUTPUTS", 2),
     KLJ_FINT("android/media/AudioManager", "STREAM_MUSIC", 3),
+    // MediaFormat colour constants — Unity's AndroidVideoMedia reads these off
+    // the decoded video format to set up the output colour conversion. Values
+    // are the AOSP MediaFormat definitions.
+    KLJ_FINT("android/media/MediaFormat", "COLOR_RANGE_FULL",      1),
+    KLJ_FINT("android/media/MediaFormat", "COLOR_RANGE_LIMITED",   2),
+    KLJ_FINT("android/media/MediaFormat", "COLOR_STANDARD_BT709",       1),
+    KLJ_FINT("android/media/MediaFormat", "COLOR_STANDARD_BT601_PAL",   2),
+    KLJ_FINT("android/media/MediaFormat", "COLOR_STANDARD_BT601_NTSC",  4),
+    KLJ_FINT("android/media/MediaFormat", "COLOR_STANDARD_BT2020",      6),
+    KLJ_FINT("android/media/MediaFormat", "COLOR_TRANSFER_LINEAR",      1),
+    KLJ_FINT("android/media/MediaFormat", "COLOR_TRANSFER_SDR_VIDEO",   3),
+    KLJ_FINT("android/media/MediaFormat", "COLOR_TRANSFER_ST2084",      6),
+    KLJ_FINT("android/media/MediaFormat", "COLOR_TRANSFER_HLG",         7),
+    // MediaCodecInfo.CodecCapabilities colour formats — Unity queries these when
+    // choosing the decoder output format. AOSP values.
+    KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatYUV420Planar",      19),
+    KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatYUV420SemiPlanar",  21),
+    KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatYUV420Flexible",    0x7F420888),
+    KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatSurface",           0x7F000789),
+    KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_QCOM_FormatYUV420SemiPlanar", 0x7FA30C00),
+    KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_TI_FormatYUV420PackedSemiPlanar", 0x7F000100),
+    KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatYUV420PackedSemiPlanar", 39),
+    KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatYUV420PackedPlanar",     20),
 
     // View.SYSTEM_UI_FLAG_* and the window flag behind them. Real Android
     // values: Unity ORs these together and hands the result straight back to
@@ -1540,6 +1648,20 @@ static const klj_field g_fields[] = {
     KLJ_FSTR("android/content/pm/PackageManager", "FEATURE_AUDIO_LOW_LATENCY",
              "android.hardware.audio.low_latency"),
     KLJ_FINT("android/content/pm/PackageManager", "PERMISSION_GRANTED", 0),
+    KLJ_FINT("android/content/pm/PackageManager", "PERMISSION_DENIED", -1),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_ACTIVITIES",            0x00000001),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_RECEIVERS",             0x00000002),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_SERVICES",              0x00000004),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_PROVIDERS",             0x00000008),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_INSTRUMENTATION",       0x00000010),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_INTENT_FILTERS",        0x00000020),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_SIGNATURES",            0x00000040),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_META_DATA",             0x00000080),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_GIDS",                  0x00000100),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_SHARED_LIBRARY_FILES",  0x00000400),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_PERMISSIONS",           0x00001000),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_CONFIGURATIONS",        0x00004000),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_SIGNING_CERTIFICATES",  0x08000000),
 
     KLJ_FSTR("android/content/Intent", "ACTION_MAIN", "android.intent.action.MAIN"),
     // VRChat watches the battery. ACTION_BATTERY_CHANGED is a STICKY broadcast,
@@ -1554,6 +1676,34 @@ static const klj_field g_fields[] = {
 
     KLJ_FSTR("android/os/Environment", "MEDIA_MOUNTED", "mounted"),
     KLJ_FFN("android/net/Uri", "EMPTY", "Landroid/net/Uri;", klj_Uri_EMPTY),
+    KLJ_FINT("android/content/res/Configuration", "colorMode", 0),
+    KLJ_FINT("android/content/res/Configuration", "densityDpi",   320),
+    KLJ_FFLT("android/content/res/Configuration", "fontScale",    1.0),
+    KLJ_FINT("android/content/res/Configuration", "orientation",  2),   // ORIENTATION_LANDSCAPE
+    KLJ_FINT("android/content/res/Configuration", "keyboard",            1),   // KEYBOARD_NOKEYS
+    // The Configuration.KEYBOARD_* constants ZIX reads to compare against
+    // `keyboard` above (is a hardware keyboard attached? — no).
+    KLJ_FINT("android/content/res/Configuration", "KEYBOARD_UNDEFINED",  0),
+    KLJ_FINT("android/content/res/Configuration", "KEYBOARD_NOKEYS",     1),
+    KLJ_FINT("android/content/res/Configuration", "KEYBOARD_QWERTY",     2),
+    KLJ_FINT("android/content/res/Configuration", "KEYBOARD_12KEY",      3),
+    KLJ_FINT("android/content/res/Configuration", "HARDKEYBOARDHIDDEN_UNDEFINED", 0),
+    KLJ_FINT("android/content/res/Configuration", "HARDKEYBOARDHIDDEN_NO",        1),
+    KLJ_FINT("android/content/res/Configuration", "HARDKEYBOARDHIDDEN_YES",       2),
+    KLJ_FINT("android/content/res/Configuration", "hardKeyboardHidden",           2),  // YES (no hw kbd)
+    KLJ_FINT("android/content/res/Configuration", "keyboardHidden",      1),   // KEYBOARDHIDDEN_NO
+    KLJ_FINT("android/content/res/Configuration", "hardKeyboardHidden",  2),   // HARDKEYBOARDHIDDEN_YES
+    KLJ_FINT("android/content/res/Configuration", "navigation",          1),   // NAVIGATION_NONAV
+    KLJ_FINT("android/content/res/Configuration", "navigationHidden",    1),   // NAVIGATIONHIDDEN_NO
+    KLJ_FINT("android/content/res/Configuration", "touchscreen",         1),   // TOUCHSCREEN_NOTOUCH
+    KLJ_FINT("android/content/res/Configuration", "screenLayout",        2),   // SCREENLAYOUT_SIZE_NORMAL
+    KLJ_FINT("android/content/res/Configuration", "uiMode",              1),   // UI_MODE_TYPE_NORMAL
+    KLJ_FINT("android/content/res/Configuration", "mcc",                 0),
+    KLJ_FINT("android/content/res/Configuration", "mnc",                 0),
+    KLJ_FINT("android/content/res/Configuration", "seq",                 0),
+    KLJ_FINT("android/content/res/Configuration", "smallestScreenWidthDp", 600),
+    KLJ_FINT("android/content/res/Configuration", "screenWidthDp",       1024),
+    KLJ_FINT("android/content/res/Configuration", "screenHeightDp",      768),
 
     // ApplicationInfo is read field-by-field, and these depend on runtime
     // configuration rather than being compile-time constants.
@@ -1564,6 +1714,11 @@ static const klj_field g_fields[] = {
     KLJ_FFN("android/content/pm/ApplicationInfo", "splitSourceDirs",       "[Ljava/lang/String;", klj_appinfo_splitSourceDirs),
     KLJ_FFN("android/content/pm/ApplicationInfo", "splitPublicSourceDirs", "[Ljava/lang/String;", klj_appinfo_splitSourceDirs),
     KLJ_FINT("android/content/pm/ApplicationInfo", "flags", 0),
+    // Declared SDK bounds, read field-by-field like the rest of ApplicationInfo.
+    // The OS already enforced minSdk at install, so these are informational; the
+    // real values come from the guest's apktool.yml (e.g. 32 / 34).
+    KLJ_FINT("android/content/pm/ApplicationInfo", "minSdkVersion", 32),
+    KLJ_FINT("android/content/pm/ApplicationInfo", "targetSdkVersion", 34),
 
     // android.hardware.Sensor's type constants. Android's own numbers, from the
     // platform API — nothing here is chosen, and they are only meaningful as
@@ -1603,6 +1758,8 @@ static const klj_field g_fields[] = {
     // guest looks itself up. See klj_guest_package.
     KLJ_FFN("android/content/pm/PackageInfo", "packageName", "Ljava/lang/String;",
             klj_PackageInfo_packageName),
+    KLJ_FFN("android/content/pm/PackageInfo", "reqFeatures",
+            "[Landroid/content/pm/FeatureInfo;", klj_PackageInfo_reqFeatures),
 
     // Unity's own static handle on the Activity. Must be the *same* object the
     // Context was, not another instance of the class — Unity passes one to native
@@ -1848,6 +2005,8 @@ const klj_binding *const klj_binding_tables[] = {
     klj_bind_prefs,
     klj_bind_sdl,
     klj_bind_ue4,
+    klj_bind_electra,
+    klj_bind_fmod,
     klj_bind_jkxr,
     NULL,
 };

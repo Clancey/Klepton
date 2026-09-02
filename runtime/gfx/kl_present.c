@@ -4,19 +4,31 @@
 // transition exactly once.
 #include <stdio.h>
 #include "kl_present.h"
+#include "kl_env.h"
 
 static int      g_have_window;
 static int      g_win_w, g_win_h;
 static int      g_have_eyes;
+static int      g_have_xr_layer;
 static unsigned g_generation;
 static kl_present_mode g_mode = KL_PRESENT_NONE;
 
 // The whole policy, in one place. Stereo beats mono because it is the more
 // specific fact: every Android guest creates a window surface, including Unity,
-// so "has a window" cannot distinguish the two on its own — but "has eye
-// textures" can.
+// so "has a window" cannot distinguish the two on its own — but an eye pair OR an
+// XR composition layer can: both are the guest presenting through the compositor.
+// (Xash's VR menus sit on a quad layer with no eye textures yet — the layer is
+// what marks them immersive while in the menu.)
 static kl_present_mode derive(void) {
-    if (g_have_eyes)   return KL_PRESENT_STEREO;
+    // KL_PRESENT_MONO=1 forces the 2D flat shell even for a guest that also set
+    // up eyes / an XR layer. A Source-VR port (portal) renders its MENU in mono to
+    // the guest window (captured by kl_glfb_present on eglSwapBuffers) while it
+    // submits EMPTY OpenXR eye/projection layers — so the auto policy shows the
+    // empty immersive view and the mono menu is never seen. This override surfaces
+    // the guest's flat picture (the menu) so it can be read and navigated; drop it
+    // once the guest actually renders stereo content (in a map).
+    if (g_have_window && kl_env_on("KL_PRESENT_MONO", 0)) return KL_PRESENT_MONO;
+    if (g_have_eyes || g_have_xr_layer) return KL_PRESENT_STEREO;
     if (g_have_window) return KL_PRESENT_MONO;
     return KL_PRESENT_NONE;
 }
@@ -47,6 +59,11 @@ void kl_present_note_window_surface(int w, int h) {
 
 void kl_present_note_eye_texture(void) {
     g_have_eyes = 1;
+    settle();
+}
+
+void kl_present_note_xr_layer(void) {
+    g_have_xr_layer = 1;
     settle();
 }
 

@@ -67,6 +67,9 @@ void kl_driver_set_alarm(unsigned seconds);
 //
 // Returns 0, or non-zero with kl_driver_error() set. `out` may be NULL.
 int kl_driver_boot(FILE *out);
+
+// The active target's short name (targets.py key), or NULL before init.
+const char *kl_driver_target_name(void);
 int kl_driver_gap_only(void);
 
 // Start the guest running: the Unity lifecycle natives (nativeRecreateGfxState,

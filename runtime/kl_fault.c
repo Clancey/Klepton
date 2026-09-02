@@ -120,10 +120,56 @@ static int klf_readable(const void *p, size_t n) {
 
 // This has to survive being called in a broken process, so it uses write(2)
 // rather than stdio and does not attempt a symbolised backtrace.
+static volatile unsigned long g_x18_recoveries;
+
 static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // Our own handler, so this is a Darwin ucontext_t and reading it is safe.
     // The layout mismatch only bites the GUEST's handlers.
     ucontext_t *uc = uctx;
+
+    // ---- x18-veneer race recovery (see kl_x18.c, KLX_HZ_TERMBR) ----------
+    // Darwin's kernel zeroes x18 on every exception return — x18 is the reserved
+    // platform register. The `br x18` veneer holds its target in x18 across two
+    // one-instruction windows:
+    //
+    //      mrs x18, tpidrro_el0        <-- window 1: a zero here makes the ldr
+    //      ldr x18, [x18, #slot*8]         dereference 0 -> fault at slot*8
+    //      br  x18                     <-- window 2: a zero here branches to 0
+    //
+    // Both are unclosable in pure code (a64 has no memory-indirect branch), but
+    // both are RECOVERABLE: the TSD slot still holds the guest's intended x18,
+    // which is the branch target, so we recompute it and resume the guest there.
+    // Window 1 is unambiguous — nothing but this veneer ever faults at exactly
+    // slot*8. Window 2 (fault at 0, pc 0) is guarded by requiring the recovered
+    // target to resolve into a mapped guest image, so an ordinary null call is
+    // not silently redirected.
+    if (uc && (sig == SIGSEGV || sig == SIGBUS)) {
+        uintptr_t fa = si ? (uintptr_t)si->si_addr : (uintptr_t)-1;
+        uintptr_t fpc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+        int win1 = (fa == (uintptr_t)KLX_TSD_SLOT * 8);
+        int win2 = (fa == 0 && fpc == 0);
+        if (win1 || win2) {
+            void *target = pthread_getspecific(KLX_TSD_SLOT);
+            size_t toff = 0;
+            int target_is_guest = target && kl_addr_image(target, &toff) != NULL;
+            // window 1 is self-identifying; window 2 must land in guest code.
+            if (target && (win1 || target_is_guest)) {
+                uc->uc_mcontext->__ss.__pc    = (uint64_t)(uintptr_t)target;
+                uc->uc_mcontext->__ss.__x[18] = (uint64_t)(uintptr_t)target;
+                unsigned long n = ++g_x18_recoveries;
+                if (n <= 8 || n % 1000 == 0) {
+                    char rb[192];
+                    int rn = snprintf(rb, sizeof rb,
+                        "[x18] recovered veneer race (window %d) -> resumed guest at "
+                        "%p [%s] (recovery #%lu)\n",
+                        win1 ? 1 : 2, target,
+                        target_is_guest ? kl_addr_image(target, &toff) : "?", n);
+                    if (rn > 0) klf_emit(rb, (size_t)rn);
+                }
+                return;   // resume the guest at the real jump-table target
+            }
+        }
+    }
     // Before anything else can fail: a report that is written only after the
     // interesting work has succeeded is missing exactly when it is needed.
     if (g_crash_path[0] && g_crash_fd < 0)
@@ -239,6 +285,28 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                          (unsigned long long)(uintptr_t)
                              pthread_getspecific(KLX_TSD_SLOT),
                          KLX_TSD_SLOT);
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+    }
+
+    // The x18-veneer TSD read: `ldr x18, [x18, #KLX_TSD_SLOT*8]` after
+    // `mrs x18, tpidrro_el0`. A fault whose address is exactly that offset means
+    // the veneer's mrs produced a zero base — the thread pointer was 0 when the
+    // veneer ran, even though pthread_getspecific works here now. Read the live
+    // tpidrro_el0 in the handler so a transient-zero can be told from a thread
+    // that genuinely has no thread pointer, which is the open question on the
+    // Liminal animation-worker crash.
+    if ((sig == SIGSEGV || sig == SIGBUS) && si &&
+        (uintptr_t)si->si_addr == (uintptr_t)KLX_TSD_SLOT * 8) {
+        uint64_t tp_now = 0;
+        __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp_now));
+        int m = snprintf(buf, sizeof buf,
+                         "    [x18] veneer TSD read faulted at slot %d (off 0x%x): "
+                         "the mrs saw tpidrro_el0=0; live tpidrro_el0 now = 0x%llx "
+                         "(%s)\n",
+                         KLX_TSD_SLOT, (unsigned)KLX_TSD_SLOT * 8,
+                         (unsigned long long)tp_now,
+                         tp_now ? "valid now -> transient/racy zero during the veneer"
+                                : "still zero -> this thread has no thread pointer");
         if (m > 0) { klf_emit(buf, (size_t)m); }
     }
 

@@ -143,20 +143,38 @@ static klj_val klj_Activity_getWindow(void *env, void *self, const klj_val *a, i
 // setRequestedOrientation is recorded, not applied — there is no window manager
 // to rotate anything. It is worth naming in the log because it says which way
 // round the engine believes the screen is, which is the first thing to check if
-// the render target ever comes out transposed.
+// the render target ever comes out transposed. The value is kept so
+// getRequestedOrientation can hand it back, which is what the engine expects of
+// the pair. Default LANDSCAPE (0): this is a headset title and the render target
+// is landscape; a concrete answer avoids the "is it transposed?" ambiguity that
+// UNSPECIFIED (-1) would leave, and matches what a VR app's manifest declares.
+static const char *const kl_orientation_names[] = {
+    "LANDSCAPE", "PORTRAIT", "USER", "BEHIND", "SENSOR", "NOSENSOR",
+    "SENSOR_LANDSCAPE", "SENSOR_PORTRAIT", "REVERSE_LANDSCAPE",
+    "REVERSE_PORTRAIT", "FULL_SENSOR", "USER_LANDSCAPE", "USER_PORTRAIT",
+    "FULL_USER", "LOCKED",
+};
+static int32_t g_requested_orientation = 0;   // SCREEN_ORIENTATION_LANDSCAPE (racy int, benign)
+static const char *kl_orientation_name(int32_t o) {
+    return (o >= 0 && o < (int32_t)(sizeof kl_orientation_names / sizeof kl_orientation_names[0]))
+           ? kl_orientation_names[o] : (o == -1 ? "UNSPECIFIED" : "?");
+}
 static klj_val klj_Activity_setRequestedOrientation(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
-    static const char *names[] = {
-        "LANDSCAPE", "PORTRAIT", "USER", "BEHIND", "SENSOR", "NOSENSOR",
-        "SENSOR_LANDSCAPE", "SENSOR_PORTRAIT", "REVERSE_LANDSCAPE",
-        "REVERSE_PORTRAIT", "FULL_SENSOR", "USER_LANDSCAPE", "USER_PORTRAIT",
-        "FULL_USER", "LOCKED",
-    };
     int32_t o = n > 0 ? (int32_t)a[0].j : -1;
-    const char *name = (o >= 0 && o < (int32_t)(sizeof names / sizeof names[0]))
-                       ? names[o] : (o == -1 ? "UNSPECIFIED" : "?");
-    KLJ_LOG("Activity.setRequestedOrientation(%d /* %s */) — recorded, not applied", o, name);
+    g_requested_orientation = o;
+    KLJ_LOG("Activity.setRequestedOrientation(%d /* %s */) — recorded, not applied",
+            o, kl_orientation_name(o));
     return (klj_val){0};
+}
+
+// ...and the read side. Unimplemented, this fatally aborts klj_call_common (batman:
+// Unity calls it during startup via CallIntMethodV). Hand back the recorded value.
+static klj_val klj_Activity_getRequestedOrientation(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    int32_t o = g_requested_orientation;
+    KLJ_LOG("Activity.getRequestedOrientation() -> %d /* %s */", o, kl_orientation_name(o));
+    return (klj_val){.j = (uint64_t)(int64_t)o};
 }
 
 // ---- odds and ends the same batch reached for ----
@@ -231,6 +249,22 @@ static klj_val klj_System_load(void *env, void *self, const klj_val *a, int n) {
     KLJ_LOG("System.load(\"%s\") -> %s", path, h ? "loaded" : "failed");
     klj_run_jni_onload(h, path);
     return (klj_val){.j = 0};
+}
+
+// Epic Online Services' own loader: com.epicgames.mobile.eossdk.LibraryLoader
+// .load() is a no-arg System.loadLibrary("EOSSDK") wrapper (ZIX ships
+// libEOSSDK.so). It aborted as an unimplemented Java method; route it through
+// the same guest dlopen so the SDK's JNI_OnLoad runs and its natives register.
+// EOS is online/account services — it initialises fine with no backend and the
+// game boots offline, the same shape as the Oculus/Ubisoft platform SDKs.
+static klj_val klj_EOS_LibraryLoader_load(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/libEOSSDK.so", g_native_lib_dir);
+    void *h = klb_dlopen(path, 0x00002 /* RTLD_NOW */);
+    KLJ_LOG("eossdk LibraryLoader.load() -> %s", h ? "loaded" : "failed");
+    klj_run_jni_onload(h, "EOSSDK");
+    return (klj_val){.l = NULL};
 }
 
 // The output devices AudioManager knows about. Answered as an empty array, which
@@ -365,6 +399,28 @@ static klj_val klj_void_noop(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.j = 0};
 }
 
+// A constructor whose only contract is "hand back a live object of my class."
+// NewObject returns exactly what <init> returns — there is no separate object
+// allocation — so a ctor wired to klj_void_noop yields a NULL reference, and a
+// guest that actually *uses* the constructed object (ZIX's C# Meta Horizon
+// platform wrapper does) NPEs the instant it touches it ("Object reference not
+// set to an instance of an object" -> "Oculus not initialized"). Return a real
+// synthetic object instead; the object is inert, which is all an offline
+// platform stand-in needs.
+static klj_val klj_ctor_object(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object(klj_class_name(self))};
+}
+static klj_val klj_horizon_zero_i(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};   // no queued platform messages
+}
+static klj_val klj_horizon_session_id(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0x484F52495A4F4Ell};   // a fixed, non-zero synthetic session id
+}
+
+
 // The engine calls the JAVA wrapper UnityPlayer.hidePreservedContent()V; on
 // Android it is a one-line forward to the registered native
 // nativeHidePreservedContent, which the guest DID register (RegisterNatives
@@ -372,6 +428,20 @@ static klj_val klj_void_noop(void *env, void *self, const klj_val *a, int n) {
 // is to call that native, not silence — hiding the preserved frame is the
 // guest's decision and it has an implementation for exactly this. If the guest
 // never registered it, silence (nothing is preserved to hide anyway).
+static klj_val klj_UnityPlayer_executeMainThreadJobs(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // Unity's render path calls this Java method each frame to run the jobs
+    // posted to the main thread. runOnUiThread / Handler.post land in our UI
+    // task queue (kl_jni_looper.c), so this is where they run once the visionOS
+    // app is pumping frames through kl_driver_frame — the driver's own
+    // between-lifecycle drain does not fire in the steady loop. Without it, the
+    // guest's GetMethodID+call fataled ("no host implementation") on the first
+    // guest frame, which read as a GPU abort because it had no GL to show.
+    kl_jni_drain_ui_tasks();
+    return (klj_val){.j = 0};
+}
+
 static klj_val klj_UnityPlayer_hidePreservedContent(void *env, void *self,
                                                     const klj_val *a, int n) {
     (void)a; (void)n;
@@ -396,6 +466,7 @@ const klj_binding klj_bind_net[] = {
     {"java/security/cert/Certificate", "getEncoded", "()[B", klj_X509Cert_getEncoded},
     {"android/app/Activity",   "getWindow", "()Landroid/view/Window;",     klj_Activity_getWindow},
     {"android/app/Activity",   "setRequestedOrientation", "(I)V", klj_Activity_setRequestedOrientation},
+    {"android/app/Activity",   "getRequestedOrientation", "()I", klj_Activity_getRequestedOrientation},
     {"android/view/Window",  "getAttributes",
      "()Landroid/view/WindowManager$LayoutParams;", klj_Window_getAttributes},
     // getResources is declared on Context and reached through the theme wrapper
@@ -405,7 +476,42 @@ const klj_binding klj_bind_net[] = {
     {"android/content/Context", "getResources",
      "()Landroid/content/res/Resources;", klj_Context_getResources},
     {"java/lang/System", "load", "(Ljava/lang/String;)V", klj_System_load},
+    {"com/epicgames/mobile/eossdk/LibraryLoader", "load", "()V", klj_EOS_LibraryLoader_load},
+    // EOSSDK.init(activity) — EOS bring-up after the loader ran. Online/account
+    // services; a no-op lets the game boot offline (the platform SDKs are all
+    // treated this way). If EOS features are used, the next call names them.
+    {"com/epicgames/mobile/eossdk/EOSSDK", "init",
+     "(Landroid/app/Activity;)V", klj_void_noop},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "init",
+     "(Lcom/unity3d/player/UnityPlayerActivity;)V", klj_void_noop},
+    // Meta Horizon platform client config ctor (ZIX). Meta platform SDK, like
+    // the Oculus platform — construct the object (NewObject makes it) and let
+    // the ctor be a no-op; the game boots without Horizon platform services.
+    {"horizonos/supplement/hzplatformclientcore/AndroidHorizonPlatformConfig", "<init>",
+     "(Landroid/app/Activity;Ljava/lang/String;)V", klj_ctor_object},
+    {"horizonos/supplement/hzplatformclientcore/AndroidHorizonPlatformConfig", "<init>",
+     "(Lcom/unity3d/player/UnityPlayerActivity;Ljava/lang/String;)V", klj_ctor_object},
+    // Core.setup(config): the Horizon platform client is handed its config and
+    // asked to come up. We have no Horizon OS services behind it, so this is a
+    // no-op; the synthetic user/entitlement path answers the questions the guest
+    // asks next.
+    {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "setup",
+     "(Lhorizonos/supplement/hzplatformclientcore/AndroidHorizonPlatformConfig;)V", klj_void_noop},
+    // getGlobalSessionId(): a non-zero id is "a session exists"; the value is
+    // opaque to the guest, which only checks it is set.
+    {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "getGlobalSessionId",
+     "()J", klj_horizon_session_id},
+    // makeSession(...): returns a session handle (long). Same synthetic non-zero
+    // id — the guest treats it as an opaque "session exists" token.
+    {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "makeSession",
+     "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;I)J", klj_horizon_session_id},
+    {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "makeRequest",
+     "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;I)J", klj_horizon_session_id},
+    {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "getMessageCount",
+     "(J)I", klj_horizon_zero_i},
     {"com/unity3d/player/UnityPlayer", "hidePreservedContent", "()V", klj_UnityPlayer_hidePreservedContent},
+    {"com/unity3d/player/UnityPlayer", "executeMainThreadJobs", "()V", klj_UnityPlayer_executeMainThreadJobs},
+    {"com/unity3d/player/UnityPlayer", "applyWindowUIChanges", "(Z)V", klj_void_noop},
     {"android/content/Context", "getContentResolver", "()Landroid/content/ContentResolver;", klj_Context_getContentResolver},
     {"android/provider/Settings$Secure", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
     {"android/media/AudioManager", "getDevices", "(I)[Landroid/media/AudioDeviceInfo;", klj_AudioManager_getDevices},

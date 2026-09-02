@@ -43,6 +43,7 @@ void kl_jni_set_permissive(int on);
 
 // Natives the guest registered, by (class, name, signature). NULL if absent.
 void *kl_jni_native(const char *cls, const char *name, const char *sig);
+const char *kl_jni_native_sig(const char *cls, const char *name);
 
 // Deliver Android's low-memory notification — UnityPlayer.nativeLowMemory,
 // which is where a title runs Resources.UnloadUnusedAssets(). The declaring
@@ -54,6 +55,10 @@ int kl_jni_low_memory(void);
 // guest holds must come from here — they carry a type tag, which is what lets
 // GetObjectClass answer truthfully instead of guessing.
 void *kl_jni_new_object(const char *class_name);
+
+// Pin a host-made object against local-frame retirement (the C NewGlobalRef).
+// Use for objects the host caches and hands back more than once.
+void kl_jni_pin_object(void *obj);
 
 // The rest of UnityPlayer's constructor, for a driver that has just run initJni.
 //
@@ -168,6 +173,17 @@ const char *kl_jni_files_dir(void);
 void kl_jni_locale_parts(char *lang, size_t lang_sz, char *country, size_t country_sz);
 // The APK, which Unity opens as a zip via getPackageCodePath(). Default "beatsaber.apk".
 void kl_jni_set_apk_path(const char *path);
+
+// The OBB directory RELATIVE to the files dir, from the ACTIVE target's `obb`
+// field — "obb" for a Unity guest, "Android/obb/<package>" for an Unreal one.
+// Set explicitly because kl_jni must not re-derive it: the only other way to
+// know is kl_target_resolve(KL_TARGET), and KL_TARGET is a host shell variable
+// that is UNSET on device, so that path silently returned the default target's
+// "obb" for every guest — which told an Unreal engine its OBB was at <files>/obb
+// while staging had put it under Android/obb/<package>, and the engine then
+// found no paks (Asgard's Wrath 2 sat on "compiling shaders 0/N" forever). NULL
+// or unset keeps the old resolve-from-env behaviour as a fallback.
+void kl_jni_set_obb_rel(const char *rel);
 // ...and what it resolved to, absolute. This is `getPackageResourcePath()` — the
 // same string, under the other of Android's two names for it — and a UE4 guest
 // is handed it directly rather than asking for it, so a driver acting out
@@ -286,4 +302,5 @@ const char *kl_jni_build_string(const char *field);
 // place Build.VERSION.SDK_INT does.
 int kl_jni_build_int(const char *field, int dflt);
 
+void kl_jni_mark_ui_thread(void);
 #endif

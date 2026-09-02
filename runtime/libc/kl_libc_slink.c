@@ -49,6 +49,7 @@ ssize_t kl_shim_read(int fd, void *buf, size_t n);  // kl_shim.c
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
 void  kl_fatal_prepare(void);
 
+#include "../guest/kl_obbmap.h"
 #define GUEST_PATH(p) char _kp[1024]; const char *_p = kl_guest_path((p), _kp, sizeof _kp)
 
 // ---------------------------------------------------------------- getauxval
@@ -401,7 +402,37 @@ int klb_epoll_wait(int epfd, void *events, int maxevents, int timeout_ms) {
 // and openat without it is the same bug that made every guest anonymous mmap a
 // file mapping of fd -1.
 int klb_openat(int dirfd, const char *path, int flags, int mode) {
+    // Xash's con_logfile / -log open their .log with a RELATIVE name against a
+    // non-writable CWD, losing the whole server console. Rebase a .log WRITE to the
+    // writable basedir so kl_xash_tail_enginelog can stream it (mirrors klh_open /
+    // klb_fopen). 3 = O_ACCMODE in the guest's Linux numbering; nonzero = write.
+    {
+        const char *xbase = getenv("XASH3D_BASEDIR");
+        if (xbase && *xbase && path && (flags & 3) != 0) {
+            size_t n = strlen(path);
+            if (n >= 4 && !strcmp(path + n - 4, ".log")) {
+                const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+                char rp[1100];
+                snprintf(rp, sizeof rp, "%s/%s", xbase, bn);
+                int lfd = openat(AT_FDCWD, rp, kl_open_flags(flags), (mode_t)mode);
+                if (lfd >= 0) {
+                    static int said;
+                    if (!said++) fprintf(stderr, "  [xash] log openat %s -> %s\n", path, rp);
+                    kl_fs_trace_open(rp, flags, lfd);
+                    return lfd;
+                }
+            }
+        }
+    }
     GUEST_PATH(path);
+    // A UE4 guest asks for its paks by their loose name; the bytes live,
+    // uncompressed, inside an OBB. Serve the read straight from the archive —
+    // the returned fd is a real OBB fd whose reads this file's read/pread/
+    // lseek/close hooks translate into the pak's byte window. Only for a plain
+    // dirfd (AT_FDCWD or an absolute path); a genuinely relative openat is not
+    // one of ours. No-op for every other guest (empty index).
+    int vfd = kl_obbmap_open(_p, kl_open_flags(flags));
+    if (vfd >= 0) { kl_fs_trace_open(_p, flags, vfd); return vfd; }
     int fd = openat(dirfd, _p, kl_open_flags(flags), (mode_t)mode);
     kl_fs_trace_open(_p, flags, fd);
     return fd;
@@ -412,6 +443,8 @@ int klb_openat(int dirfd, const char *path, int flags, int mode) {
 // something to handle.
 int klb___open_2(const char *path, int flags) {
     GUEST_PATH(path);
+    int vfd = kl_obbmap_open(_p, kl_open_flags(flags));
+    if (vfd >= 0) { kl_fs_trace_open(_p, flags, vfd); return vfd; }
     int fd = open(_p, kl_open_flags(flags));
     // Traced here for the same reason the plain open() is: KL_TRACE_FS is the
     // instrument every "which file did it want?" question runs through, and a
@@ -446,7 +479,11 @@ void *klb___memmove_chk(void *d, const void *s, size_t n, size_t cap) {
     return memmove(d, s, n);
 }
 char *klb___strncpy_chk(char *d, const char *s, size_t n, size_t cap) {
-    if (n > cap) chk_fail("__strncpy_chk", n, cap);
+    if (n > cap) {
+        fprintf(stderr, "[klepton] __strncpy_chk overflow: n=%zu cap=%zu "
+                        "src=\"%.200s\"\n", n, cap, s ? s : "(null)");
+        chk_fail("__strncpy_chk", n, cap);
+    }
     return strncpy(d, s, n);
 }
 // The two-size form additionally knows the source's declared length, which it
@@ -458,7 +495,11 @@ char *klb___strncpy_chk2(char *d, const char *s, size_t n, size_t dcap, size_t s
 }
 char *klb___strcat_chk(char *d, const char *s, size_t cap) {
     size_t n = strlen(d) + strlen(s) + 1;
-    if (n > cap) chk_fail("__strcat_chk", n, cap);
+    if (n > cap) {
+        fprintf(stderr, "[klepton] __strcat_chk overflow: dest(%zu)=\"%.200s\" "
+                        "src(%zu)=\"%.200s\"\n", strlen(d), d, strlen(s), s);
+        chk_fail("__strcat_chk", n, cap);
+    }
     return strcat(d, s);
 }
 // The FORTIFY form goes through the same completion the plain one does — see
@@ -496,6 +537,8 @@ ssize_t klb___read_chk(int fd, void *buf, size_t n, size_t cap) {
 // arc), and a headless run of the same build is clean. So it is a race that the
 // viewer's extra threads and signals make likely, and it is not this.
 static ssize_t klb_pread_full(int fd, void *buf, size_t n, off_t off) {
+    int handled; ssize_t vr = kl_obbmap_pread(fd, buf, n, off, &handled);
+    if (handled) return vr;   // an OBB read-through fd — served from the archive
     size_t done = 0;
     while (done < n) {
         ssize_t r = pread(fd, (char *)buf + done, n - done, off + (off_t)done);
@@ -509,6 +552,14 @@ static ssize_t klb_pread_full(int fd, void *buf, size_t n, off_t off) {
 
 ssize_t klb_pread64(int fd, void *buf, size_t n, off_t off) {
     return klb_pread_full(fd, buf, n, off);
+}
+
+// pwrite64 — the write twin of pread64. Darwin's pwrite is already 64-bit, so
+// this is a straight forward; a guest built without FORTIFY reaches it by this
+// bare name (UE4/libUE4 does). Short writes are the caller's to handle, exactly
+// as __pwrite64_chk leaves them.
+ssize_t klb_pwrite64(int fd, const void *buf, size_t n, off_t off) {
+    return pwrite(fd, buf, n, off);
 }
 
 ssize_t klb___pread64_chk(int fd, void *buf, size_t n, off_t off, size_t cap) {
@@ -552,6 +603,19 @@ int klb___vsprintf_chk(char *d, int flags, size_t cap, const char *fmt, kl_va *v
     int n = vsnprintf(d, cap == (size_t)-1 ? (size_t)INT32_MAX : cap, fmt, (va_list)_m);
     if (cap != (size_t)-1 && n >= 0 && (size_t)n >= cap) chk_fail("__vsprintf_chk", (size_t)n + 1, cap);
     return n;
+}
+
+// __snprintf_chk(dst, n, flags, cap, fmt, ...) — snprintf with a FORTIFY object
+// size. The va_list is handed in by the asm thunk (kl_va_thunks.S) just like
+// __vsprintf_chk. `n` is the caller's requested bound and `cap` is the compiler's
+// object size; bionic aborts when the caller asks to write more than the object
+// holds (n > cap). The actual write is still bounded by n, as snprintf's is.
+int klb___snprintf_chk(char *d, size_t n, int flags, size_t cap, const char *fmt, kl_va *va) {
+    (void)flags;
+    if (cap != (size_t)-1 && n > cap) chk_fail("__snprintf_chk", n, cap);
+    char _m[512] __attribute__((aligned(16)));
+    if (kl_va_marshal(fmt, va, _m, sizeof _m, KL_VA_PRINTF) == (size_t)-1) return -1;
+    return vsnprintf(d, n, fmt, (va_list)_m);
 }
 
 // ---------------------------------------------------------------- odds and ends

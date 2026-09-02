@@ -64,11 +64,27 @@ static int           g_vr_loaded;
 static volatile int  g_guest_quit;
 
 const char *kl_app_target_name(void) { return g_target ? g_target->name : "(unconfigured)"; }
+// See kl_app.h: the target name even before configure sets g_target, so the
+// launcher UI knows which game it is on the first render. Same source configure
+// uses (KL_TARGET override, else the compile-time default).
+const char *kl_app_target_name_or_default(void) {
+    return g_target ? g_target->name : kl_env_str("KL_TARGET", KL_TARGET_DEFAULT);
+}
 int kl_app_target_is_steamlink(void) {
     return g_target && g_target->kind == KL_GUEST_STEAMLINK;
 }
 static int target_is_jkxr(void) {
     return g_target && g_target->kind == KL_GUEST_JKXR;
+}
+int kl_app_target_wants_full(void) {
+    // In-world VR titles render their MENU as a full stereo scene too, so .mixed
+    // leaves it a flat window floating in passthrough (a jagged quad) until gameplay
+    // starts. Default those to .full immersion from boot: the native OpenXR kind
+    // (vicecity) and the folder-fed launcher games — hl1 (GLES3JNI) and
+    // cs1/hl2/portal (SDL2). KL_FULL=0 forces .mixed back for development.
+    return g_target && (g_target->kind == KL_GUEST_NATIVE ||
+                        g_target->kind == KL_GUEST_GLES3JNI ||
+                        g_target->kind == KL_GUEST_SDL2);
 }
 int kl_app_target_owns_frame_loop(void) {
     return g_target ? kl_driver_owns_frame_loop() : 0;
@@ -81,6 +97,7 @@ static char g_apk[1024];
 static char g_dylibs[1024];
 static char g_log[1024];
 static char g_status[512] = "not configured";
+const char *kl_app_assets_dir(void) { return g_assets[0] ? g_assets : NULL; }
 
 // Where the run has got to, for the heartbeat below; the driver reports its own
 // phases through it.
@@ -168,8 +185,21 @@ int kl_app_configure(const char *resources, const char *container) {
     // against the mmap loader the translations replace.
     if (!have_translations() && !have(g_libdir))
         return missing("guest libraries (neither translations nor an ELF tree)", g_libdir);
-    if (!have(g_assets)) return missing("staged assets (run stage_assets.sh)", g_assets);
-    if (!have(g_apk))    return missing("staged APK (run stage_assets.sh)", g_apk);
+    // Assets and the APK are required only for an engine that reads its data out
+    // of the APK's assets/ tree (Unity, UE4, JKXR, …). The FOLDER-FED guests carry
+    // no assets/ and no .apk: a plain NativeActivity port (vicecity), and the
+    // Xash/Source launcher titles (hl1 = GLES3JNI, cs1/hl2/portal = SDL2) whose
+    // whole data set is the game folder the PLAYER supplies through the launcher —
+    // there is nothing to stage, so the guard would wrongly refuse to boot. The
+    // path strings above are still set (harmless — those guests never resolve an
+    // APK/asset path); only the existence check is skipped.
+    int folder_fed = g_target->kind == KL_GUEST_NATIVE   ||
+                     g_target->kind == KL_GUEST_GLES3JNI ||
+                     g_target->kind == KL_GUEST_SDL2;
+    if (!folder_fed && !have(g_assets))
+        return missing("staged assets (run stage_assets.sh)", g_assets);
+    if (!folder_fed && !have(g_apk))
+        return missing("staged APK (run stage_assets.sh)", g_apk);
     mkdir(g_files, 0755);
 
     if (kl_app_target_is_steamlink()) {
@@ -232,6 +262,11 @@ int kl_app_configure(const char *resources, const char *container) {
         kl_jni_set_assets_dir(g_assets);
         kl_jni_set_apk_path(g_apk);
         kl_jni_set_files_dir(g_files);
+        // The OBB layout is per-target and kl_jni must be TOLD it: on device
+        // KL_TARGET is unset, so kl_jni's own fallback resolves the default
+        // guest and hands a UE4 title the wrong OBB directory. g_target is the
+        // real one this app was built for.
+        kl_jni_set_obb_rel(g_target->obb);
         // ...and HOME, for a guest that is a UNIX PORT wearing an Android
         // manifest rather than an Android app. OpenJK derives fs_homepath from
         // $HOME and then walks it with mkdir -p (FS_CreatePath), which is fatal

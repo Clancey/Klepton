@@ -320,6 +320,79 @@ static void probe_xr_display(unsigned frame) {
             oo ? (*(uint8_t *)il.object_unbox(oo) ? "1" : "0") : "?");
 }
 
+// ---------------------------------------------------------------------------
+// KL_PROBE_RESOLVE=0xoff[,0xoff...]: name the managed method CONTAINING each
+// given libil2cpp offset. The sampler reports parked pcs as libil2cpp+0x...;
+// on metadata v29 its own resolver cannot name them, but the RUNTIME can:
+// enumerate every image -> class -> method through the embedding API, read
+// each MethodInfo's methodPointer (its first field - stable across il2cpp
+// versions), and keep the nearest method at or below each target. One pass,
+// a few seconds, printed once.
+static void mprobe_resolve_offsets(void) {
+    const char *spec = kl_env_str("KL_PROBE_RESOLVE", NULL);
+    if (!spec || !*spec) return;
+    kl_image *img = kl_find_image("libil2cpp.so");
+    if (!img) return;
+    typedef const MethodInfo *(*get_methods_fn)(Il2CppClass *, void **);
+    typedef size_t (*class_count_fn)(const Il2CppImage *);
+    typedef Il2CppClass *(*get_class_fn)(const Il2CppImage *, size_t);
+    typedef const char *(*m_name_fn)(const MethodInfo *);
+    typedef const char *(*i_name_fn)(const Il2CppImage *);
+    get_methods_fn get_methods = (get_methods_fn)kl_sym(img, "il2cpp_class_get_methods");
+    class_count_fn class_count = (class_count_fn)kl_sym(img, "il2cpp_image_get_class_count");
+    get_class_fn   get_class   = (get_class_fn)kl_sym(img, "il2cpp_image_get_class");
+    m_name_fn      m_name      = (m_name_fn)kl_sym(img, "il2cpp_method_get_name");
+    i_name_fn      i_name      = (i_name_fn)kl_sym(img, "il2cpp_image_get_name");
+    if (!get_methods || !class_count || !get_class || !m_name) {
+        fprintf(stderr, "  [mprobe] resolve: enumeration exports missing\n");
+        return;
+    }
+    uintptr_t base = (uintptr_t)kl_base(img);
+    enum { MAXT = 8 };
+    uintptr_t tgt[MAXT]; int nt = 0;
+    for (const char *p = spec; *p && nt < MAXT; ) {
+        tgt[nt++] = base + (uintptr_t)strtoull(p, NULL, 16);
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+    }
+    struct { uintptr_t best; const MethodInfo *m; Il2CppClass *k; const Il2CppImage *im; } hit[MAXT];
+    memset(hit, 0, sizeof hit);
+    size_t na = 0;
+    const Il2CppAssembly **as = il.domain_get_assemblies(il.domain_get(), &na);
+    unsigned long long nmeth = 0;
+    for (size_t a = 0; a < na; a++) {
+        const Il2CppImage *im = il.assembly_get_image(as[a]);
+        if (!im) continue;
+        size_t nc = class_count(im);
+        for (size_t c = 0; c < nc; c++) {
+            Il2CppClass *k = get_class(im, c);
+            if (!k) continue;
+            void *iter = NULL;
+            const MethodInfo *m;
+            while ((m = get_methods(k, &iter)) != NULL) {
+                nmeth++;
+                uintptr_t p = *(uintptr_t *)m;   // MethodInfo.methodPointer
+                if (!p) continue;
+                for (int t = 0; t < nt; t++)
+                    if (p <= tgt[t] && p > hit[t].best) {
+                        hit[t].best = p; hit[t].m = m; hit[t].k = k; hit[t].im = im;
+                    }
+            }
+        }
+    }
+    fprintf(stderr, "  [mprobe] resolve: scanned %llu methods in %zu assemblies\n",
+            nmeth, na);
+    for (int t = 0; t < nt; t++) {
+        if (!hit[t].m) { fprintf(stderr, "  [mprobe] resolve %#llx: no method at or below\n",
+                                 (unsigned long long)(tgt[t] - base)); continue; }
+        fprintf(stderr, "  [mprobe] resolve libil2cpp+%#llx -> %s::%s (+%#llx, image %s)\n",
+                (unsigned long long)(tgt[t] - base),
+                il.class_get_name(hit[t].k), m_name(hit[t].m),
+                (unsigned long long)(tgt[t] - hit[t].best),
+                i_name && hit[t].im ? i_name(hit[t].im) : "?");
+    }
+}
+
 void kl_mprobe_tick(unsigned frame) {
     // Independent of KL_PROBE_INPUT and of KL_PROBE_FROM: this one has to land
     // BEFORE the throw it exists to describe, and the throw here is on the
@@ -328,6 +401,13 @@ void kl_mprobe_tick(unsigned frame) {
     if (!st_done && kl_env_str("KL_PROBE_STACKTRACE", NULL) && mprobe_init()) {
         st_done = 1;
         probe_stack_traces();
+    }
+    // pc->method naming, once, late enough that the game's assemblies are all
+    // loaded (frame 600 ~= ten seconds in).
+    static int rs_done;
+    if (!rs_done && frame >= 600 && kl_env_str("KL_PROBE_RESOLVE", NULL) && mprobe_init()) {
+        rs_done = 1;
+        mprobe_resolve_offsets();
     }
     // Also independent, and for the same reason: the disagreement it looks for
     // is settled long before KL_PROBE_FROM's default, and reading XRSettings
@@ -589,12 +669,20 @@ void kl_mprobe_tick(unsigned frame) {
 
     // 1. Does any of the fill survive into Input.GetAxis? This was the one
     //    unproven link in the chain from our ovrp state to the game's click.
-    fprintf(stderr, "  [mprobe f%u] axes:", frame);
-    for (unsigned i = 0; i < N_AXES; i++) {
-        void *args[1] = { axis_str[i] };
-        fprintf(stderr, " %s=%.3f", AXES[i], invoke_float(m_axis, args, "Input.GetAxis"));
+    //    Gated behind its OWN knob (default off) even under KL_PROBE_INPUT: on a
+    //    title whose Input Manager has no axis of the queried name, il2cpp's
+    //    Input.GetAxis walks off a buffer inside libunity and SIGSEGVs — an
+    //    intermittent native fault the managed try/catch cannot stop, and it
+    //    killed some Unity guests mid-run. The answer here is always
+    //    "InvalidOperationException" anyway, so it is off unless asked for.
+    if (kl_env_on("KL_PROBE_GETAXIS", 0)) {
+        fprintf(stderr, "  [mprobe f%u] axes:", frame);
+        for (unsigned i = 0; i < N_AXES; i++) {
+            void *args[1] = { axis_str[i] };
+            fprintf(stderr, " %s=%.3f", AXES[i], invoke_float(m_axis, args, "Input.GetAxis"));
+        }
+        fprintf(stderr, "\n");
     }
-    fprintf(stderr, "\n");
 
     // 2. And do the hand poses? The pointer ray is built from these, so a ray
     //    that never hits is either aimed wrong or cast from nowhere. Asked

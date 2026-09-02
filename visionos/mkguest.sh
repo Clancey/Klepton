@@ -58,33 +58,40 @@ for NAME in $LIBS; do
   # underscores-only rewrite let through, and Xcode rejects at the EMBED step
   # rather than at build: "had an invalid CFBundleIdentifier in its Info.plist".
   ID_NAME=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9.-' '-')
+  # The framework/executable NAME must not carry '+': App Store validation rejects a
+  # CFBundleExecutable containing \ [ ] { } ( ) + * (error 90121), and libc++_shared
+  # has one. Map it to a filesystem-safe name for the bundle; the guest still asks
+  # for "libc++_shared.so" and the runtime loader applies the SAME map when it
+  # resolves the path (dylib_candidate in kl_image.c). Only the .so SOURCE and the
+  # .xcframework CONTAINER keep the original name.
+  FWNAME=$(printf '%s' "$NAME" | tr '+' 'x')
   for PLAT in $PLATS; do
     case "$PLAT" in
       xros)        KLPLAT=visionos    ;;
       xrsimulator) KLPLAT=visionossim ;;
     esac
-    FW="build/guest/$KLT_NAME/$PLAT/$NAME.framework"
+    FW="build/guest/$KLT_NAME/$PLAT/$FWNAME.framework"
     mkdir -p "$FW"
-    "$LD" "$SRC/$NAME.so" -o "$FW/$NAME" --platform "$KLPLAT" \
-          --install-name "@rpath/$NAME.framework/$NAME" --quiet
+    "$LD" "$SRC/$NAME.so" -o "$FW/$FWNAME" --platform "$KLPLAT" \
+          --install-name "@rpath/$FWNAME.framework/$FWNAME" --quiet
     cat > "$FW/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleExecutable</key><string>$NAME</string>
+  <key>CFBundleExecutable</key><string>$FWNAME</string>
   <key>CFBundleIdentifier</key><string>dev.klepton.guest.$ID_NAME</string>
-  <key>CFBundleName</key><string>$NAME</string>
+  <key>CFBundleName</key><string>$FWNAME</string>
   <key>CFBundlePackageType</key><string>FMWK</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>
-  <key>MinimumOSVersion</key><string>2.0</string>
+  <key>MinimumOSVersion</key><string>26.0</string>
 </dict></plist>
 EOF
   done
   rm -rf "$OUT/$NAME.xcframework"
   FWARGS=()
   for PLAT in $PLATS; do
-    FWARGS+=(-framework "build/guest/$KLT_NAME/$PLAT/$NAME.framework")
+    FWARGS+=(-framework "build/guest/$KLT_NAME/$PLAT/$FWNAME.framework")
   done
   xcodebuild -create-xcframework "${FWARGS[@]}" \
       -output "$OUT/$NAME.xcframework" > /dev/null

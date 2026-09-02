@@ -19,9 +19,23 @@ set -euo pipefail
 cd "$(dirname "$0")"
 eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
 export KLEPTON_TARGET="$KLT_NAME"
+# Forward target-requested knobs into the runtime environment. Some targets
+# can request host-side behaviour (for example a guest that needs to JIT).
+# The target table emits KLT_ keys; export the corresponding KL_ env var so
+# run.sh's forwarding picks it up for the runtime and the app.
+if [ -n "${KLT_GUEST_JIT:-}" ]; then
+  export KL_GUEST_JIT="$KLT_GUEST_JIT"
+fi
 BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
 PRODUCT="$KLT_PRODUCT"
 MODE="${1:-sim}"
+
+# Give the custom-launcher build its OWN derived data. Xcode's incremental Swift
+# build does not reliably invalidate on a SWIFT_ACTIVE_COMPILATION_CONDITIONS change,
+# so flipping KL_CUSTOM_LAUNCHER against a shared dd-* dir silently reuses the stale
+# (other-state) compile — the "flag had no effect" build. Separate dirs per state keep
+# each cache correct. gen_xcodeproj.py reads the same env to bake the condition in.
+case "${KL_CUSTOM_LAUNCHER:-}" in 1|true|TRUE|yes|Yes|on|On) DD_SUFFIX="-launcher" ;; *) DD_SUFFIX="" ;; esac
 
 # Build the slice THIS run will install and not the other one. A device build
 # never loads the simulator's runtime and vice versa, and each slice is a full
@@ -64,7 +78,7 @@ STAMP_DIR="build/staged"
 # this target — a shell that aborts with `Could not find the Qt
 # platform plugin "virtual"` and a run.sh that says the assets are already
 # there. Bump this whenever stage_assets.sh stages something new.
-STAGE_SCHEMA=4
+STAGE_SCHEMA=7
 stage_stamp() {   # <target-key>
   local apk="../$KLT_APK" sig=""
   [ -f "$apk" ] && sig=$(stat -f '%z-%m' "$apk" 2>/dev/null || true)
@@ -113,9 +127,11 @@ stage_if_needed() {
 # it, the app never did, and the run took the window path while looking like the
 # compositor had failed to come up. A knob that is set and not delivered is worse
 # than one that does not exist, so the default is now "forward it".
-FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
+FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
 FORWARD=""
-for K in $(env | sed -n 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' | sort); do
+for K in $(env | sed -n -e 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' \
+                        -e 's/^\(MTL_[A-Za-z0-9_]*\)=.*/\1/p' \
+                        -e 's/^\(METAL_[A-Za-z0-9_]*\)=.*/\1/p' | sort); do
   case " $FORWARD_SKIP " in *" $K "*) continue ;; esac
   FORWARD="$FORWARD $K"
 done
@@ -139,7 +155,7 @@ if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
 # nothing is. gen_xcodeproj.py embeds it only if this produced something.
 ./mkmvk.sh | tail -1
 
-echo "[2/5] project…"
+echo "[2/5] project…  custom launcher: $([ -n "$DD_SUFFIX" ] && echo "ON (HL*VR name + monogram icon + Boot button)" || echo "off (normal build; set KL_CUSTOM_LAUNCHER=1 to enable)")"
 python3 gen_xcodeproj.py | head -1
 
 if [ "$MODE" = "device" ]; then
@@ -171,7 +187,7 @@ print(phys[0]["identifier"])
   # generic/platform, not id= : the build must not depend on the device being awake
   set +e
   xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration Debug \
-    -destination 'generic/platform=visionOS' -derivedDataPath "build/dd-device-$KLT_NAME" \
+    -destination 'generic/platform=visionOS' -derivedDataPath "build/dd-device-$KLT_NAME$DD_SUFFIX" \
     -allowProvisioningUpdates build 2>&1 | grep -E 'error:|Signing Identity|\*\* BUILD'
   # xcodebuild's status, through the pipe. Testing for the .app is NOT enough: a
   # failed *incremental* build leaves the previous, complete and perfectly valid
@@ -180,12 +196,22 @@ print(phys[0]["identifier"])
   # most expensive possible way to be told about a compile error.
   BUILD_RC=${PIPESTATUS[0]}
   set -e
-  APP="build/dd-device-$KLT_NAME/Build/Products/Debug-xros/$PRODUCT.app"
+  APP="build/dd-device-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xros/$PRODUCT.app"
   [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
   [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
 
-  echo "[4/5] installing…"
-  xcrun devicectl device install app --device "$DEVID" "$APP" | tail -2
+  if [ -n "${KL_SKIP_INSTALL:-}" ]; then
+    # Every install observed on this device ROTATES the data container, which
+    # orphans a 16 GB staged OBB with no symptom until the game polls for data
+    # that "was staged" into a container it no longer runs in. A run that only
+    # changes environment knobs does not need a new binary on the device at all,
+    # so skipping the install keeps the container - and everything staged into
+    # it - exactly where the app will look.
+    echo "[4/5] install skipped (KL_SKIP_INSTALL=1 - existing app and its data container kept)"
+  else
+    echo "[4/5] installing…"
+    xcrun devicectl device install app --device "$DEVID" "$APP" | tail -2
+  fi
   # Installing can rotate the data container, so assets are staged *after*.
   stage_if_needed "$DEVID" "$DEVID"
 
@@ -366,18 +392,22 @@ print(phys[0]["identifier"])
   exit 0
 fi
 
-UDID=$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1)
-[ -n "$UDID" ] || { echo "!! no booted visionOS simulator"; exit 1; }
+# `|| true` because pipefail otherwise kills the SCRIPT on the grep finding
+# nothing — silently, right after "[2/5] project…", before the message below
+# ever prints. Cost a "build crash" report that was really a missing `device`
+# argument on a machine with no simulator booted.
+UDID=$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1 || true)
+[ -n "$UDID" ] || { echo "!! no booted visionOS simulator (did you mean ./run.sh device ?)"; exit 1; }
 
 echo "[3/5] building for the simulator…"
 set +e
 xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" \
   -destination "platform=visionOS Simulator,id=$UDID" \
-  -derivedDataPath "build/dd-sim-$KLT_NAME" CODE_SIGNING_ALLOWED=NO build 2>&1 \
+  -derivedDataPath "build/dd-sim-$KLT_NAME$DD_SUFFIX" CODE_SIGNING_ALLOWED=NO build 2>&1 \
   | grep -E 'error:|\*\* BUILD'
 BUILD_RC=${PIPESTATUS[0]}
 set -e
-APP="build/dd-sim-$KLT_NAME/Build/Products/Debug-xrsimulator/$PRODUCT.app"
+APP="build/dd-sim-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xrsimulator/$PRODUCT.app"
 [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
 [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
 

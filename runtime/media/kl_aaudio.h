@@ -13,14 +13,24 @@
 // lock the guest holds. Hence a thread of our own per stream, exactly as
 // kl_opensl.c already does, feeding the same lock-free ring.
 //
-// Direction: OUTPUT is implemented, INPUT is refused by design. The guest asks
-// for a capture stream for voice chat (it calls setInputPreset), and we report
-// no capture device rather than fabricating one — reporting silence would be
-// inventing behaviour, and a real microphone would need a privacy usage
-// description whose absence is a process kill on the request. "No
-// input device" is the same platform-absent answer kl_ovrplat.c gives, and it
-// grants nothing. If the guest ever treats that as fatal the log says so by
-// name, which is the point.
+// Direction: OUTPUT is always implemented; INPUT is opt-in. The guest asks for a
+// capture stream for voice chat (it calls setInputPreset), and the answer now
+// depends on the KleptonMic toggle:
+//
+//   * toggle OFF (the default) — openStream(INPUT) still returns UNAVAILABLE,
+//     exactly as it always did. Nothing touches the microphone, so nothing
+//     triggers the visionOS permission prompt, and a title that never asks for
+//     the mic behaves as before. This is the same platform-absent answer
+//     kl_ovrplat.c gives, and it grants nothing.
+//   * toggle ON — openStream(INPUT) builds a real capture stream fed by
+//     kl_audio.c's mic path (kl_audio_mic_open/read/close). Steam Link then
+//     reads voice frames with AAudioStream_read (blocking with a timeout) or, if
+//     it registered a data callback, is handed each captured burst by a feeder.
+//     The mic hardware is opened lazily, only here, only when both the toggle is
+//     on AND a guest actually asks — see kl_audio.h.
+//
+// If a guest ever treats the OFF refusal as fatal the log says so by name, which
+// is the point.
 #ifndef KL_AAUDIO_H
 #define KL_AAUDIO_H
 

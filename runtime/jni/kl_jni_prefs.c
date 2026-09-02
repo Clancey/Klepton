@@ -252,6 +252,13 @@ static klj_val klj_Context_getSharedPreferences(void *env, void *self, const klj
             name, n > 1 ? (int)a[1].j : 0, p->path, p->kv.n);
     void *obj = kl_jni_new_object("android/content/SharedPreferences");
     klj_as_object(obj)->data = p;
+    // Android SharedPreferences are long-lived and callers keep them (hl2's
+    // libsourcevr fetches once and reads later). We cache the object in
+    // g_prefs_objs and hand it back on the next getSharedPreferences, so it must
+    // outlive the local frame it was made in — otherwise the cached pointer is
+    // retired and the guest's next GetObjectClass/getInt on it aborts on an
+    // "untagged pointer". Pin it.
+    kl_jni_pin_object(obj);
     g_prefs_objs[g_nprefs_files++] = obj;
     return (klj_val){.l = obj};
 }
@@ -281,20 +288,76 @@ static klj_pref *klj_prefs_lookup(void *self, const klj_val *a, int n, char kind
 static klj_val klj_SP_getString(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     klj_pref *e = klj_prefs_lookup(self, a, n, 'S');
-    if (!e) return (klj_val){.l = n > 1 ? a[1].l : NULL};
+    if (!e) {
+        klj_prefs *p_ = klj_prefs_of(self);
+        if (p_ && strcmp(p_->name, "mod") == 0)   // see KLJ_SP_GET diagnostic note
+            KLJ_LOG("prefs[mod] getString(\"%s\") absent -> guest default \"%s\"",
+                    n > 0 ? klj_str(a[0].l) : "?",
+                    n > 1 && a[1].l ? klj_str(a[1].l) : "");
+        return (klj_val){.l = n > 1 ? a[1].l : NULL};
+    }
     return (klj_val){.l = kl_jni_new_string(e->sval ? e->sval : "")};
 }
-#define KLJ_SP_GET(Sfx, kind, Field, Slot)                                        \
+// Klepton: HL2Q3VR (hl2/portal) picks its OpenXR renderer from the empty prefs
+// getSharedPreferences("mod").getInt("launcher_gfx_renderer_path", 0). Default 0 =
+// the "direct array" single-pass MULTIVIEW renderer — which this build's PCVR
+// (non-multiview) shader data cannot back, so every world draw is "no usable vertex
+// shader variant" and the screen stays black. Force a per-eye path (value 1), whose
+// variants the shaders DO have (portal renders that way). Override the value with
+// KL_HL2_RENDERER_PATH to try others without a rebuild; only applies to hl2/portal
+// (or whenever the env var is set), and only when the key is absent from mod.xml so
+// a real user choice still wins. Returns 1 and writes *out if it overrides.
+static int klj_mod_renderer_override(const char *file, const char *key, long long *out) {
+    if (!file || strcmp(file, "mod") != 0 || !key) return 0;
+    // launcher_gfx_renderer_path: env-only sweep knob. renderer_path only changes how
+    // eye textures reach OpenXR (0=direct array, 1=compatible copied); it does NOT
+    // control the port's multiview SHADER path.
+    if (strcmp(key, "launcher_gfx_renderer_path") == 0) {
+        const char *env = getenv("KL_HL2_RENDERER_PATH");
+        if (!env) return 0;
+        *out = atoll(env); return 1;
+    }
+    // GENERIC mod-pref override: KL_HL2_PREF_<key>=<int> forces any "mod" getInt key
+    // from the device without a rebuild — for sweeping the port's own gates. e.g.
+    // KL_HL2_PREF_hl2q3vr_xr_diagnostics=1 to test the frame-loop-ready gate
+    // ([x19+0x741] in libsourcevr reads this cvar), or hl2q3vr_mobile_aux_target.
+    // Only fires when the key is absent from mod.xml, so a real user choice still wins.
+    char envname[160];
+    int nn = snprintf(envname, sizeof envname, "KL_HL2_PREF_%s", key);
+    if (nn > 0 && nn < (int)sizeof envname) {
+        const char *env = getenv(envname);
+        if (env) { *out = atoll(env); return 1; }
+    }
+    return 0;
+}
+
+// Diagnostic + override for the launcher's "mod" prefs (see above). Logs each
+// absent read's key+default once (one-shot, cheap) so new keys stay discoverable.
+#define KLJ_SP_GET(Sfx, kind, Field, Slot, DefLL)                                  \
     static klj_val klj_SP_get##Sfx(void *env, void *self, const klj_val *a, int n) { \
         (void)env;                                                                \
         klj_pref *e = klj_prefs_lookup(self, a, n, kind);                         \
-        if (!e) return (klj_val){.Slot = n > 1 ? a[1].Slot : 0};                  \
+        if (!e) {                                                                 \
+            klj_prefs  *p_ = klj_prefs_of(self);                                  \
+            const char *k_ = n > 0 ? klj_str(a[0].l) : NULL;                      \
+            long long   ov_;                                                      \
+            if (kind == 'I' && p_ && k_ &&                                        \
+                klj_mod_renderer_override(p_->name, k_, &ov_)) {                  \
+                KLJ_LOG("prefs[mod] get" #Sfx "(\"%s\") -> Klepton override %lld " \
+                        "(guest default %lld)", k_, ov_, (long long)(DefLL));     \
+                return (klj_val){.Slot = (typeof(((klj_val *)0)->Slot))ov_};      \
+            }                                                                     \
+            if (p_ && strcmp(p_->name, "mod") == 0)                               \
+                KLJ_LOG("prefs[mod] get" #Sfx "(\"%s\") absent -> guest default %lld", \
+                        k_ ? k_ : "?", (long long)(DefLL));                       \
+            return (klj_val){.Slot = n > 1 ? a[1].Slot : 0};                      \
+        }                                                                         \
         return (klj_val){.Slot = e->Field};                                       \
     }
-KLJ_SP_GET(Int,     'I', ival, j)
-KLJ_SP_GET(Long,    'J', ival, j)
-KLJ_SP_GET(Boolean, 'Z', ival, j)
-KLJ_SP_GET(Float,   'F', fval, d)
+KLJ_SP_GET(Int,     'I', ival, j, n > 1 ? a[1].j : 0)
+KLJ_SP_GET(Long,    'J', ival, j, n > 1 ? a[1].j : 0)
+KLJ_SP_GET(Boolean, 'Z', ival, j, n > 1 ? a[1].j : 0)
+KLJ_SP_GET(Float,   'F', fval, d, n > 1 ? (long long)a[1].d : 0)
 #undef KLJ_SP_GET
 
 static klj_val klj_SP_contains(void *env, void *self, const klj_val *a, int n) {
@@ -562,6 +625,10 @@ const klj_binding klj_bind_prefs[] = {
     {"android/app/Activity", "getPreferences", "(I)Landroid/content/SharedPreferences;",
      klj_Activity_getPreferences},
     {"android/content/Context", "getSharedPreferences",
+     "(Ljava/lang/String;I)Landroid/content/SharedPreferences;", klj_Context_getSharedPreferences},
+    // ...and the same, reached on the null Activity UbiServices holds before we
+    // route it a real Context (permissive reports the null as java/lang/Object).
+    {"java/lang/Object", "getSharedPreferences",
      "(Ljava/lang/String;I)Landroid/content/SharedPreferences;", klj_Context_getSharedPreferences},
 
     {"android/content/SharedPreferences", "getString",

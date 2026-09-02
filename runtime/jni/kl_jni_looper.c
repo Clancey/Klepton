@@ -102,6 +102,17 @@ static int klj_on_ui_thread(void) {
         || kl_ndk_thread_has_looper();
 }
 
+// Mark the CALLING thread as the activity/UI thread and give it a native looper.
+// Android's main thread always has one (Looper.prepareMainLooper before onCreate),
+// and the Unity path never prepared it here — so newer Unity guests failed "Couldn't retrieve native ALooper for UI thread" and spun
+// on graphics-context setup until SIGILL. The driver calls this on the thread
+// that runs UnityPlayer.initJni, before Unity's native code first asks.
+void kl_jni_mark_ui_thread(void) {
+    g_ui_thread = pthread_self();
+    g_ui_thread_known = 1;
+    kl_ndk_prepare_looper();
+}
+
 static klj_val klj_Activity_runOnUiThread(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     void *r = n > 0 ? a[0].l : NULL;
@@ -582,18 +593,45 @@ static klj_val klj_Choreographer_postFrameCallback(void *env, void *self,
 // both call into guest proxies, and that machinery is defined there.
 
 // ---- android.os.Process ----
-// setThreadPriority(tid, priority) is a no-op we can only record. Android's
-// priority is a Linux nice value applied to another thread by tid; Darwin has no
-// equivalent — scheduling is set through pthread QoS classes on the thread
-// itself, so honouring this would mean intercepting it at thread creation. It is
-// logged rather than silently dropped because it names which of the engine's
-// threads expect to run below normal.
+// setThreadPriority(tid, priority) is an Android nice value applied to another
+// thread by tid. Darwin has no by-nice equivalent — scheduling is set through
+// pthread QoS classes — but the ONE case that matters we CAN honour: a thread
+// flagged THREAD_PRIORITY_AUDIO (-16) or _URGENT_AUDIO (-19) is an audio mixer
+// thread with a realtime deadline, and on visionOS a default-QoS guest thread is
+// scheduled BEHIND the compositor. Under shader-compile / render load that mixer
+// starves and its output arrives in gaps — the stutter olar exhibits even though
+// our CoreAudio output path never underruns (the gaps are in the content the
+// guest produced). So for an audio priority we route the tid through the same
+// QoS-override path XR-critical threads use (kl_pthread_boost_qos: self door for
+// the calling thread, cross-thread override via the live registry otherwise).
+// The tid the guest passes is our pthread_threadid_np — gettid / Process.myTid
+// both return it — so the registry lookup matches. Below-normal / non-audio
+// priorities stay recorded-not-applied: boosting the game or render thread here
+// would starve the very compositor this is careful not to.
+#define KLJ_THREAD_PRIORITY_AUDIO (-16)   // android.os.Process.THREAD_PRIORITY_AUDIO
 static klj_val klj_Process_setThreadPriority(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
-    if (n > 1) KLJ_LOG("Process.setThreadPriority(tid=%d, %d) — not applied on Darwin",
-                       (int)a[0].j, (int)a[1].j);
-    else if (n > 0) KLJ_LOG("Process.setThreadPriority(%d) — not applied on Darwin",
-                            (int)a[0].j);
+    if (n > 1) {
+        int tid = (int)a[0].j, prio = (int)a[1].j;
+        if (prio <= KLJ_THREAD_PRIORITY_AUDIO) {
+            KLJ_LOG("Process.setThreadPriority(tid=%d, %d) — audio thread, "
+                    "raising to USER_INTERACTIVE QoS", tid, prio);
+            kl_pthread_boost_qos((uint32_t)tid);
+        } else {
+            KLJ_LOG("Process.setThreadPriority(tid=%d, %d) — not applied on Darwin",
+                    tid, prio);
+        }
+    } else if (n > 0) {
+        int prio = (int)a[0].j;
+        if (prio <= KLJ_THREAD_PRIORITY_AUDIO) {
+            uint64_t self_tid = 0; pthread_threadid_np(NULL, &self_tid);
+            KLJ_LOG("Process.setThreadPriority(%d) — audio, raising self to "
+                    "USER_INTERACTIVE QoS", prio);
+            kl_pthread_boost_qos(self_tid);
+        } else {
+            KLJ_LOG("Process.setThreadPriority(%d) — not applied on Darwin", prio);
+        }
+    }
     return (klj_val){0};
 }
 // SDL's own wrapper for the same operation, and it lands in the same place:

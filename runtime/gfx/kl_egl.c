@@ -35,6 +35,7 @@
 #include "kl_glfb.h"
 #include "kl_mediandk.h"   // what an AHardwareBuffer is, for the image path
 #include "kl_present.h"
+#include "kl_openxr.h"   // XR_KHR_android_surface_swapchain: eglSwapBuffers presents it
 
 // ---- the subset of EGL/egl.h we actually answer for ----
 #define EGL_FALSE                 0
@@ -121,8 +122,8 @@ static struct { int id, es_bits, samples, depth, stencil; } g_configs[] = {
 };
 #define NCONFIGS ((int)(sizeof g_configs / sizeof g_configs[0]))
 
-typedef struct { int32_t w, h; int pbuffer; } kl_egl_surface;
-typedef struct { int client_version; } kl_egl_context;
+typedef struct { int32_t w, h; int pbuffer; void *xr_swapchain; } kl_egl_surface;
+typedef struct { int client_version; int config_id; } kl_egl_context;
 
 static kl_egl_surface g_surfaces[8];
 static kl_egl_context g_contexts[8];
@@ -150,8 +151,43 @@ static unsigned g_nsurf, g_nctx;
 // them migrates separately, through kl_glfb_make_current/_release_current.
 static __thread EGLSurface g_draw, g_read;
 static __thread EGLContext g_current;
+// The last REAL context (a g_contexts[] slot) this thread ever made current,
+// remembered across an eglMakeCurrent(NULL) release. HL2Q3VR (hl2) needs it:
+// its startup-video path releases the GL context to hand the Android Surface to
+// a MediaPlayer, then relies on the post-video code to restore it — but our port
+// finds no valve.avi, takes the "no video" branch, and never re-makes-current.
+// The engine then reads eglGetCurrentContext at XR-graphics-binding time
+// (libsourcevr's XrGraphicsBindingOpenGLESAndroidKHR setup), gets NULL, logs
+// "Source EGL context is not current", and skips xrCreateSession entirely — so
+// the whole VR render loop (and the multiview probe that lives inside it) is
+// never reached, and the menu renders black. ANGLE keeps a live context the
+// whole time (kl_glfb re-takes the root on the next GL call), so answering with
+// the last real context is truthful, not a lie. Gated to hl2 so Unity — which
+// deliberately keys FBO ownership on a NULL answer — is untouched.
+static __thread EGLContext g_last_real;
+// Process-wide companion to g_last_real: the last real context made current on ANY
+// thread. The hl2 cinema eye-copy ("Point Insertion" g-man intro) reads
+// eglGetCurrentContext on a VR submission thread that never made a context current
+// there — so per-thread g_last_real is 0 and the guest would fall to its broken
+// context-less copy path (Eye 1 fallback=1, see-through / stale per eye). All guest
+// contexts alias the single ANGLE root on this backend, so answering with the
+// process-wide last real context lets that thread take the NORMAL copy path; the
+// klfb_GenFramebuffers host-bind (KL_HL2_CINEMA_CTX) makes its GL actually land.
+static EGLContext g_last_real_any;
 static int g_error = EGL_SUCCESS;
 static unsigned long g_frames;
+
+// Cached "is this the hl2 target" test — the only guest that needs the sticky
+// current-context above. Computed once; kl_driver_target_name is stable.
+static int klegl_sticky_ctx(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        cached = (t && strcmp(t, "hl2") == 0) ? 1 : 0;
+    }
+    return cached;
+}
 
 #define DISPLAY ((EGLDisplay)&g_display)
 
@@ -179,6 +215,11 @@ static int permissive(void) {
 // Reached through a per-name trampoline, so x0 is the function's own name. The
 // return value becomes the GL call's return value: the stub tail-calls here, so
 // returning 0 is exactly "the GL function returned 0".
+// The last GL name that hit the unimplemented-abort. The pre-abort fprintf below
+// races the device-console capture and is often lost, so this is stamped and
+// re-emitted from kl_egl_report(), which rides the fault handler's report that
+// DOES survive to the log — the reliable way to learn the culprit's name.
+char kl_gl_last_unimpl[64];
 static uint64_t klgl_called(const char *name) {
     int s = gl_slot(name);
     if (s >= 0) g_gl[s].calls++;
@@ -187,8 +228,12 @@ static uint64_t klgl_called(const char *name) {
             fprintf(stderr, "  [egl] GL call (permissive, returning 0): %s\n", name);
         return 0;
     }
+    snprintf(kl_gl_last_unimpl, sizeof kl_gl_last_unimpl, "%s", name ? name : "?");
     fprintf(stderr, "\n[klepton] fatal: guest called unimplemented GL entry point "
                     "'%s'\n", name);
+    fflush(stderr);   // abort() below does not flush a fully-buffered stderr (log
+                      // is a file, not a tty): without this the one line that names
+                      // the culprit never reaches the captured log.
     kl_egl_report(stderr);
     kl_fatal_prepare();
     abort();
@@ -265,14 +310,70 @@ void kl_egl_set_gles_version(int major, int minor) {
 static const char *const g_gl_extensions[] = {
     "GL_EXT_color_buffer_float",
     "GL_EXT_color_buffer_half_float",
+    // Apple GPUs decode ASTC natively and kl_glfb uploads the ASTC LDR block
+    // formats, so advertise it — UE4 reads this to decide whether to load its
+    // ASTC-cooked textures (without it, it reports "Unsupported Texture Format:
+    // ASTC / Supported: ETC2" and then dies uploading the assets it does have).
+    "GL_KHR_texture_compression_astc_ldr",
+    "GL_OES_texture_compression_astc",
+    // Framebuffer blit + multisample. These are CORE in GLES 3 (glBlitFramebuffer,
+    // glRenderbufferStorageMultisample) and fully backed by ANGLE, but Source's
+    // togl is a desktop-GL translator that gates its scene->eye RESOLVE on the old
+    // EXT extension NAMES and, finding them absent from our (curated) string,
+    // logged "This system DOES NOT support GL_EXT_framebuffer_blit" and never
+    // copied its rendered scene into the eye swapchain image — a black display
+    // despite ~29k draws a frame. Advertise them so that path runs. (Harmless to
+    // GLES guests, which use the core entry points regardless.)
+    "GL_EXT_framebuffer_object",
+    "GL_EXT_framebuffer_blit",
+    "GL_EXT_framebuffer_multisample",
+    // Single-pass stereo. glGetString(GL_EXTENSIONS) is "kept ours", so a guest
+    // that decides whether to use multiview by reading this string never saw it
+    // even after ANGLE's Metal backend gained OVR_multiview support. Advertising
+    // it makes the guest bake num_views shaders and use glFramebufferTextureMulti
+    // viewOVR; ANGLE then translates them (instanced emulation -> per-view
+    // render_target_array_index) and renders both eyes in one pass.
+    //
+    // But ONLY offer it to targets that genuinely render this way — ieytd (Unity)
+    // and the HL2Q3VR Source-VR family (hl2, portal), which are multiview-only VR
+    // ports: without the extension they can't build their stereo vertex variants
+    // ("no usable vertex shader variant") and render black. A different engine that
+    // isn't built for it is better left on its own per-eye path. klgl_want_multiview()
+    // gates BOTH doors (this list and GL_MAX_VIEWS_OVR); klgl_ext_count() drops these
+    // entries when it returns 0, so THESE TWO MULTIVIEW ENTRIES MUST STAY LAST.
+    "GL_OVR_multiview",
+    "GL_OVR_multiview2",
 };
+
+// Which targets actually render with GLES single-pass multiview. Advertise the
+// extension ONLY to these; a non-multiview engine (cs1/Xash, hl1/lambda1vr) that
+// saw it might take a multiview path it can't back. The ones here NEED it: hiding
+// it makes HL2Q3VR (hl2/portal) report "no usable vertex shader variant" for every
+// stereo shader and render black — it is a multiview-only VR port, same as ieytd.
+// (The ANGLE side still only emits gl_Layer for shaders that enable the extension,
+// so even a mistaken advertisement can't fault a per-eye draw — this door is about
+// steering each engine to the path it actually supports.)
+extern const char *kl_driver_target_name(void);
+static int klgl_want_multiview(void) {
+    const char *t = kl_driver_target_name();
+    if (!t) return 0;
+    // ieytd/ieytd2/ieytd-<n> (Unity), and the HL2Q3VR Source-VR family (hl2, portal
+    // — both liblauncher) whose single-pass stereo is baked around GL_OVR_multiview.
+    return strncmp(t, "ieytd", 5) == 0 ||
+           strcmp(t, "hl2") == 0 ||
+           strcmp(t, "portal") == 0;
+}
 
 // ...and none of it is offered below ES 3. Steam Link is told GLES 2.0
 // (kl_egl_set_gles_version) and has always run against an empty list; the
 // argument above is an ES 3.2 argument and does not carry over, so that target
 // stays exactly as it was rather than being changed by a fix it did not need.
 static int klgl_ext_count(void) {
-    return g_es_major >= 3 ? (int)(sizeof g_gl_extensions / sizeof g_gl_extensions[0]) : 0;
+    if (g_es_major < 3) return 0;
+    int n = (int)(sizeof g_gl_extensions / sizeof g_gl_extensions[0]);
+    // Hide the two trailing OVR_multiview entries from targets that don't use it.
+    if (!klgl_want_multiview()) n -= 2;
+    return n;
 }
 
 static const char *klgl_GetString(uint32_t name) {
@@ -426,6 +527,12 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     if (pname == 0x0D3A) {                       // MAX_VIEWPORT_DIMS: two values
         params[0] = 16384; params[1] = 16384; return 1;
     }
+    // GL_MAX_VIEWS_OVR — how many views multiview supports. Answer 2 (stereo,
+    // matching the ANGLE Metal backend's maxViews) ONLY for multiview targets; for
+    // everyone else leave it unhandled (returns 0 -> "multiview unavailable") so it
+    // matches the hidden extension string and no per-eye engine takes a multiview
+    // path. See klgl_want_multiview().
+    if (pname == 0x9631) { if (!klgl_want_multiview()) return 0; params[0] = 2; return 1; }
     return 0;
 }
 
@@ -1003,6 +1110,16 @@ static const char *const g_gl_void[] = {
     "glEnable", "glDisable", "glCullFace", "glFrontFace", "glDepthFunc", "glDepthMask",
     "glColorMask", "glColorMaski", "glStencilMask", "glStencilFuncSeparate",
     "glStencilOpSeparate", "glPolygonOffset", "glScissor", "glViewport", "glPixelStorei",
+    // glPolygonMode is desktop-GL only (no GLES equivalent); gl4es passes it
+    // through when the guest asks for it. GL_FILL is the default and only mode a
+    // null/GLES driver can honour, so doing nothing is correct — wireframe
+    // (GL_LINE) is the sole behaviour lost, which no gameplay path needs.
+    "glPolygonMode",
+    // glTexImage1D is desktop-GL only; gl4es passes it through when it can't fold
+    // a 1D texture into a 2D one. A null/GLES driver has no 1D texture to fill, so
+    // this is a no-op — the 1D texture stays unpopulated (a colour ramp / lookup
+    // that samples black), which is a visual gap, not a crash.
+    "glTexImage1D",
     "glBlendEquation", "glBlendEquationi", "glBlendEquationSeparate",
     "glBlendEquationSeparatei", "glBlendFuncSeparate", "glBlendFuncSeparatei",
     "glBlendBarrier",
@@ -1245,7 +1362,7 @@ static unsigned klegl_GetConfigAttrib(EGLDisplay dpy, EGLConfig cfg,
 static EGLSurface new_surface(int32_t w, int32_t h, int pbuffer) {
     if (g_nsurf >= sizeof g_surfaces / sizeof g_surfaces[0]) return NULL;
     kl_egl_surface *s = &g_surfaces[g_nsurf++];
-    s->w = w; s->h = h; s->pbuffer = pbuffer;
+    s->w = w; s->h = h; s->pbuffer = pbuffer; s->xr_swapchain = NULL;
     return (EGLSurface)s;
 }
 
@@ -1266,7 +1383,23 @@ static EGLSurface klegl_CreateWindowSurface(EGLDisplay dpy, EGLConfig cfg,
     // setter is a no-op once ANGLE is up, and honours KL_GLFB_SIZE, so this
     // neither fights an explicit override nor resizes a live surface.
     kl_glfb_set_size(w, h);
-    return new_surface(w, h, 0);
+    EGLSurface es = new_surface(w, h, 0);
+    // XR_KHR_android_surface_swapchain: if this window came from
+    // ANativeWindow_fromSurface on an XR game-surface, bind the EGL surface to
+    // that swapchain. eglSwapBuffers then presents the guest's frame INTO the
+    // swapchain image (see klegl_SwapBuffers) rather than only into the flat
+    // door — which is what routes a guest's Android-surface screen to its VR quad layers.
+    if (es) {
+        void *owner = kl_ndk_window_owner(win);
+        void *sc = owner ? kl_xr_swapchain_for_surface(owner) : NULL;
+        if (sc) {
+            ((kl_egl_surface *)es)->xr_swapchain = sc;
+            fprintf(stderr, "  [egl] window surface %dx%d is an XR game surface "
+                            "-> bound to swapchain %p; eglSwapBuffers presents it\n",
+                    w, h, sc);
+        }
+    }
+    return es;
 }
 
 static EGLSurface klegl_CreatePbufferSurface(EGLDisplay dpy, EGLConfig cfg,
@@ -1338,10 +1471,16 @@ static unsigned klegl_SurfaceAttrib(EGLDisplay dpy, EGLSurface surf,
 static EGLContext klegl_CreateContext(EGLDisplay dpy, EGLConfig cfg,
                                       EGLContext share, const int32_t *attribs) {
     KLEGL_TRACE("eglCreateContext");
-    (void)dpy; (void)cfg; (void)share;
+    (void)dpy; (void)share;
     if (g_nctx >= sizeof g_contexts / sizeof g_contexts[0]) return NULL;
     kl_egl_context *c = &g_contexts[g_nctx++];
     c->client_version = 2;
+    // Remember which config this context was created against so eglQueryContext
+    // can answer EGL_CONFIG_ID with an id that round-trips through eglGetConfigs
+    // + eglGetConfigAttrib. HL2Q3VR's XR-graphics-binding matches the two to find
+    // the EGLConfig for XrGraphicsBindingOpenGLESAndroidKHR; without a real id it
+    // finds no config and refuses the session.
+    c->config_id = cfg ? ((const typeof(g_configs[0]) *)cfg)->id : g_configs[0].id;
     for (const int32_t *a = attribs; a && *a != EGL_NONE; a += 2)
         if (a[0] == 0x3098 /* EGL_CONTEXT_CLIENT_VERSION */) c->client_version = a[1];
     fprintf(stderr, "  [egl] context %u = %p, GLES %d (created on t%llu)\n",
@@ -1384,6 +1523,12 @@ static unsigned klegl_QueryContext(EGLDisplay dpy, EGLContext ctx,
     case EGL_CONTEXT_CLIENT_VER:  *value = c->client_version; break;
     case EGL_CONTEXT_CLIENT_TYPE: *value = EGL_OPENGL_ES_API; break;
     case EGL_RENDER_BUFFER:       *value = EGL_BACK_BUFFER;   break;
+    // The config the context was created against (0 for the pre-tracking default,
+    // which still round-trips: g_configs[0].id). Now answerable because the
+    // context remembers its config — see klegl_CreateContext. HL2Q3VR needs it to
+    // build its XR OpenGL-ES graphics binding.
+    case EGL_CONFIG_ID:           *value = c->config_id ? c->config_id
+                                                        : g_configs[0].id; break;
     default:
         fprintf(stderr, "  [egl] eglQueryContext: unhandled attribute 0x%x\n", attr);
         g_error = 0x3004 /* EGL_BAD_ATTRIBUTE */;
@@ -1411,6 +1556,15 @@ static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
         fprintf(stderr, "  [egl] t%llu current context %p -> %p\n",
                 klegl_tid(), (void *)g_current, (void *)ctx);
     (void)dpy; g_draw = draw; g_read = read; g_current = ctx;
+    // Remember the last context that is one of ours (a g_contexts[] slot) so the
+    // hl2 sticky path below can answer with it after a release. The startup-video
+    // teardown makes a bogus (EGLContext)0x1 current for an instant; excluding
+    // anything outside the array keeps that out of the sticky value.
+    if (ctx && (kl_egl_context *)ctx >= g_contexts &&
+        (kl_egl_context *)ctx < g_contexts + (sizeof g_contexts / sizeof g_contexts[0])) {
+        g_last_real = ctx;
+        g_last_real_any = ctx;   // cross-thread sticky for the cinema eye-copy
+    }
     // Whichever thread this is, it is the one that will now issue GL — or, when
     // the guest releases the context (NULL), the one giving it up; migration
     // mode needs both halves.
@@ -1423,27 +1577,40 @@ static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
 
 static EGLContext klegl_GetCurrentContext(void) {
     KLEGL_TRACE("eglGetCurrentContext");
+    // Resolve the answer FIRST — including the hl2 sticky restore — so the
+    // log-dedup below cannot short-circuit it (it used to `return g_current`
+    // early for a repeated call site, which bypassed the sticky path entirely and
+    // is why the cinema eye-copy kept seeing 0x0). Per-thread g_last_real first;
+    // fall back to the process-wide last real context so a submission thread that
+    // never held one (the cinema eye-copy) still gets a valid context instead of
+    // the guest's broken context-less path.
+    EGLContext ans = g_current;
+    if (!g_current && klegl_sticky_ctx()) {
+        EGLContext sticky = g_last_real ? g_last_real : g_last_real_any;
+        if (sticky) ans = sticky;
+    }
     // A NULL answer is the interesting one and it is not an error: it means the
     // asking thread holds no context. Unity latches this into the "active
     // context" it keys framebuffer-object ownership on, and two of its three
     // writers store the answer UNCONDITIONALLY — a NULL there becomes a sentinel
-    // that never matches any framebuffer again. Named by call site, once each,
-    // because a count says nothing about which caller latched it.
+    // that never matches any framebuffer again. Named by call site + answer, once
+    // each (dedup only — never gates the return value).
     {
         static struct { const void *ret; const void *ctx; } said[16];
         static unsigned nsaid;
         const void *ret = __builtin_return_address(0);
-        unsigned n = nsaid;
+        unsigned n = nsaid, seen = 0;
         for (unsigned i = 0; i < n && i < 16; i++)
-            if (said[i].ret == ret && said[i].ctx == g_current) return g_current;
-        if (n < 16) {
-            said[n].ret = ret; said[n].ctx = g_current; nsaid = n + 1;
+            if (said[i].ret == ret && said[i].ctx == ans) { seen = 1; break; }
+        if (!seen && n < 16) {
+            said[n].ret = ret; said[n].ctx = ans; nsaid = n + 1;
             size_t off = 0; const char *img = kl_addr_image((void *)ret, &off);
-            fprintf(stderr, "  [egl] t%llu eglGetCurrentContext -> %p <- %s+0x%zx\n",
-                    klegl_tid(), (void *)g_current, img ? img : "?", off);
+            fprintf(stderr, "  [egl] t%llu eglGetCurrentContext -> %p <- %s+0x%zx%s\n",
+                    klegl_tid(), (void *)ans, img ? img : "?", off,
+                    ans != g_current ? " (sticky)" : "");
         }
     }
-    return g_current;
+    return ans;
 }
 
 void *kl_egl_current_context(void) { return (void *)g_current; }
@@ -1453,7 +1620,13 @@ static EGLDisplay klegl_GetCurrentDisplay(void) {
     // context, or EGL_NO_DISPLAY when nothing is current — that is the spec's
     // answer for a thread with no context, and it is what 1.40's
     // libOculusXRPlugin asks for as it spins up its own EGL context.
-    return g_current ? DISPLAY : (EGLDisplay)0;   /* EGL_NO_DISPLAY */
+    if (g_current) return DISPLAY;
+    // hl2 sticky (see g_last_real): the XR-binding check reads display AND context
+    // and bails if either is NULL, so the released-context restore must cover both.
+    // Process-wide fallback too, so the cinema eye-copy thread's display matches the
+    // context restored in klegl_GetCurrentContext.
+    if ((g_last_real || g_last_real_any) && klegl_sticky_ctx()) return DISPLAY;
+    return (EGLDisplay)0;   /* EGL_NO_DISPLAY */
 }
 static EGLSurface klegl_GetCurrentSurface(int32_t which) {
     KLEGL_TRACE("eglGetCurrentSurface");
@@ -1470,8 +1643,18 @@ unsigned long kl_egl_swap_count(void) { return g_frames; }
 
 static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
     KLEGL_TRACE("eglSwapBuffers");
-    (void)dpy; (void)s;
+    (void)dpy;
     g_frames++;
+    // XR_KHR_android_surface_swapchain: for a swapchain-bound window this swap is
+    // the "release" — the finished frame is in the default framebuffer right now
+    // and the guest's context is current, the one moment a GL copy into the
+    // swapchain image is legal. Do it BEFORE kl_glfb_present's own FBO-0 capture
+    // below so both read the same finished frame.
+    {
+        kl_egl_surface *swp = (kl_egl_surface *)s;
+        if (swp && swp->xr_swapchain)
+            kl_xr_android_surface_present(swp->xr_swapchain);
+    }
     // The GL object census, on the frame clock: a class whose live count climbs
     // at every loading transition is the leak, and a flat one exonerates the GL
     // path. No-op unless KL_GL_CENSUS names an interval (kl_glfb.h).
@@ -1605,6 +1788,33 @@ void *kl_egl_sym(const char *name) {
     }
     for (size_t i = 0; i < sizeof g_gl_impl / sizeof g_gl_impl[0]; i++)
         if (strcmp(g_gl_impl[i].name, name) == 0) return g_gl_impl[i].fn;
+    // Desktop-GL suffix aliases: the ARB/EXT/OES/KHR name of a function that was
+    // promoted to core is the SAME entry point (the buffer-object family —
+    // glGenBuffersARB etc. — is exactly glGenBuffers). gl4es and the Source/Xash
+    // GL compat shims call the old names. Retry the base name against the real
+    // backends (host GL, our egl/gl impls) before giving up to a stub; only take
+    // it if the base actually resolves, so a genuinely-absent call still aborts by
+    // its real name.
+    {
+        static const char *const sfx[] = { "ARB", "EXT", "OES", "KHR" };
+        size_t len = strlen(name);
+        for (size_t i = 0; i < sizeof sfx / sizeof sfx[0]; i++) {
+            size_t sl = strlen(sfx[i]);
+            if (len <= sl || strcmp(name + len - sl, sfx[i]) != 0) continue;
+            char base[128];
+            if (len - sl >= sizeof base) break;
+            snprintf(base, sizeof base, "%.*s", (int)(len - sl), name);
+            void *b = kl_egl_lookup(base);
+            if (!b) b = kl_glfb_sym(base);
+            if (!b) for (size_t j = 0; j < sizeof g_gl_impl / sizeof g_gl_impl[0]; j++)
+                        if (strcmp(g_gl_impl[j].name, base) == 0) { b = g_gl_impl[j].fn; break; }
+            if (b) {
+                int bs = gl_slot(name);
+                if (bs >= 0) g_gl[bs].resolved = 1;
+                return b;
+            }
+        }
+    }
     int s = gl_slot(name);
     if (s >= 0) g_gl[s].resolved = 1;
     if (gl_is_void(name)) return kl_named_stub(name, (void *)klgl_noop);
@@ -1640,6 +1850,11 @@ int kl_egl_is_handle(const void *h) { return h == (const void *)g_gl_handle; }
 unsigned long kl_egl_frames(void) { return g_frames; }
 
 void kl_egl_report(FILE *f) {
+    // Outside the idempotency guard so it prints on whichever report call reaches
+    // the log: the name of the GL entry point that aborted, when one did.
+    if (kl_gl_last_unimpl[0])
+        fprintf(f, "\n[klepton] the abort was an unimplemented GL entry point: '%s'\n",
+                kl_gl_last_unimpl);
     // Idempotent: this is reachable both from a caller that knows it is dying
     // and from kl_fatal_prepare(), which every fatal path goes through. Printing
     // the graphics surface twice is noise; printing it never is how the first

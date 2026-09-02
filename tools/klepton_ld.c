@@ -131,8 +131,8 @@ static const struct platform PLATFORMS[] = {
     { "macos",       PLATFORM_MACOS,              0x0e0000, 0x0e0000 },  // 14.0
     { "ios",         PLATFORM_IOS,                0x110000, 0x110000 },  // 17.0
     { "iossim",      PLATFORM_IOSSIMULATOR,       0x110000, 0x110000 },
-    { "visionos",    11 /* PLATFORM_VISIONOS */,  0x010000, 0x010000 },  // 1.0
-    { "visionossim", 12 /* ...SIMULATOR */,       0x010000, 0x010000 },
+    { "visionos",    11 /* PLATFORM_VISIONOS */,  0x1a0000, 0x1a0000 },  // 26.0
+    { "visionossim", 12 /* ...SIMULATOR */,       0x1a0000, 0x1a0000 },
 };
 
 int main(int argc, char **argv) {
@@ -495,17 +495,24 @@ int main(int argc, char **argv) {
     uint32_t sz_id   = (uint32_t)align_up(sizeof(struct dylib_command) + strlen(iname) + 1, 8);
     uint32_t sz_ld   = (uint32_t)align_up(sizeof(struct dylib_command) + strlen(libsystem) + 1, 8);
     uint32_t sz_bv   = sizeof(struct build_version_command);
+    uint32_t sz_enc  = sizeof(struct encryption_info_command_64);
     uint32_t sz_st   = sizeof(struct symtab_command);
     uint32_t sz_dst  = sizeof(struct dysymtab_command);
     uint32_t sz_uuid = sizeof(struct uuid_command);
 
+    // LC_ENCRYPTION_INFO_64 goes on DEVICE binaries only: the App Store requires it
+    // (error 90125 without), but the simulator loader rejects a binary that carries
+    // it. Keyed on the platform name so device/sim each get the right shape.
+    int enc = (strstr(plat->name, "sim") == NULL);
     uint32_t ncmds = 3 /* segments */ + 1 /* id */ + 1 /* load libSystem */ +
                      1 /* build version */ + 1 /* symtab */ + 1 /* dysymtab */ + 1 /* uuid */;
+    if (enc) ncmds++;                            /* encryption info */
     // __DATA is only present if the library has a writable group.
     if (ngrp < 2) { ncmds--; sz_data = 0; }
     if (have_x18_seg) ncmds++;
     uint32_t sizeofcmds = sz_text + sz_x18 + sz_data + sz_link + sz_id + sz_ld + sz_bv +
                           sz_st + sz_dst + sz_uuid;
+    if (enc) sizeofcmds += sz_enc;
     if (sizeof(struct mach_header_64) + sizeofcmds > HDR_RESERVE)
         die("load commands (%u bytes) do not fit below the image shift %#llx",
             sizeofcmds, (unsigned long long)HDR_RESERVE);
@@ -656,6 +663,20 @@ int main(int argc, char **argv) {
         b->platform = plat->id; b->minos = plat->minos; b->sdk = plat->sdk;
         b->ntools = 0;
         lc += sz_bv;
+    }
+    // LC_ENCRYPTION_INFO_64 — Apple's App Store validation refuses a Mach-O without
+    // it ("the encryption info ... is either missing or invalid ... not built with
+    // Apple's linker", error 90125). cryptid 0 = not encrypted; the encryptable
+    // region is __TEXT past the header reserve, the same convention a linker-built
+    // dylib uses (cryptoff = HDR_RESERVE, cryptsize = the rest of __TEXT's file bytes).
+    if (enc) {
+        struct encryption_info_command_64 *e = (struct encryption_info_command_64 *)lc;
+        e->cmd = LC_ENCRYPTION_INFO_64; e->cmdsize = sz_enc;
+        e->cryptoff  = (uint32_t)(seg_foff[0] + HDR_RESERVE);
+        e->cryptsize = (uint32_t)(seg_fsize[0] > HDR_RESERVE ? seg_fsize[0] - HDR_RESERVE : 0);
+        e->cryptid   = 0;
+        e->pad       = 0;
+        lc += sz_enc;
     }
     // LC_SYMTAB / LC_DYSYMTAB — empty. Nothing imported, nothing exported.
     {

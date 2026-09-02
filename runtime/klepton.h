@@ -232,4 +232,20 @@ void kl_shim_set_guest_gl(kl_image *img);
 // a hang names the contested mutex's owner, not just its waiters.
 void kl_pthread_report(FILE *out);
 
+// XR_KHR_android_thread_settings (kl_pthread.c): raise a guest-flagged
+// scheduling-critical thread to USER_INTERACTIVE QoS so a streaming guest's
+// receive/decode/submit pipeline is not preempted by the compositor on
+// visionOS. Self-flagging takes a direct self-QoS bump; a cross-thread flag
+// uses a QoS override via the live-thread registry. Gated by KL_XR_THREAD_QOS
+// (default on).
+void kl_pthread_boost_qos(uint64_t threadid);
+
+// __builtin_return_address(1) and deeper walk the x29 frame-record chain, which
+// FAULTS when the immediate caller is guest code that does not keep x29 as a
+// frame pointer (Unity/IL2CPP omit it). Pass __builtin_frame_address(0) from the
+// caller wanting its own "grandcaller" return address; this walks one record up
+// with full stack-bounds validation and returns NULL — never a SIGSEGV — when the
+// chain is not well-formed. Diagnostic use only.
+void *kl_caller_ra2(void *my_frame);
+
 #endif

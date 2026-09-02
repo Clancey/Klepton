@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include "klepton.h"
+#include "kl_mediaplayer.h"
 #include "kl_jni.h"
 #include "kl_fault.h"
 #include "kl_target.h"
@@ -79,6 +80,110 @@ static klj_val klj_fmod_false(void *env, void *self, const klj_val *a, int n) {
 static klj_val klj_fmod_void(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){0};
+}
+
+// Shared void no-op handler. (kl_jni_net.c has its own file-local copy; this
+// one keeps kl_jni_services.c self-contained.)
+static klj_val klj_void_noop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};
+}
+
+// ---- android.media.MediaPlayer -> kl_mediaplayer (kl_mediaplayer.c) ----
+// GTA Vice City plays its intro/cutscene movies (movies/*.mpg) through this. The
+// game renders the video itself and uses MediaPlayer only for the audio; the
+// files are MPEG-1 program streams, which AVFoundation cannot open, so
+// kl_mediaplayer demuxes them and decodes the Layer II audio via AudioQueue. The
+// native player hangs off the Java object's data slot (klj_new_object_data), the
+// same shape UE4's MediaPlayer14 uses.
+static kl_mediaplayer *klj_mp_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return (o && strcmp(o->cls, "android/media/MediaPlayer") == 0) ? o->data : NULL;
+}
+static klj_val klj_MediaPlayer_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = klj_new_object_data("android/media/MediaPlayer",
+                                              kl_mediaplayer_new())};
+}
+static klj_val klj_MediaPlayer_setDataSource(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    kl_mediaplayer *mp = klj_mp_of(self);
+    const char *s = n > 0 ? klj_str(a[0].l) : NULL;
+    if (mp && s) {
+        char kp[1024];
+        kl_mediaplayer_set_source(mp, kl_guest_path(s, kp, sizeof kp));
+    }
+    return (klj_val){0};
+}
+static klj_val klj_MediaPlayer_prepare(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    kl_mediaplayer *mp = klj_mp_of(self); if (mp) kl_mediaplayer_prepare(mp);
+    return (klj_val){0};
+}
+static klj_val klj_MediaPlayer_start(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    kl_mediaplayer *mp = klj_mp_of(self); if (mp) kl_mediaplayer_start(mp);
+    return (klj_val){0};
+}
+static klj_val klj_MediaPlayer_pause(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    kl_mediaplayer *mp = klj_mp_of(self); if (mp) kl_mediaplayer_pause(mp);
+    return (klj_val){0};
+}
+static klj_val klj_MediaPlayer_stop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    kl_mediaplayer *mp = klj_mp_of(self); if (mp) kl_mediaplayer_stop(mp);
+    return (klj_val){0};
+}
+static klj_val klj_MediaPlayer_release(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    kl_mediaplayer *mp = klj_mp_of(self);
+    if (mp) kl_mediaplayer_release(mp);
+    klj_object *o = klj_as_object(self);   // so a second release can't reuse it
+    if (o) o->data = NULL;
+    return (klj_val){0};
+}
+static klj_val klj_MediaPlayer_setLooping(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    kl_mediaplayer *mp = klj_mp_of(self);
+    if (mp) kl_mediaplayer_set_looping(mp, n > 0 && a[0].j != 0);
+    return (klj_val){0};
+}
+static klj_val klj_MediaPlayer_setVolume(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    kl_mediaplayer *mp = klj_mp_of(self);
+    // setVolume(float left, float right): a 'F' arg is promoted to double and
+    // lives in .d (see klj_call_common), so read it as a double — reading four
+    // bytes of .j gets the low half of the double's bits (~0), which is why the
+    // clip started at full volume and only "settled" when a later call happened
+    // to decode non-zero. Left channel; clamp to the 0..1 AudioQueue expects.
+    if (mp && n > 0) {
+        float v = (float)a[0].d;
+        if (v < 0) v = 0; else if (v > 1) v = 1;
+        kl_mediaplayer_set_volume(mp, v);
+    }
+    return (klj_val){0};
+}
+static klj_val klj_MediaPlayer_seekTo(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    kl_mediaplayer *mp = klj_mp_of(self);
+    if (mp) kl_mediaplayer_seek_ms(mp, n > 0 ? (int)a[0].j : 0);
+    return (klj_val){0};
+}
+static klj_val klj_MediaPlayer_getCurrentPosition(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    kl_mediaplayer *mp = klj_mp_of(self);
+    return (klj_val){.j = (uint64_t)(mp ? kl_mediaplayer_position_ms(mp) : 0)};
+}
+static klj_val klj_MediaPlayer_getDuration(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    kl_mediaplayer *mp = klj_mp_of(self);
+    return (klj_val){.j = (uint64_t)(mp ? kl_mediaplayer_duration_ms(mp) : 0)};
+}
+static klj_val klj_MediaPlayer_isPlaying(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    kl_mediaplayer *mp = klj_mp_of(self);
+    return (klj_val){.j = (uint64_t)(mp && kl_mediaplayer_is_playing(mp))};
 }
 
 // UnityPlayer.getNetworkConnectivity() — the native side of Unity's
@@ -476,6 +581,50 @@ static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, in
         KLJ_LOG("Locale.getDefault() -> %s_%s (from the host LANG)", lang, country);
     }
     return (klj_val){.l = locale};
+}
+
+// The SYSTEM locale chain: Resources.getSystem().getConfiguration()
+// .getLocales().get(0). AC Nexus reads its locale THIS way during boot (the
+// UbiServices first-boot flow), and every step used to fall through to "no
+// host implementation" - the chain then dispatched against java/lang/Object
+// and the game never got an answer. Each object is a singleton with the right
+// CLASS NAME so the next call in the chain dispatches correctly, and the
+// LocaleList hands back the same pinned Locale getDefault() serves - one
+// locale, however it is asked.
+static klj_val klj_Resources_getSystem(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *res;
+    if (!res) {
+        res = kl_jni_new_object("android/content/res/Resources");
+        if (res) klj_as_object(res)->pinned = 1;
+    }
+    return (klj_val){.l = res};
+}
+static klj_val klj_Resources_getConfiguration(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *cfg;
+    if (!cfg) {
+        cfg = kl_jni_new_object("android/content/res/Configuration");
+        if (cfg) klj_as_object(cfg)->pinned = 1;
+    }
+    return (klj_val){.l = cfg};
+}
+static klj_val klj_Configuration_getLocales(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *list;
+    if (!list) {
+        list = kl_jni_new_object("android/os/LocaleList");
+        if (list) klj_as_object(list)->pinned = 1;
+    }
+    return (klj_val){.l = list};
+}
+static klj_val klj_LocaleList_size(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};
+}
+static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, int n);
+static klj_val klj_LocaleList_get(void *env, void *self, const klj_val *a, int n) {
+    return klj_Locale_getDefault(env, self, a, n);
 }
 
 static klj_val klj_Locale_getLanguage(void *env, void *self, const klj_val *a, int n) {
@@ -986,6 +1135,14 @@ static klj_val klj_PackageInfo_getLongVersionCode(void *env, void *self,
     return (klj_val){.l = kl_jni_new_string(name)};
 }
 
+// PackageInfo.reqFeatures — the declared <uses-feature> list. Served as an
+// empty FeatureInfo[] rather than null: guests that read this walk the array
+// (Unity/Oculus scan it for android.hardware.vr.headtracking), and a null would
+// NPE the walk. Empty means "declares no features", which is harmless here.
+ klj_val klj_PackageInfo_reqFeatures(void) {
+    return (klj_val){.l = klj_new_array('L', "android/content/pm/FeatureInfo", 0)};
+}
+
 // PackageInfo, like ApplicationInfo, is read field-by-field.
 static klj_val klj_PM_getPackageInfo(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -1041,16 +1198,18 @@ static klj_val klj_Context_getExternalFilesDir(void *env, void *self, const klj_
     (void)env; (void)self;
     const char *type = n > 0 && a[0].l ? klj_str(a[0].l) : NULL;
     char path[1024];
-    if (type && *type) snprintf(path, sizeof path, "%s/files/%s", kl_jni_files_dir(), type);
-    else               snprintf(path, sizeof path, "%s/files", kl_jni_files_dir());
+    // Return the SHORT /sdcard spelling, not kl_jni_files_dir() (the ~90-char
+    // container path): /sdcard maps to files_dir via kl_guest_path, so the two
+    // resolve identically, but a guest that appends "/gamedata" then a FORTIFY'd
+    // strcat into a 128-byte buffer (vicecity) overflows on the long form.
+    if (type && *type) snprintf(path, sizeof path, "/sdcard/files/%s", type);
+    else               snprintf(path, sizeof path, "/sdcard/files");
     KLJ_LOG("getExternalFilesDir(%s) -> %s", type ? type : "null", path);
     return (klj_val){.l = klj_new_file(path)};
 }
 static klj_val klj_Context_getFilesDir(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    char path[1024];
-    snprintf(path, sizeof path, "%s/files", kl_jni_files_dir());
-    return (klj_val){.l = klj_new_file(path)};
+    return (klj_val){.l = klj_new_file("/sdcard/files")};   // short form; see getExternalFilesDir
 }
 static klj_val klj_Context_getCacheDir(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -1084,6 +1243,41 @@ static klj_val klj_ActivityThread_getApplication(void *env, void *self, const kl
     (void)env; (void)self; (void)a; (void)n;
     static void *app;
     return klj_singleton("android/app/Application", &app);
+}
+// The Source VR launcher (portal/hl2) reaches its Activity through
+// ActivityThread.currentActivityThread().getTopResumedActivity() — the one
+// foreground Activity, which here is the single Activity singleton the rest of
+// the JNI surface answers with.
+static klj_val klj_ActivityThread_getTopResumedActivity(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_activity()};
+}
+
+// AC Nexus / UbiServices bridge. Ubisoft's Java bridge hands its SDK the Unity
+// Activity through this static method and expects a status back. We accept it
+// and answer 0 (success) - the handshake HAS to succeed or the SDK is left with
+// a null Activity and spins on getApplication()/getSharedPreferences() forever
+// (the "Scheduler::dispatch 1255 ms" stalls). Accepting the injection is NOT the
+// same as granting an online session: no Ubisoft Connect credentials are handed
+// out anywhere, so the SDK's own connectivity check is what decides online vs
+// offline, and with no route to Ubisoft it stays offline. See the two
+// java/lang/Object bindings below for the calls it makes on that (formerly null)
+// Activity.
+// AC Nexus's native loading screen: com.nexusvr.loadingscreen.LoadingScreen.
+// stopUpdatingLoadingScreen() is the game telling the loading screen to go
+// away. We drive the loading video from the host, so honour it: suppress the
+// skybox so the eye (the menu, once it renders) shows through. A later movie
+// re-shows it. Without this we never stop covering the eye with the backdrop.
+static klj_val klj_LoadingScreen_stopUpdating(void *env, void *self,
+                                              const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    kl_loadingvideo_stop();
+    return (klj_val){.j = 0};
+}
+static klj_val klj_UbiJavaInterface_injectActivity(void *env, void *self,
+                                                   const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
 }
 
 // Our storage is a plain writable directory, so "mounted" is the honest state.
@@ -1122,7 +1316,7 @@ static klj_val klj_Environment_getExternalStorageState(void *env, void *self, co
 }
 static klj_val klj_Environment_getExternalStorageDirectory(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.l = klj_new_file(kl_jni_files_dir())};
+    return (klj_val){.l = klj_new_file("/sdcard")};   // short form; see getExternalFilesDir
 }
 
 // MANAGE_EXTERNAL_STORAGE — "does this app hold unrestricted access to shared
@@ -1444,6 +1638,45 @@ static klj_val klj_AssetManager_open(void *env, void *self, const klj_val *a, in
     return (klj_val){.l = obj};
 }
 
+// SDL's SDLActivity.getAssetsList(boolean, String path) -> String[]: the names
+// of the entries directly under <assets>/<path>. SDL calls it to enumerate a
+// bundled directory (cs1/Xash lists its assets this way). Serve it off the same
+// assets root AssetManager.open uses; an unreadable/empty dir is a zero-length
+// array, which is what Android returns and the guest handles.
+static klj_val klj_SDLActivity_getAssetsList(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *rel = n > 1 ? klj_str(a[1].l) : NULL;   // (boolean keepOpen, String path)
+    char dir[1024];
+    if (rel && *rel) snprintf(dir, sizeof dir, "%s/%s", g_assets_dir, rel);
+    else             snprintf(dir, sizeof dir, "%s", g_assets_dir);
+
+    char  **names = NULL;
+    size_t  count = 0, cap = 0;
+    DIR *d = opendir(dir);
+    if (d) {
+        for (struct dirent *e; (e = readdir(d)) != NULL; ) {
+            if (e->d_name[0] == '.' &&
+                (e->d_name[1] == '\0' || (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+                continue;                                // skip "." and ".."
+            if (count == cap) {
+                size_t ncap = cap ? cap * 2 : 32;
+                char **grown = realloc(names, ncap * sizeof *grown);
+                if (!grown) break;
+                names = grown; cap = ncap;
+            }
+            names[count++] = strdup(e->d_name);
+        }
+        closedir(d);
+    }
+    KLJ_LOG("SDLActivity.getAssetsList(\"%s\") -> %zu entr%s", rel ? rel : "", count, count == 1 ? "y" : "ies");
+
+    void *arr = klj_new_array('L', KLJ_CLASS_STRING, (int)count);
+    void **out = klj_arr(arr)->data;
+    for (size_t i = 0; i < count; i++) { out[i] = kl_jni_new_string(names[i]); free(names[i]); }
+    free(names);
+    return (klj_val){.l = arr};
+}
+
 // Scanner, only as far as Unity uses it: wrap a stream, set a delimiter, pull
 // tokens. Java's delimiter is a *regex*, and we do not have one — so we handle
 // the input-anchor idioms exactly and treat anything else as a literal, warning
@@ -1558,8 +1791,25 @@ const klj_binding klj_bind_services[] = {
     {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "getError", "()Ljava/lang/String;", klj_OculusDeviceConfig_getError},
     {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "didPrefetchParamName", "(Ljava/lang/String;)Z", klj_OculusDeviceConfig_didPrefetchParamName},
     {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "getBoolean", "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z", klj_OculusDeviceConfig_getBoolean},
+    // Meta's unified telemetry logger (olar/UE5). There is no telemetry pipe on
+    // this host — the ovrp Qpl* / consent family are already no-ops — so the
+    // logger is a synthetic singleton and reportEvent drops the event. getInstance
+    // is a static factory on the class, so klj_View_new returns an object of it;
+    // reportEvent takes a built AnalyticsEvent and returns void.
+    {"com/oculus/os/UnifiedTelemetryLogger", "getInstance", "(Landroid/content/Context;)Lcom/oculus/os/UnifiedTelemetryLogger;", klj_View_new},
+    {"com/oculus/os/UnifiedTelemetryLogger", "reportEvent", "(Lcom/oculus/os/AnalyticsEvent;Z)V", klj_void_noop},
+    // The event the game builds to hand reportEvent: a name in the ctor, then
+    // chained setExtra(key, value) calls. Nothing is recorded (reportEvent drops
+    // it), so the ctor is a no-op and setExtra returns the builder for chaining.
+    {"com/oculus/os/AnalyticsEvent", "<init>", "(Ljava/lang/String;)V", klj_void_noop},
+    {"com/oculus/os/AnalyticsEvent", "setExtra", "(Ljava/lang/String;Ljava/lang/Object;)Lcom/oculus/os/AnalyticsEvent;", klj_AlertBuilder_self},
     {"android/os/Vibrator", "hasVibrator", "()Z", klj_Vibrator_hasVibrator},
     {"android/content/pm/PackageManager", "getInstallerPackageName", "(Ljava/lang/String;)Ljava/lang/String;", klj_PackageManager_getInstallerPackageName},
+    {"android/content/res/Resources", "getSystem", "()Landroid/content/res/Resources;", klj_Resources_getSystem},
+    {"android/content/res/Resources", "getConfiguration", "()Landroid/content/res/Configuration;", klj_Resources_getConfiguration},
+    {"android/content/res/Configuration", "getLocales", "()Landroid/os/LocaleList;", klj_Configuration_getLocales},
+    {"android/os/LocaleList", "get", "(I)Ljava/util/Locale;", klj_LocaleList_get},
+    {"android/os/LocaleList", "size", "()I", klj_LocaleList_size},
     {"java/util/Locale", "getDefault",  "()Ljava/util/Locale;",   klj_Locale_getDefault},
     {"java/util/Locale", "getLanguage", "()Ljava/lang/String;",   klj_Locale_getLanguage},
     {"java/util/Locale", "getCountry",  "()Ljava/lang/String;",   klj_Locale_getCountry},
@@ -1602,6 +1852,11 @@ const klj_binding klj_bind_services[] = {
     {"android/widget/CompoundButton", "setOnCheckedChangeListener",
      "(Landroid/widget/CompoundButton$OnCheckedChangeListener;)V", klj_View_void},
     {"android/content/Context", "getAssets", "()Landroid/content/res/AssetManager;", klj_Context_getAssets},
+    // SDL's SDLActivity.getAssets(boolean) — same AssetManager, one extra flag
+    // (whether to keep it open) we don't need. cs1 (Xash/SDL2) calls this to read
+    // the APK assets root; hand back the same singleton Context.getAssets serves.
+    {"org/libsdl/app/SDLActivity", "getAssets", "(Z)Landroid/content/res/AssetManager;", klj_Context_getAssets},
+    {"org/libsdl/app/SDLActivity", "getAssetsList", "(ZLjava/lang/String;)[Ljava/lang/String;", klj_SDLActivity_getAssetsList},
     {"android/content/Context", "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;", klj_Context_getExternalFilesDir},
     {"android/content/Context", "getFilesDir", "()Ljava/io/File;", klj_Context_getFilesDir},
     {"android/content/Context", "getCacheDir", "()Ljava/io/File;", klj_Context_getCacheDir},
@@ -1610,6 +1865,20 @@ const klj_binding klj_bind_services[] = {
     {"android/app/ActivityThread", "currentActivityThread", "()Landroid/app/ActivityThread;",
      klj_ActivityThread_current},
     {"android/app/ActivityThread", "getApplication", "()Landroid/app/Application;",
+     klj_ActivityThread_getApplication},
+    {"android/app/ActivityThread", "getTopResumedActivity", "()Landroid/app/Activity;",
+     klj_ActivityThread_getTopResumedActivity},
+    // AC Nexus's UbiServices SDK, offline. Accept the Activity injection, then
+    // answer the calls it makes on the Activity it thinks it has: permissive
+    // reports the null's class as java/lang/Object, so bind getApplication there
+    // and hand back the real Application. (getSharedPreferences is answered the
+    // same way in kl_jni_prefs.c.)
+    {"com/ubisoft/bridge/JavaInterface", "injectActivityJava",
+     "(Lcom.unity3d.player.UnityPlayerActivity;)I", klj_UbiJavaInterface_injectActivity},
+    // AC Nexus native loading screen - hide the host skybox when the game asks.
+    {"com/nexusvr/loadingscreen/LoadingScreen", "stopUpdatingLoadingScreen",
+     "()V", klj_LoadingScreen_stopUpdating},
+    {"java/lang/Object", "getApplication", "()Landroid/app/Application;",
      klj_ActivityThread_getApplication},
     {"android/content/Context", "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", klj_Context_getApplicationInfo},
     {"android/content/pm/PackageManager", "getPackageInfo",
@@ -1668,5 +1937,24 @@ const klj_binding klj_bind_services[] = {
 
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetAssetManager",
      "()Landroid/content/res/AssetManager;", klj_Context_getAssets},
+
+    // android.media.MediaPlayer — GTA Vice City's intro/cutscene movie audio,
+    // decoded by kl_mediaplayer (MPEG-1 program-stream demux + Layer II decode).
+    // setAudioStreamType is a no-op (stream routing is meaningless here); the rest
+    // drive the native player.
+    {"android/media/MediaPlayer", "<init>",             "()V",                      klj_MediaPlayer_init},
+    {"android/media/MediaPlayer", "setAudioStreamType", "(I)V",                     klj_void_noop},
+    {"android/media/MediaPlayer", "setDataSource",      "(Ljava/lang/String;)V",    klj_MediaPlayer_setDataSource},
+    {"android/media/MediaPlayer", "prepare",            "()V",                      klj_MediaPlayer_prepare},
+    {"android/media/MediaPlayer", "start",              "()V",                      klj_MediaPlayer_start},
+    {"android/media/MediaPlayer", "pause",              "()V",                      klj_MediaPlayer_pause},
+    {"android/media/MediaPlayer", "stop",               "()V",                      klj_MediaPlayer_stop},
+    {"android/media/MediaPlayer", "release",            "()V",                      klj_MediaPlayer_release},
+    {"android/media/MediaPlayer", "setLooping",         "(Z)V",                     klj_MediaPlayer_setLooping},
+    {"android/media/MediaPlayer", "setVolume",          "(FF)V",                    klj_MediaPlayer_setVolume},
+    {"android/media/MediaPlayer", "seekTo",             "(I)V",                     klj_MediaPlayer_seekTo},
+    {"android/media/MediaPlayer", "getCurrentPosition", "()I",                      klj_MediaPlayer_getCurrentPosition},
+    {"android/media/MediaPlayer", "getDuration",        "()I",                      klj_MediaPlayer_getDuration},
+    {"android/media/MediaPlayer", "isPlaying",          "()Z",                      klj_MediaPlayer_isPlaying},
     {0}
 };

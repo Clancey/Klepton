@@ -66,6 +66,40 @@ int       kl_avdec_complete(kl_avdec *d);
 const void *kl_avdec_frame(kl_avdec *d, int *w, int *h, size_t *bytes,
                            unsigned long long *serial);
 
+// ---------------------------------------------------------------------------
+// Demux-only path, for Unity's NDK video (AMediaExtractor + AMediaCodec).
+//
+// Unlike kl_avdec above (an all-in-one player for UE4's Java MediaPlayer),
+// Unity drives demux and decode as two separate NDK objects: it pulls compressed
+// samples from AMediaExtractor and feeds them to AMediaCodec. kl_mediandk's
+// AMediaCodec is kl_vtdec, which decodes Annex-B — so this hands the container's
+// video back as an Annex-B elementary stream (parameter sets injected on every
+// keyframe), which is exactly what that path already absorbs. Reuses the OBB
+// byte-range slicing kl_avdec_open uses.
+typedef struct kl_avdemux kl_avdemux;
+
+// Open (container, offset, length) — offset/length address a sub-range inside an
+// OBB, 0/0 for a plain file. NULL if the file has no video track / cannot open.
+kl_avdemux *kl_avdemux_open(const char *container, long long offset, long long size);
+void        kl_avdemux_close(kl_avdemux *m);
+
+// Track facts for AMediaExtractor_getTrackFormat. `mime` is "video/avc" or
+// "video/hevc" (static string, not owned). Any out-param may be NULL.
+int  kl_avdemux_info(kl_avdemux *m, int *w, int *h, const char **mime,
+                     long long *duration_us, float *fps);
+
+// The CURRENT sample. read copies it as Annex-B into buf and returns its byte
+// length (the full length even if it exceeds cap, matching AMediaExtractor); -1
+// at end of stream. time/keyframe describe that same current sample.
+long long kl_avdemux_sample_time_us(kl_avdemux *m);
+int       kl_avdemux_sample_keyframe(kl_avdemux *m);
+long      kl_avdemux_read(kl_avdemux *m, unsigned char *buf, unsigned long cap);
+
+// Move to the next sample; 1 if one is now current, 0 at end of stream.
+int  kl_avdemux_advance(kl_avdemux *m);
+// Seek so the next current sample is at/after us; 1 on success.
+int  kl_avdemux_seek_us(kl_avdemux *m, long long us);
+
 #ifdef __cplusplus
 }
 #endif

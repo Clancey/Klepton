@@ -73,6 +73,13 @@ int   kl_vulkan_available(void);
 // chose GLES would answer false here, correctly.
 int kl_vulkan_guest_active(void);
 
+// The 8-byte LUID of the GPU the guest's Vulkan instance sees, for ovrp_GetDisplay
+// AdapterId2 to hand back so Unity's OculusXR device match picks the right (only)
+// VkPhysicalDevice instead of a NULL one. Fills out[8] and returns 1 when a Vulkan
+// instance exists and reports a valid LUID; returns 0 (out untouched) otherwise —
+// a GLES guest, where the adapter id must stay empty.
+int kl_vulkan_display_luid(uint8_t out[8]);
+
 // Create (or return) the eye image for a swapchain stage and eye. The returned
 // value is the VkImage handle widened to 64 bits, which is exactly what
 // ovrp_GetLayerTexture2's out-parameter carries.
@@ -112,13 +119,28 @@ unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
 // A layer allocated for eye 0 alone — the common case, one texture with a
 // per-eye ViewportRect selecting the part — answers eye 1 from it rather than
 // with nothing. NULL when the layer has no storage for that stage.
+void *kl_vulkan_mtl_for_handle(unsigned long long h);
 void *kl_vulkan_layer_mtl_texture(int layer_key, int stage, int eye,
                                   int *w, int *h);
+
+// Rename a layer's slot in the image table. kl_ovrp calls this when a guest
+// destroys a layer and sets up an identical one (wrath2's "compiling shaders"
+// toast does it on every text update): the new id inherits the old id's
+// images, still holding the previous picture, instead of allocating a fresh
+// empty one that blinks the layer off until the guest has drawn into it. This
+// is the same reuse the slot's GL names have always had. A no-op if the old
+// key is not in the table.
+void kl_vulkan_layer_rekey(int old_key, int new_key);
+
+// The MTLTexture behind the wild-handle scratch — the image AC Nexus actually
+// composites its frame into. NULL until the scratch exists. w/h report 4096.
+void *kl_vulkan_wild_scratch_mtl(int *w, int *h);
 
 // Write both eyes of a stage out as PNGs. Called at frame submission, which on
 // this path is ovrp_EndFrame4 — the guest's own assertion that it has finished
 // drawing them.
 void kl_vulkan_capture_eyes(unsigned frame, int stage);
+void kl_vulkan_capture_layers(void);
 
 // "The guest has finished drawing this stage's eye textures." Called from the
 // same place the capture is (ovrp_EndFrame4), and it is what a COMPOSITOR waits

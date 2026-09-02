@@ -419,3 +419,266 @@ const void *kl_avdec_frame(kl_avdec *d, int *w, int *h, size_t *bytes,
     pthread_mutex_unlock(&d->mu);
     return p;
 }
+
+// ===========================================================================
+// Demux-only path for Unity's NDK video (AMediaExtractor). See kl_avdec.h.
+//
+// AVAssetReader with nil output settings yields the track's COMPRESSED samples,
+// but in AVCC framing (4-byte length prefixes, parameter sets held out of band
+// in the format description). kl_vtdec — behind AMediaCodec — decodes Annex-B
+// (start-code NALs, parameter sets in-band), so every sample is converted here:
+// length prefixes become 00 00 00 01 start codes, and the SPS/PPS(/VPS) are
+// prepended on every keyframe so the decoder can build its format from the
+// stream exactly as it does for Steam Link.
+// ===========================================================================
+
+struct kl_avdemux {
+    char        path[1024];
+    int         width, height;
+    long long   duration_us;
+    const char *mime;                // static "video/avc" | "video/hevc"
+    float       fps;                 // nominal frame rate, 0 if unknown
+
+    void       *asset;               // CFBridgingRetain'd Obj-C objects
+    void       *track;
+    void       *reader;
+    void       *out;
+
+    unsigned char *psets;            // parameter sets as Annex-B, prepended on keyframes
+    size_t         psets_len;
+    int            nal_len_size;     // AVCC length-prefix width (usually 4)
+
+    unsigned char *cur;              // current sample, Annex-B
+    size_t         cur_len;
+    long long      cur_pts_us;
+    int            cur_key;
+    int            eos;
+};
+
+static const uint8_t k_startcode[4] = { 0, 0, 0, 1 };
+
+// Pull the format description's parameter sets into one Annex-B blob, and learn
+// the NAL length-prefix width. Returns 0 on failure.
+static int demux_build_psets(kl_avdemux *m, CMFormatDescriptionRef fmt, int hevc) {
+    size_t total = 0, count = 0;
+    int nalLen = 4;
+    // First pass: index 0 tells us the count and the header length.
+    const uint8_t *p = NULL; size_t sz = 0;
+    OSStatus st = hevc
+        ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 0, &p, &sz, &count, &nalLen)
+        : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, 0, &p, &sz, &count, &nalLen);
+    if (st != noErr || count == 0) return 0;
+    m->nal_len_size = nalLen > 0 ? nalLen : 4;
+    for (size_t i = 0; i < count; i++) {
+        st = hevc
+            ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, i, &p, &sz, NULL, NULL)
+            : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &p, &sz, NULL, NULL);
+        if (st != noErr) return 0;
+        total += 4 + sz;
+    }
+    m->psets = malloc(total);
+    if (!m->psets) return 0;
+    size_t o = 0;
+    for (size_t i = 0; i < count; i++) {
+        st = hevc
+            ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, i, &p, &sz, NULL, NULL)
+            : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &p, &sz, NULL, NULL);
+        if (st != noErr) { free(m->psets); m->psets = NULL; return 0; }
+        memcpy(m->psets + o, k_startcode, 4); o += 4;
+        memcpy(m->psets + o, p, sz);          o += sz;
+    }
+    m->psets_len = total;
+    return 1;
+}
+
+// Convert one AVCC sample buffer to Annex-B, prepending parameter sets when it
+// is a keyframe. Stores the result in m->cur.
+static int demux_convert(kl_avdemux *m, CMSampleBufferRef sb) {
+    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+    if (!bb) return 0;
+    size_t avcc_len = CMBlockBufferGetDataLength(bb);
+    unsigned char *avcc = malloc(avcc_len ? avcc_len : 1);
+    if (!avcc) return 0;
+    if (CMBlockBufferCopyDataBytes(bb, 0, avcc_len, avcc) != noErr) { free(avcc); return 0; }
+
+    // Keyframe? kCMSampleAttachmentKey_NotSync absent or false means "sync".
+    int key = 1;
+    CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+    if (atts && CFArrayGetCount(atts) > 0) {
+        CFDictionaryRef d0 = CFArrayGetValueAtIndex(atts, 0);
+        CFBooleanRef notSync = NULL;
+        if (d0 && CFDictionaryGetValueIfPresent(d0, kCMSampleAttachmentKey_NotSync,
+                                                (const void **)&notSync)
+               && notSync && CFBooleanGetValue(notSync))
+            key = 0;
+    }
+
+    // Worst-case output: psets (if key) + every NAL grows by (4 - nal_len_size),
+    // which is 0 for the usual 4-byte prefix. Size it exactly by walking once.
+    int nls = m->nal_len_size;
+    size_t body = 0, pos = 0;
+    while (pos + (size_t)nls <= avcc_len) {
+        uint32_t l = 0;
+        for (int i = 0; i < nls; i++) l = (l << 8) | avcc[pos + i];
+        pos += nls;
+        if (l == 0 || pos + l > avcc_len) break;   // malformed; stop cleanly
+        body += 4 + l;
+        pos += l;
+    }
+    size_t out_len = body + (key ? m->psets_len : 0);
+    unsigned char *out = malloc(out_len ? out_len : 1);
+    if (!out) { free(avcc); return 0; }
+    size_t o = 0;
+    if (key && m->psets_len) { memcpy(out, m->psets, m->psets_len); o = m->psets_len; }
+    pos = 0;
+    while (pos + (size_t)nls <= avcc_len) {
+        uint32_t l = 0;
+        for (int i = 0; i < nls; i++) l = (l << 8) | avcc[pos + i];
+        pos += nls;
+        if (l == 0 || pos + l > avcc_len) break;
+        memcpy(out + o, k_startcode, 4); o += 4;
+        memcpy(out + o, avcc + pos, l);  o += l;
+        pos += l;
+    }
+    free(avcc);
+
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+    free(m->cur);
+    m->cur = out;
+    m->cur_len = o;
+    m->cur_pts_us = CMTIME_IS_VALID(pts) ? (long long)(CMTimeGetSeconds(pts) * 1e6) : 0;
+    m->cur_key = key;
+    return 1;
+}
+
+// Pull the next sample into m->cur; sets m->eos at end of stream.
+static void demux_pull(kl_avdemux *m) {
+    AVAssetReaderTrackOutput *out = (__bridge AVAssetReaderTrackOutput *)m->out;
+    for (;;) {
+        CMSampleBufferRef sb = [out copyNextSampleBuffer];
+        if (!sb) { m->eos = 1; free(m->cur); m->cur = NULL; m->cur_len = 0; return; }
+        int ok = demux_convert(m, sb);
+        CFRelease(sb);
+        if (ok) return;                 // a sample with no data buffer is skipped
+    }
+}
+
+static int demux_start_reader(kl_avdemux *m, CMTime from) {
+    AVAsset *asset = (__bridge AVAsset *)m->asset;
+    AVAssetTrack *track = (__bridge AVAssetTrack *)m->track;
+    NSError *err = nil;
+    AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
+    if (!r) return 0;
+    // nil outputSettings: hand back the COMPRESSED samples, not decoded pixels.
+    AVAssetReaderTrackOutput *o =
+        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:nil];
+    o.alwaysCopiesSampleData = NO;
+    if (![r canAddOutput:o]) return 0;
+    [r addOutput:o];
+    if (CMTIME_IS_VALID(from) && CMTimeGetSeconds(from) > 0)
+        r.timeRange = CMTimeRangeMake(from, kCMTimePositiveInfinity);
+    if (![r startReading]) return 0;
+    if (m->reader) CFBridgingRelease(m->reader);
+    if (m->out)    CFBridgingRelease(m->out);
+    m->reader = (void *)CFBridgingRetain(r);
+    m->out    = (void *)CFBridgingRetain(o);
+    return 1;
+}
+
+kl_avdemux *kl_avdemux_open(const char *container, long long offset, long long size) {
+    if (!container || !*container) return NULL;
+    char real[1024];
+    if (offset > 0 || size > 0) {
+        if (!slice_out(container, offset, size, real, sizeof real)) return NULL;
+    } else {
+        snprintf(real, sizeof real, "%s", container);
+    }
+    kl_avdemux *m = calloc(1, sizeof *m);
+    if (!m) return NULL;
+    snprintf(m->path, sizeof m->path, "%s", real);
+    m->nal_len_size = 4;
+
+    @autoreleasepool {
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:real]];
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+        AVAssetTrack *t = first_video_track(asset);
+        if (!t) {
+            fprintf(stderr, "  [avdemux] %s carries no video track\n", real);
+            free(m); return NULL;
+        }
+        CMFormatDescriptionRef fmt =
+            (__bridge CMFormatDescriptionRef)t.formatDescriptions.firstObject;
+        if (!fmt) { free(m); return NULL; }
+        FourCharCode sub = CMFormatDescriptionGetMediaSubType(fmt);
+        int hevc = (sub == kCMVideoCodecType_HEVC);
+        m->mime = hevc ? "video/hevc" : "video/avc";
+        if (!demux_build_psets(m, fmt, hevc)) {
+            fprintf(stderr, "  [avdemux] %s: could not read parameter sets\n", real);
+            free(m); return NULL;
+        }
+        CGSize sz = t.naturalSize;
+        m->width = (int)sz.width; m->height = (int)sz.height;
+        m->duration_us = (long long)(CMTimeGetSeconds(asset.duration) * 1e6);
+        m->fps = t.nominalFrameRate;
+        m->asset = (void *)CFBridgingRetain(asset);
+        m->track = (void *)CFBridgingRetain(t);
+        if (!demux_start_reader(m, kCMTimeZero)) {
+            fprintf(stderr, "  [avdemux] %s: reader would not start\n", real);
+            kl_avdemux_close(m); return NULL;
+        }
+    }
+    demux_pull(m);      // make the first sample current
+    fprintf(stderr, "  [avdemux] %s: %s %dx%d, %lld us\n",
+            m->path, m->mime, m->width, m->height, m->duration_us);
+    return m;
+}
+
+void kl_avdemux_close(kl_avdemux *m) {
+    if (!m) return;
+    if (m->out)    CFBridgingRelease(m->out);
+    if (m->reader) CFBridgingRelease(m->reader);
+    if (m->track)  CFBridgingRelease(m->track);
+    if (m->asset)  CFBridgingRelease(m->asset);
+    free(m->psets);
+    free(m->cur);
+    free(m);
+}
+
+int kl_avdemux_info(kl_avdemux *m, int *w, int *h, const char **mime, long long *dur,
+                    float *fps) {
+    if (!m) return 0;
+    if (w)    *w = m->width;
+    if (h)    *h = m->height;
+    if (mime) *mime = m->mime;
+    if (dur)  *dur = m->duration_us;
+    if (fps)  *fps = m->fps;
+    return 1;
+}
+
+long long kl_avdemux_sample_time_us(kl_avdemux *m) {
+    return (m && !m->eos) ? m->cur_pts_us : -1;
+}
+
+int kl_avdemux_sample_keyframe(kl_avdemux *m) {
+    return (m && !m->eos) ? m->cur_key : 0;
+}
+
+long kl_avdemux_read(kl_avdemux *m, unsigned char *buf, unsigned long cap) {
+    if (!m || m->eos || !m->cur) return -1;
+    if (buf && cap) memcpy(buf, m->cur, m->cur_len < cap ? m->cur_len : cap);
+    return (long)m->cur_len;          // full size, AMediaExtractor convention
+}
+
+int kl_avdemux_advance(kl_avdemux *m) {
+    if (!m || m->eos) return 0;
+    demux_pull(m);
+    return m->eos ? 0 : 1;
+}
+
+int kl_avdemux_seek_us(kl_avdemux *m, long long us) {
+    if (!m) return 0;
+    m->eos = 0;
+    if (!demux_start_reader(m, CMTimeMake(us, 1000000))) return 0;
+    demux_pull(m);
+    return m->eos ? 0 : 1;
+}

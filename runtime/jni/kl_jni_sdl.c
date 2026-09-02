@@ -25,6 +25,7 @@
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_va.h"
+#include "kl_mono.h"
 #include "kl_jni_int.h"
 
 // ------------------------------------------------------------- SDLActivity --
@@ -141,6 +142,17 @@ static klj_val klj_SDLA_getNativeSurface(void *env, void *self, const klj_val *a
     return (klj_val){.l = kl_jni_new_object("android/view/Surface")};
 }
 
+// SDLActivity.getDisplayDPI() -> DisplayMetrics. Must return a NON-NULL object:
+// HL2Q3VR's per-frame XR graphics-binding check (libsourcevr 0x11400, reached from
+// the frame loop via 0x14cd4) calls this and, on null, fails the binding so the
+// whole frame loop skips xrPollEvent/render and the eyes composite black. The
+// object's xdpi/ydpi/densityDpi fields are already answered as constants by
+// kl_jni_display.c, so an empty DisplayMetrics instance is enough.
+static klj_val klj_SDLA_getDisplayDPI(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object("android/util/DisplayMetrics")};
+}
+
 // Recorded, not applied: there is no window manager here to rotate, and the
 // guest's own idea of orientation follows from the resolution it was given.
 static klj_val klj_SDLA_setOrientation(void *env, void *self, const klj_val *a, int n) {
@@ -190,6 +202,68 @@ static klj_val klj_SDLA_null(void *env, void *self, const klj_val *a, int n) {
 static klj_val klj_SDLA_false(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 0};
+}
+
+// SDLActivity.loadAndroidID()/getAndroidID(): SDL persists a per-device GUID for
+// its joystick layer. We present no joysticks (VR input is OpenXR) and disable
+// HIDAPI, so the id is unused — an empty string is the honest "none stored", and
+// SDL synthesises one it never has to save. saveAndroidID(String) is the matching
+// no-op (its return is discarded for a void method).
+static klj_val klj_SDLA_emptyString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("")};
+}
+
+// SDLActivity.getCallingPackage(): the package that launched this activity. cs1's
+// CS client reads it once cstrike is the active game (-game cstrike). A missing
+// binding aborts the JNI call (SIGABRT in klj_call_common); return the guest's own
+// package — a self-launched app is effectively its own caller, and a non-null
+// string is what the guest expects.
+static klj_val klj_SDLA_getCallingPackage(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    extern const char *klj_guest_package(void);
+    return (klj_val){.l = kl_jni_new_string(klj_guest_package())};
+}
+
+// SDLActivity.requestPermission(String permission, int requestCode). SDL's
+// SDL_AndroidRequestPermission BLOCKS until SDLActivity.nativePermissionResult
+// (requestCode, granted) fires, so a plain no-op would hang the guest (cs1 asks
+// for one — mic? — during LAN map load). There is no Android permission model on
+// visionOS, so GRANT it immediately by calling the native result callback right
+// here; it posts SDL's wait semaphore before Android_JNI_RequestPermission waits.
+static klj_val klj_SDLA_requestPermission(void *env, void *self, const klj_val *a, int n) {
+    (void)self;
+    int requestCode = (n >= 2) ? (int)a[1].j : 0;
+    void *fn = kl_jni_native(KLJ_SDLA, "nativePermissionResult", NULL);
+    if (fn) {
+        void *cls = kl_jni_class(KLJ_SDLA);
+        ((void (*)(void *, void *, int, int))fn)(env, cls, requestCode, 1 /* granted */);
+    }
+    return (klj_val){.j = 0};
+}
+
+// SDL text input. The guest asks the platform to raise a soft keyboard
+// (showTextInput) and to report whether one is up (isScreenKeyboardShown). There
+// is no Android IME here — visionOS composits the guest itself — so there is no
+// on-screen keyboard to raise, but a MISSING binding is not a no-op: SDL calls
+// showTextInput as a static boolean and an unbound JNI method aborts the call
+// (cs1 crashed trying to type a local-server name). Report text input as active so
+// SDL enters text-input mode and turns hardware-keyboard key events into text;
+// track the flag so isScreenKeyboardShown agrees. (A visionOS system keyboard is a
+// separate enhancement; this stops the crash and lets a paired keyboard type.)
+static klj_val klj_SDLA_showTextInput(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // Route the request to the keyboard seam: the frontend (KleptonApp) polls
+    // kl_mono_text_input_wanted, focuses a hidden field to raise the visionOS
+    // system keyboard, and feeds characters back through kl_mono_key. Reported
+    // as shown so SDL enters text-input mode and turns those key events into text.
+    kl_mono_set_text_input(1);
+    KLJ_LOG("showTextInput — raising the visionOS system keyboard via the frontend");
+    return (klj_val){.j = 1};
+}
+static klj_val klj_SDLA_isScreenKeyboardShown(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = kl_mono_text_input_wanted()};
 }
 
 static klj_val klj_SDLA_setActivityTitle(void *env, void *self, const klj_val *a, int n) {
@@ -258,6 +332,7 @@ const klj_binding klj_bind_sdl[] = {
     {KLJ_SDLA, "sendMessage", "(II)Z", klj_SDLA_sendMessage},
     {KLJ_SDLA, "setSystemCursor", "(I)Z", klj_SDLA_setSystemCursor},
     {KLJ_SDLA, "getNativeSurface", "()Landroid/view/Surface;", klj_SDLA_getNativeSurface},
+    {KLJ_SDLA, "getDisplayDPI", "()Landroid/util/DisplayMetrics;", klj_SDLA_getDisplayDPI},
     {KLJ_SDLA, "setOrientation", "(IIZLjava/lang/String;)V", klj_SDLA_setOrientation},
     {"org/libsdl/app/SDL", "getContext", "()Landroid/app/Activity;", klj_SDLA_getContext},
     {KLJ_SDLA, "setActivityTitle", "(Ljava/lang/String;)Z", klj_SDLA_setActivityTitle},
@@ -266,6 +341,20 @@ const klj_binding klj_bind_sdl[] = {
     {KLJ_SDLA, "isChromebook", "()Z", klj_SDLA_false},
     {KLJ_SDLA, "isDeXMode", "()Z", klj_SDLA_false},
     {KLJ_SDLA, "shouldMinimizeOnFocusLoss", "()Z", klj_SDLA_false},
+    // VR input is OpenXR, not a mouse — SDL's relative-mouse mode is unsupported,
+    // and a custom hardware cursor cannot be created (0 = none; SDL keeps default).
+    {KLJ_SDLA, "showTextInput", "(IIII)Z", klj_SDLA_showTextInput},
+    {KLJ_SDLA, "isScreenKeyboardShown", "()Z", klj_SDLA_isScreenKeyboardShown},
+    {KLJ_SDLA, "supportsRelativeMouse", "()Z", klj_SDLA_false},
+    {KLJ_SDLA, "createCustomCursor", "([IIIII)I", klj_SDLA_false},
+    {KLJ_SDLA, "setCustomCursor", "(I)Z", klj_SDLA_false},
+    // Per-device GUID persistence (unused here — no SDL joysticks). Load/get
+    // return "none stored"; save is a no-op (void, return ignored).
+    {KLJ_SDLA, "loadAndroidID", "()Ljava/lang/String;", klj_SDLA_emptyString},
+    {KLJ_SDLA, "getCallingPackage", "()Ljava/lang/String;", klj_SDLA_getCallingPackage},
+    {KLJ_SDLA, "requestPermission", "(Ljava/lang/String;I)V", klj_SDLA_requestPermission},
+    {KLJ_SDLA, "getAndroidID",  "()Ljava/lang/String;", klj_SDLA_emptyString},
+    {KLJ_SDLA, "saveAndroidID", "(Ljava/lang/String;)V", klj_SDLA_false},
     // Declared on SDLActivity, so Steam Link's override resolves here through
     // the superclass walk rather than needing its own entry.
     {KLJ_SDLA, "messageboxShowMessageBox",

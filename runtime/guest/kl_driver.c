@@ -9,16 +9,22 @@
 
 #include "klepton.h"
 #include "kl_driver.h"
+#include "kl_obbmap.h"
 #include "kl_egl.h"
 #include "kl_env.h"
 #include "kl_guestpoke.h"
 #include "kl_jkxr.h"
+#include "kl_native.h"
+#include "kl_sdl2.h"
+#include "kl_gles3jni.h"
 #include "kl_jni.h"
 #include "kl_mediandk.h"
 #include "kl_opensl.h"
 #include "kl_openxr.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_mprobe.h"
+#include "kl_sample.h"
 #include "kl_slink.h"
 #include "kl_ue4.h"
 
@@ -56,18 +62,84 @@ static void P(FILE *out, const char *fmt, ...) {
     fflush(out);
 }
 
+// Per-target env defaults: bake in a title's validated flag set so it need not be
+// typed on every launch. setenv with overwrite=0 means an explicit KL_* from the
+// launch environment (run.sh forwards every KL_* to the device) still wins, so the
+// documented per-flag A/B overrides (e.g. KL_HL2_TWOPASS_OPAQUE=0) keep working.
+// Applied here, at the very top of driver init, because it must precede every reader:
+// the hl2 cfg synth (kl_libc.c), ANGLE's own getenv("KL_ANGLE_MV_RELAX"), and the
+// cached-static flag defaults in kl_glfb.c. The THREADED_MIRROR / CINEMA_CTX fixes
+// already default-on for hl2 via their own target check, so they are not repeated.
+static void kl_driver_env_defaults(const kl_target *t) {
+    if (!t || !t->name) return;
+    if (!strcmp(t->name, "hl2")) {
+        // Validated Half-Life 2 VR configuration (2026-08-31): direct-array multiview
+        // + forced eye-RT allocation, single-threaded material queue (threaded wedges
+        // the guest's GL context), ANGLE multiview relaxation, two-pass brush+opaque
+        // (recovers the geometry the emulated single-pass multiview silently drops),
+        // force-clear, visfix, no-cull, and sv_cheats (unblocks the skybox fog cvars).
+        // See the hl2-* memories for why each is needed.
+        setenv("KL_HL2_MULTIVIEW",     "1", 0);
+        setenv("KL_HL2_FORCERT",       "1", 0);
+        setenv("KL_HL2_MAT_QUEUE",     "0", 0);
+        setenv("KL_ANGLE_MV_RELAX",    "1", 0);
+        setenv("KL_HL2_FORCE_CLEAR",   "1", 0);
+        setenv("KL_HL2_VISFIX",        "1", 0);
+        setenv("KL_HL2_TWOPASS_BRUSH", "1", 0);
+        setenv("KL_HL2_TWOPASS_OPAQUE","1", 0);
+        setenv("KL_HL2_NO_CULL",       "1", 0);
+        setenv("KL_HL2_SV_CHEATS",     "1", 0);
+        // LOWMEM confirmed on device (2026-08-31): long in-game sessions were
+        // signal-9 jettisoned by the OS; mat_picmip 2 + mat_reducefillrate 1 cut
+        // the footprint and the session ran meaningfully longer. KL_HL2_LOWMEM=0
+        // restores full-res textures.
+        setenv("KL_HL2_LOWMEM",        "1", 0);
+    }
+    else if (!strcmp(t->name, "hl1")) {
+        // Half-Life on Xash3D / Lambda1VR. Written into userconfig.cfg on device by
+        // kl_xash_write_userconfig (kl_native.c), which execs AFTER config.cfg so
+        // these win over the saved/archived values:
+        //   vr_smoothturn/vr_turn_angle — force smooth turning (the in-menu toggle's
+        //     hitbox is offset/unclickable); vr_turn_angle < 10 selects smooth mode
+        //     and is also its speed (0 would be smooth-but-motionless).
+        //   vr_height_adjust — the guest reads the head in LOCAL space, which Klepton
+        //     places ~1.675 m below the floor (STAGE bounds query fails, so the game
+        //     never gets a floor-grounded space), so the head reads ~1.68 m too high
+        //     and clips low ceilings (the intro tram roof). -1.5 m cancels most of it.
+        //     The real fix is the LOCAL/STAGE reference-space math in kl_openxr.c.
+        // (con_logfile was tried here to capture the engine console, but this build
+        // of Xash writes no logfile on this platform — verified inert — so it's
+        // dropped. The engine console is only reachable on-screen.)
+        setenv("KL_XASH_CVARS",
+               "vr_smoothturn 1; vr_turn_angle 5; vr_height_adjust -1.5", 0);
+    }
+    else if (!strcmp(t->name, "wrath2")) {
+        // wrath2's world never appears because the GAME thread grinds through FMOD
+        // Studio bank loading (UEngine::LoadMap -> LoadBanksForMap -> loadBankFile),
+        // which polls with short usleeps. At DEFAULT QoS on visionOS those sleeps
+        // are coalesced to 30 Hz (33 ms), so a ~few-second bank load stretches to
+        // minutes and the level never finishes loading in a session. Cap the poll
+        // sleep and lift the guest threads off default QoS so their timer wakeups
+        // are not coalesced — same fix class as olar's audio-thread QoS starvation.
+        setenv("KL_USLEEP_CAP", "250", 0);   // microseconds; the FMOD poll slept 5-33 ms/call
+        setenv("KL_GUEST_QOS",  "1",   0);   // USER_INITIATED instead of default
+    }
+}
+
 void kl_driver_init(const kl_target *t, const char *libdir, kl_slink_door door) {
     g_target = t;
     g_door   = door;
     g_error[0] = 0;
     snprintf(g_libdir, sizeof g_libdir, "%s", libdir ? libdir : "");
+    kl_driver_env_defaults(t);
 }
 
-static kl_guest_kind kl_driver_kind(void) {
+kl_guest_kind kl_driver_kind(void) {
     return g_target ? g_target->kind : KL_GUEST_UNITY;
 }
 
 const char      *kl_driver_error(void)  { return g_error; }
+const char      *kl_driver_target_name(void) { return g_target ? g_target->name : NULL; }
 int              kl_driver_gap_only(void) { return g_gap_only; }
 unsigned         kl_driver_frames(void) { return g_frames; }
 void             kl_driver_note_frame(void) { g_frames++; }
@@ -78,7 +150,10 @@ int kl_driver_owns_frame_loop(void) {
     switch (kl_driver_kind()) {
     case KL_GUEST_STEAMLINK:
     case KL_GUEST_UE4:
-    case KL_GUEST_JKXR: return 1;
+    case KL_GUEST_JKXR:
+    case KL_GUEST_NATIVE:
+    case KL_GUEST_SDL2:
+    case KL_GUEST_GLES3JNI: return 1;
     default:            return 0;
     }
 }
@@ -117,6 +192,11 @@ static int boot_unity(FILE *out) {
 
     // load() takes the *directory* — it appends "/libunity.so" itself.
     phase("NativeLoader.load");
+    // Before load, not before initJni: newer libunity asks ALooper_forThread()
+    // for the UI thread inside its own JNI_OnLoad, which runs during this call.
+    // Marking afterwards left "Couldn't retrieve native ALooper for UI thread."
+    // in every affected Unity boot.
+    kl_jni_mark_ui_thread();
     P(out, "\n=== NativeLoader.load(\"%s\") ===\n", g_libdir);
     kl_jni_local_frame_push();
     int8_t ok = ((nativeloader_load_fn)load)(kl_jni_env(), NULL,
@@ -131,13 +211,49 @@ static int boot_unity(FILE *out) {
     // UnityPlayerActivity and Unity checks with IsInstanceOf — and the shared
     // singleton, because Unity reads it back through the static
     // UnityPlayer.currentActivity and compares.
+    // Two initJni generations. Unity 2021's is (Context) alone; the 2022+/Meta
+    // template (newer Meta Unity guests) registers
+    // (Landroid/content/Context;ILjava/lang/String;)V - context, CONTEXT TYPE,
+    // command line. Calling the new one with the old arity left the int and
+    // String registers holding garbage: libunity then logged the junk forever
+    // ("Unknown context type: 31 / <stale pointer>", 4069 times) and trapped
+    // with SIGILL before the first frame. The int is com.unity3d.player.a.o's
+    // enum value - ActivityOrService = 0, which UnityPlayerActivity uses - and
+    // the string is the "unity" intent extra, empty on a plain launch.
+    // Arity is decided from the signature RegisterNatives actually stored, not
+    // from an exact-string lookup: the exact match came back NULL on a run whose
+    // log showed the 3-arg registration, and printing the stored bytes verbatim
+    // is the only way the next log can say why. strstr on the context-type int
+    // plus the command-line String is the discriminator between generations.
+    const char *ijsig = kl_jni_native_sig("com/unity3d/player/UnityPlayer", "initJni");
     void *initJni = kl_jni_native("com/unity3d/player/UnityPlayer", "initJni", NULL);
     if (!initJni) return fail("UnityPlayer.initJni was never registered");
+    // THREE initJni generations, decided from the signature RegisterNatives
+    // actually stored:
+    //   1-arg  (Landroid/content/Context;)V                         Unity 2021
+    //   2-arg  (Landroid/content/Context;I)V                        context + type
+    //   3-arg  (Landroid/content/Context;ILjava/lang/String;)V      + command line
+    // The int is the context-type enum (0 = ActivityOrService, what
+    // UnityPlayerActivity uses); the String is the "unity" intent extra, empty
+    // on a plain launch. Calling a newer arity with an older one leaves the int
+    // (and String) registers holding garbage, and libunity logs "Unknown context
+    // type: <junk>" forever and SIGILLs before the first frame — which is exactly
+    // what Mission ISS's (Context;I) form did when it fell to the 1-arg branch.
+    int initJni3 = ijsig && strstr(ijsig, "ILjava/lang/String;") != NULL;
+    int initJni2 = !initJni3 && ijsig && strstr(ijsig, ";I)") != NULL;
     phase("initJni");
-    P(out, "\n=== UnityPlayer.initJni(Context) ===\n");
+    P(out, "\n=== UnityPlayer.initJni%s -> %s-arg call ===\n",
+      ijsig ? ijsig : "<sig unrecorded>", initJni3 ? "3" : initJni2 ? "2" : "1");
     void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
     kl_jni_local_frame_push();
-    ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, kl_jni_activity());
+    if (initJni3)
+        ((void (*)(void *, void *, void *, int, void *))initJni)(
+            kl_jni_env(), thiz, kl_jni_activity(), 0, kl_jni_new_string(""));
+    else if (initJni2)
+        ((void (*)(void *, void *, void *, int))initJni)(
+            kl_jni_env(), thiz, kl_jni_activity(), 0);
+    else
+        ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, kl_jni_activity());
     kl_jni_local_frame_pop();
     P(out, "  initJni returned\n");
     // Here rather than at libmain: the chain dlopens libunity.so and libil2cpp.so
@@ -221,7 +337,7 @@ static int boot_steamlink(FILE *out) {
 
 static int boot_ue4(FILE *out) {
     phase("ue4 configure");
-    if (kl_ue4_configure(g_libdir, out) != 0) return fail(kl_ue4_error());
+    if (kl_ue4_configure(g_libdir, g_target->entry_lib, out) != 0) return fail(kl_ue4_error());
     phase("ue4 chain");
     if (kl_ue4_load(out) != 0) return fail(kl_ue4_error());
     P(out, "\n=== the shim gap ===\n");
@@ -249,6 +365,44 @@ static int boot_jkxr(FILE *out) {
     return 0;
 }
 
+static int boot_native(FILE *out) {
+    phase("native configure");
+    if (kl_native_configure(g_libdir, g_target->entry_lib, out) != 0)
+        return fail(kl_native_error());
+    phase("native load");
+    if (kl_native_load(out) != 0) return fail(kl_native_error());
+    P(out, "\n=== the shim gap ===\n");
+    kl_native_gap(out);
+    if (g_gap_only) return 0;
+    P(out, "\n=== EXIT CRITERION MET: the NativeActivity library is mapped and "
+           "initialised ===\n");
+    return 0;
+}
+
+static int boot_sdl2(FILE *out) {
+    phase("sdl2 configure");
+    if (kl_sdl2_configure(g_libdir, g_target->entry_lib, out) != 0) return fail(kl_sdl2_error());
+    phase("sdl2 load");
+    if (kl_sdl2_load(out) != 0) return fail(kl_sdl2_error());
+    P(out, "\n=== the shim gap ===\n");
+    kl_sdl2_gap(out);
+    if (g_gap_only) return 0;
+    P(out, "\n=== EXIT CRITERION MET: the SDL2 graph is mapped and JNI_OnLoad ran ===\n");
+    return 0;
+}
+
+static int boot_gles3jni(FILE *out) {
+    phase("gles3jni configure");
+    if (kl_gles3jni_configure(g_libdir, g_target->entry_lib, out) != 0) return fail(kl_gles3jni_error());
+    phase("gles3jni load");
+    if (kl_gles3jni_load(out) != 0) return fail(kl_gles3jni_error());
+    P(out, "\n=== the shim gap ===\n");
+    kl_gles3jni_gap(out);
+    if (g_gap_only) return 0;
+    P(out, "\n=== EXIT CRITERION MET: the GLES3JNILib engine is mapped and JNI_OnLoad ran ===\n");
+    return 0;
+}
+
 int kl_driver_boot(FILE *out) {
     if (!g_target) return fail("kl_driver_init was not called");
     g_gap_only = kl_env_on("KL_GAP_ONLY", 0);
@@ -257,6 +411,9 @@ int kl_driver_boot(FILE *out) {
     case KL_GUEST_STEAMLINK: rc = boot_steamlink(out); break;
     case KL_GUEST_UE4:       rc = boot_ue4(out);       break;
     case KL_GUEST_JKXR:      rc = boot_jkxr(out);      break;
+    case KL_GUEST_NATIVE:    rc = boot_native(out);    break;
+    case KL_GUEST_SDL2:      rc = boot_sdl2(out);      break;
+    case KL_GUEST_GLES3JNI:  rc = boot_gles3jni(out);  break;
     default:                 rc = boot_unity(out);     break;
     }
     if (rc == 0 && g_gap_only)
@@ -266,9 +423,58 @@ int kl_driver_boot(FILE *out) {
 
 // ---- the lifecycle ---------------------------------------------------------
 
+// Unity 2022+/Meta template split the player: initJni stays on UnityPlayer, but
+// the lifecycle natives (nativeRecreateGfxState/Resume/Render) moved onto the
+// UnityPlayerForActivityOrService subclass. Some guests registered them only
+// there, so a UnityPlayer-only lookup came back "not registered" and the frame
+// loop ended before the first frame. Prefer the subclass, fall back to the base
+// so 2019/2021 titles (which register on UnityPlayer) are unchanged. Identity of
+// thiz does not matter here: initJni and these calls already use different
+// synthetic objects, so libunity keys its state off native globals, not thiz.
+static void *unity_lifecycle_native(const char *name) {
+    void *fn = kl_jni_native("com/unity3d/player/UnityPlayerForActivityOrService",
+                             name, NULL);
+    return fn ? fn : kl_jni_native("com/unity3d/player/UnityPlayer", name, NULL);
+}
+
+// KL_SAMPLE_MS: the guest-thread sampler, wired here so it runs on DEVICE
+// too - m_boot starts it around its own pump, but the visionOS app pumps
+// through this driver and never saw the knob. Metadata for managed-name
+// resolution comes from KL_IL2CPP_METADATA or the libdir-derived path; on
+// device the tree usually is not beside the libs, and the sampler then
+// reports module+offset frames, which is the useful part on v29 metadata.
+//
+// A helper because every DOOR needs it, not just Unity's: the first wrath2
+// freeze-hunt ran with KL_SAMPLE_MS set and got nothing back — the knob was
+// honoured only in begin_unity, and a UE4 guest booted through begin_ue4,
+// which never looked. (A UE4 guest has no il2cpp metadata; the sampler then
+// reports module+offset frames, which is the half that matters there anyway.)
+static void sample_start_if_asked(void) {
+    const char *senv = getenv("KL_SAMPLE_MS");
+    if (!senv || !*senv) return;
+    char meta[1024];
+    const char *mp = getenv("KL_IL2CPP_METADATA");
+    if (!mp) {
+        snprintf(meta, sizeof meta, "%s", g_libdir);
+        char *tail = strstr(meta, "/lib/");
+        if (tail) *tail = 0;
+        snprintf(meta + strlen(meta), sizeof meta - strlen(meta),
+                 "/assets/bin/Data/Managed/Metadata/global-metadata.dat");
+        mp = meta;
+    }
+    kl_sample_start((unsigned)strtoul(senv, NULL, 10), mp);
+}
+
 static int begin_unity(FILE *out) {
     g_thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
     if (!g_thiz) return fail("kl_driver_boot must run first");
+
+    // Index the OBB's audio banks by basename (NULL base = no UE4 loose-path
+    // serving, banks only). A Unity sound engine — Wwise (ZIX) or FMOD — reads
+    // its .bnk/.wem/.bank by a native path unrelated to the OBB layout, and the
+    // banks live only inside the OBB; without this the engine gets AK_FileNotFound
+    // and renders silence.
+    kl_obbmap_init(kl_jni_obb_dir(), NULL);
 
     // The order UnityPlayerActivity drives: attach a surface, resume, then one
     // frame. nativeRecreateGfxState is what reaches for EGL, and it is also what
@@ -278,7 +484,7 @@ static int begin_unity(FILE *out) {
         { "nativeRecreateGfxState", 2 }, { "nativeResume", 0 }, { "nativeRender", 1 },
     };
     for (unsigned i = 0; i < sizeof seq / sizeof seq[0]; i++) {
-        void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", seq[i].name, NULL);
+        void *fn = unity_lifecycle_native(seq[i].name);
         if (!fn) { P(out, "  %s: not registered\n", seq[i].name); continue; }
         phase(seq[i].name);
         P(out, "\n=== UnityPlayer.%s ===\n", seq[i].name);
@@ -303,12 +509,13 @@ static int begin_unity(FILE *out) {
         if (ran) P(out, "  drained %u posted task%s\n", ran, ran == 1 ? "" : "s");
     }
 
-    g_render = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
+    g_render = unity_lifecycle_native("nativeRender");
     // The graphics device exists by now and no frame has been drawn yet. The
     // raise lets libunity bind past its un-queried cap of 32 texture units
     // instead of refusing every bind and reading stale unit-0 textures; it is
     // declined per Unity build, and names the build when it declines.
     kl_guest_poke_texture_unit_cap();
+    sample_start_if_asked();
     phase("frame pump");
     return 0;
 }
@@ -338,6 +545,7 @@ static int begin_ue4(FILE *out) {
     if (kl_ue4_create(out) != 0) { if (g_alarm) alarm(0); return fail(kl_ue4_error()); }
     kl_ue4_start(out);
     if (g_alarm) alarm(0);
+    sample_start_if_asked();
     phase("looper pump");
     return 0;
 }
@@ -363,6 +571,48 @@ static int begin_jkxr(FILE *out) {
     // a begin that stopped at onCreate would look like a hang.
     kl_jkxr_start(out);
     if (g_alarm) alarm(0);
+    sample_start_if_asked();
+    phase("looper pump");
+    return 0;
+}
+
+static int begin_sdl2(FILE *out) {
+    phase("SDLActivity begin");
+    P(out, "\n=== SDLActivity: setupJNI + nativeRunMain ===\n");
+    if (g_alarm) alarm(g_alarm);
+    int rc = kl_sdl2_begin(out);
+    if (g_alarm) alarm(0);
+    if (rc != 0) return fail(kl_sdl2_error());
+    sample_start_if_asked();
+    phase("looper pump");
+    return 0;
+}
+
+static int begin_gles3jni(FILE *out) {
+    phase("GLES3JNILib onCreate");
+    P(out, "\n=== GLES3JNILib: onCreate + lifecycle ===\n");
+    if (g_alarm) alarm(g_alarm);
+    if (kl_gles3jni_create(out) != 0) { if (g_alarm) alarm(0); return fail(kl_gles3jni_error()); }
+    if (g_alarm) alarm(0);
+    // onStart/onResume/onSurfaceCreated/Changed — the surface is where the engine
+    // stops waiting, so a begin that stopped at onCreate would look like a hang.
+    kl_gles3jni_start(out);
+    sample_start_if_asked();
+    phase("looper pump");
+    return 0;
+}
+
+static int begin_native(FILE *out) {
+    phase("ANativeActivity_onCreate");
+    P(out, "\n=== ANativeActivity_onCreate ===\n");
+    if (g_alarm) alarm(g_alarm);
+    if (kl_native_create(out) != 0) { if (g_alarm) alarm(0); return fail(kl_native_error()); }
+    if (g_alarm) alarm(0);
+    // onStart / onResume / onNativeWindowCreated: the game's render thread has
+    // been spinning since onCreate and blocks until the window arrives, so a begin
+    // that stopped at onCreate would look like a hang.
+    kl_native_start(out);
+    sample_start_if_asked();
     phase("looper pump");
     return 0;
 }
@@ -373,6 +623,9 @@ int kl_driver_lifecycle_begin(FILE *out) {
     case KL_GUEST_STEAMLINK: return begin_steamlink(out);
     case KL_GUEST_UE4:       return begin_ue4(out);
     case KL_GUEST_JKXR:      return begin_jkxr(out);
+    case KL_GUEST_NATIVE:    return begin_native(out);
+    case KL_GUEST_SDL2:      return begin_sdl2(out);
+    case KL_GUEST_GLES3JNI:  return begin_gles3jni(out);
     default:                 return begin_unity(out);
     }
 }
@@ -399,6 +652,11 @@ int kl_driver_frame(void) {
     // Android's low-memory notification: one task_info call, and the guest drops
     // its caches when the footprint crosses the reported budget.
     kl_mem_pressure_poll();
+    // KL_PROBE_INPUT: the managed-side probe, self-gated on its env knob and
+    // wired here so it runs on DEVICE too (m_boot ticks it around its own
+    // pump). Between frames on the thread that just ran one, which is where
+    // managed calls are safe.
+    kl_mprobe_tick(g_frames);
     if (g_alarm) alarm(0);
     g_frames++;
     return r;
@@ -411,6 +669,9 @@ double kl_driver_pump(double seconds, const volatile int *quit) {
                                      : kl_slink_sdl_pump(seconds, quit);
     case KL_GUEST_UE4:  return kl_ue4_pump(seconds, quit);
     case KL_GUEST_JKXR: return kl_jkxr_pump(seconds, quit);
+    case KL_GUEST_NATIVE: return kl_native_pump(seconds, quit);
+    case KL_GUEST_SDL2: return kl_sdl2_pump(seconds, quit);
+    case KL_GUEST_GLES3JNI: return kl_gles3jni_pump(seconds, quit);
     default:            return 0.0;
     }
 }
@@ -426,6 +687,10 @@ double kl_driver_pump_default(void) {
                                   ? strtod(getenv("KL_UE4_WAIT"), NULL) : 5.0;
     case KL_GUEST_JKXR:      return kl_env_str("KL_JKXR_WAIT", NULL)
                                   ? strtod(getenv("KL_JKXR_WAIT"), NULL) : 5.0;
+    case KL_GUEST_NATIVE:
+    case KL_GUEST_SDL2:
+    case KL_GUEST_GLES3JNI:  return kl_env_str("KL_NATIVE_WAIT", NULL)
+                                  ? strtod(getenv("KL_NATIVE_WAIT"), NULL) : 5.0;
     default:                 return 0.0;
     }
 }
@@ -446,6 +711,19 @@ void kl_driver_report(FILE *out) {
         fprintf(out, "\n=== the OpenJK run ===\n");
         kl_jkxr_report(out);
         fflush(out);
+        return;
+    case KL_GUEST_NATIVE:
+        fprintf(out, "\n=== the NativeActivity run ===\n");
+        kl_native_report(out);
+        fflush(out);
+        return;
+    case KL_GUEST_SDL2:
+        fprintf(out, "\n=== the SDL2 run ===\n");
+        kl_sdl2_report(out);
+        return;
+    case KL_GUEST_GLES3JNI:
+        fprintf(out, "\n=== the GLES3JNILib run ===\n");
+        kl_gles3jni_report(out);
         return;
     default: break;
     }

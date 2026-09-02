@@ -399,6 +399,21 @@ typedef struct { int32_t type; const void *next;
                  struct { float width, height; } size;
                } XrCompositionLayerQuad;
 
+// A curved panel — same header, subImage, pose and eyeVisibility as a quad, with
+// radius/centralAngle/aspectRatio instead of a flat size. cs1's Xash renders its
+// menu as one of these (XR_KHR_composition_layer_cylinder). We composite it as a
+// FLAT quad: the arc length (radius*centralAngle) is the width and aspectRatio
+// gives the height. The curvature is dropped — a menu panel reads fine flat, and
+// this is the difference between the menu being visible and a black screen.
+#define XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR 1000017000
+typedef struct { int32_t type; const void *next;
+                 uint64_t layerFlags; void *space;
+                 int32_t eyeVisibility;
+                 XrSwapchainSubImage subImage;
+                 XrPosef pose;
+                 float radius, centralAngle, aspectRatio;
+               } XrCompositionLayerCylinderKHR;
+
 typedef struct { int32_t type; const void *next;
                  int64_t displayTime;
                  int32_t environmentBlendMode;
@@ -472,6 +487,19 @@ enum {
     KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING = -50,
 };
 
+// --- error-return trace (bring-up) -------------------------------------------
+// Every error return in this file goes through KLXR_RET so a failing xr call
+// names itself and its line in the log. Success paths return KLXR_SUCCESS
+// directly and stay silent, so this only fires on genuine errors (rare), which
+// is exactly what turns a guest's opaque "OpenXR::Init() failed: error code -1"
+// into "xrCreateSession -> error -1 (kl_openxr.c:NNN)".
+static XrResult klxr_err(const char *fn, int line, XrResult r) {
+    if (r < 0)
+        fprintf(stderr, "  [xr] %s -> error %d (kl_openxr.c:%d)\n", fn, (int)r, line);
+    return r;
+}
+#define KLXR_RET(r) return klxr_err(__func__, __LINE__, (r))
+
 enum { KLXR_FORM_FACTOR_HMD = 1 };
 
 // The "is this real" bits on a located space or view. VALID says the value is
@@ -539,12 +567,20 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrGetVulkanGraphicsRequirementsKHR)                                      \
     X(xrGetVulkanInstanceExtensionsKHR) X(xrGetVulkanDeviceExtensionsKHR)      \
     X(xrGetVulkanGraphicsDeviceKHR)                                            \
+    X(xrCreateVulkanInstanceKHR) X(xrCreateVulkanDeviceKHR)                    \
+    X(xrGetVulkanGraphicsRequirements2KHR) X(xrGetVulkanGraphicsDevice2KHR)    \
     X(xrEnumerateDisplayRefreshRatesFB) X(xrGetDisplayRefreshRateFB)           \
     X(xrRequestDisplayRefreshRateFB)                                           \
     X(xrConvertTimespecTimeToTimeKHR) X(xrConvertTimeToTimespecTimeKHR)         \
     X(xrPerfSettingsSetPerformanceLevelEXT)                                    \
     X(xrSetAndroidApplicationThreadKHR)                                        \
-    X(xrEnumerateColorSpacesFB) X(xrSetColorSpaceFB)
+    X(xrEnumerateColorSpacesFB) X(xrSetColorSpaceFB)                          \
+    X(xrCreatePassthroughFB) X(xrDestroyPassthroughFB)                         \
+    X(xrPassthroughStartFB) X(xrPassthroughPauseFB)                            \
+    X(xrCreatePassthroughLayerFB) X(xrDestroyPassthroughLayerFB)               \
+    X(xrPassthroughLayerPauseFB) X(xrPassthroughLayerResumeFB)                 \
+    X(xrPassthroughLayerSetStyleFB)                                          \
+    X(xrCreateSwapchainAndroidSurfaceKHR)
 
 // ------------------------------------------------------------------ bookkeeping
 // One row per entry point: resolved counts lookups, called counts calls. The
@@ -664,9 +700,9 @@ KL_XR_ENTRY_POINTS(X)
 // makes that assertion by name.
 static int klxr_GetInstanceProcAddr(void *instance, const char *name, void **function) {
     (void)instance;
-    if (!function) return KLXR_ERROR_FUNCTION_UNSUPPORTED;
+    if (!function) KLXR_RET(KLXR_ERROR_FUNCTION_UNSUPPORTED);
     *function = NULL;
-    if (!name) return KLXR_ERROR_FUNCTION_UNSUPPORTED;
+    if (!name) KLXR_RET(KLXR_ERROR_FUNCTION_UNSUPPORTED);
 
     klxr_row *row = klxr_row_for(name);
     if (!row) {
@@ -676,7 +712,7 @@ static int klxr_GetInstanceProcAddr(void *instance, const char *name, void **fun
         // and those never appear in the import list, so without it they would
         // be invisible until something else broke.
         fprintf(stderr, "  [xr] xrGetInstanceProcAddr(\"%s\") — not served\n", name);
-        return KLXR_ERROR_FUNCTION_UNSUPPORTED;
+        KLXR_RET(KLXR_ERROR_FUNCTION_UNSUPPORTED);
     }
     row->resolved++;
     *function = row->fn;
@@ -699,6 +735,7 @@ static int klxr_GetInstanceProcAddr(void *instance, const char *name, void **fun
 // diagnostic already printed above it. Any name that turns up in the "not
 // served" line is therefore a crash waiting to happen, not a maybe.
 static int klxr_InitializeLoaderKHR(const void *info) {
+    fprintf(stderr, "  [xr] >> %s\n", "xrInitializeLoaderKHR");
     (void)info;
     return KLXR_SUCCESS;
 }
@@ -769,7 +806,8 @@ static klxr_instance *klxr_inst(void *h) {
 // Vulkan is that second one.
 enum { KLXR_GATE_ALWAYS = 0,      // unconditional
        KLXR_GATE_REFRESH = 1,     // ...unless KL_XR_REFRESH_EXT=0
-       KLXR_GATE_VULKAN = 2 };    // ...only when MoltenVK is actually reachable
+       KLXR_GATE_VULKAN = 2,      // ...only when MoltenVK is actually reachable
+       KLXR_GATE_USER_PRESENCE = 3 };  // ...missioniss only (see below)
 
 static const struct { const char *name; uint32_t version; int gate; } g_extensions[] = {
     { "XR_KHR_opengl_es_enable",       10, KLXR_GATE_ALWAYS },
@@ -813,6 +851,12 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // understating it invites an app to take a compatibility path it does not
     // need.
     { "XR_KHR_vulkan_enable",           8, KLXR_GATE_VULKAN },
+    // XR_KHR_vulkan_enable2 — GTA Vice City VR (libmiamivr) REQUIRES this and
+    // loops on xrEnumerateInstanceExtensionProperties forever without it ("runtime
+    // does not expose XR_KHR_vulkan_enable2"). Same Vulkan half, same gate; the
+    // difference is only that the runtime makes the vkCreate* calls (see
+    // klxr_CreateVulkanInstanceKHR / ...DeviceKHR / ...Requirements2 / ...Device2).
+    { "XR_KHR_vulkan_enable2",          2, KLXR_GATE_VULKAN },
     // XR_EXT_performance_settings — JKXR, and it is the counter-example to the
     // paragraph at the top of this table: this guest lists it as a REQUIRED
     // extension in xrCreateInstance rather than probing for it, so withholding
@@ -842,6 +886,26 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // XR_FB_color_space — JKXR, required. See the implementation for why the
     // enumerated list is two entries rather than the extension's eight.
     { "XR_FB_color_space",              3, KLXR_GATE_ALWAYS },
+    // A guest's required-extension set. It enumerates these at startup and
+    // aborts before xrCreateInstance if any it needs is missing (it renders VR
+    // through OpenXR+GLES; the MoltenVK it loads is for its own core, not the XR
+    // binding). Advertised so instance creation proceeds — the composition-layer
+    // and passthrough entry points are not implemented yet, so a guest that goes
+    // on to CALL one aborts by name, which is the next work item if it does.
+    { "XR_KHR_android_surface_swapchain",     4, KLXR_GATE_ALWAYS },
+    { "XR_KHR_composition_layer_cylinder",    4, KLXR_GATE_ALWAYS },
+    { "XR_KHR_composition_layer_equirect2",   1, KLXR_GATE_ALWAYS },
+    { "XR_FB_composition_layer_image_layout", 1, KLXR_GATE_ALWAYS },
+    { "XR_FB_composition_layer_settings",     3, KLXR_GATE_ALWAYS },
+    // XR_FB_passthrough — some guests REQUIRE it (instance creation fails
+    // without it), then drives it through the entry points below. Stubbed:
+    // handles are accepted and start/pause/style succeed, but nothing composites
+    // a passthrough layer — on visionOS the immersive space already provides the
+    // environment, and the guest's screens render on top through the
+    // projection layer. Graduates to a real body if the background must show.
+    { "XR_FB_passthrough",                    1, KLXR_GATE_ALWAYS },
+    { "XR_META_performance_metrics",          2, KLXR_GATE_ALWAYS },
+    { "XR_EXT_user_presence",                 1, KLXR_GATE_USER_PRESENCE },
 };
 #define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
 
@@ -906,6 +970,18 @@ static int klxr_ext_gate_open(int gate) {
         // Asked once, here, so the answer cannot change between the
         // enumeration, xrCreateInstance's check and xrGetInstanceProcAddr.
         return kl_vulkan_xr_supported();
+    case KLXR_GATE_USER_PRESENCE: {
+        // missioniss (Unity, OVRPlugin) resolves its IVRPlatformHelper to the
+        // DEVICELESS helper — no head/controller pose, working menu+select — when
+        // the SDK's cached OVRPlugin.userPresent stays false. The Quest reference
+        // sends XR_EXT_user_presence with isUserPresent=1; Klepton never did, so
+        // the cache stays 0. Advertise + emit it for missioniss so the game picks
+        // its real (Oculus) helper and the world/controllers track. Gated to that
+        // one target; KL_XR_USER_PRESENCE overrides.
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        return kl_env_on("KL_XR_USER_PRESENCE", t && !strcmp(t, "missioniss"));
+    }
     default:
         return 1;
     }
@@ -962,10 +1038,10 @@ static int klxr_ext_advertised(const char *name) {
 // and countOutput is written in ALL of those cases. Factored out so the four
 // enumerators cannot disagree about it.
 static XrResult klxr_two_call(uint32_t capacity, uint32_t *count_out, uint32_t have) {
-    if (!count_out) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!count_out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     *count_out = have;
     if (capacity == 0) return KLXR_SUCCESS;
-    if (capacity < have) return KLXR_ERROR_SIZE_INSUFFICIENT;
+    if (capacity < have) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
     return KLXR_SUCCESS;
 }
 
@@ -979,21 +1055,22 @@ static XrResult klxr_two_call(uint32_t capacity, uint32_t *count_out, uint32_t h
 // which is not merely noise, it is formatted I/O on the guest's frame path, and
 // it buried the six lines the run existed to produce.
 #define KLXR_CHAIN_SEEN 64
+// A next pointer we are handed is only as good as the guest's initialization of
+// it, and it CANNOT be trusted: the OpenXR spec lets a runtime ignore chained
+// output structs, and guests routinely leave `next` as uninitialized stack
+// garbage on them — lambda1vr (hl1) hands us leftover systemName bytes
+// ("...Quest2\0kl..."), the CS xash (cs1) an unmapped 0x5a000008a0. No range or
+// alignment gate makes dereferencing arbitrary garbage safe (0x5a000008a0 is
+// 8-aligned and inside the 48-bit range yet unmapped), and this walk is
+// DIAGNOSTIC ONLY — we never fill chained structs regardless. So do not
+// dereference the chain at all: note once, per call site, that one was supplied.
 static void klxr_log_chain(const char *where, const void *next) {
-    static struct { const char *where; int32_t type; } seen[KLXR_CHAIN_SEEN];
+    if (!next) return;
+    static const char *seen[KLXR_CHAIN_SEEN];
     static int n_seen;
-    for (int depth = 0; next && depth < 16; depth++) {
-        int32_t type = *(const int32_t *)next;
-        int already = 0;
-        for (int i = 0; i < n_seen; i++)
-            if (seen[i].type == type && seen[i].where == where) { already = 1; break; }
-        if (!already) {
-            if (n_seen < KLXR_CHAIN_SEEN) seen[n_seen++] = (typeof(seen[0])){where, type};
-            fprintf(stderr, "  [xr] %s: chained struct type %d — not filled in\n",
-                    where, type);
-        }
-        next = *(const void *const *)((const char *)next + 8);
-    }
+    for (int i = 0; i < n_seen; i++) if (seen[i] == where) return;
+    if (n_seen < KLXR_CHAIN_SEEN) seen[n_seen++] = where;
+    fprintf(stderr, "  [xr] %s: a chained struct was supplied (left unread)\n", where);
 }
 
 // ...and the one chained struct that must NOT merely be logged. The guest asks
@@ -1032,14 +1109,15 @@ static void klxr_fill_space_velocity(void *next, const float *lin, const float *
 static XrResult klxr_EnumerateInstanceExtensionProperties(
         const char *layer_name, uint32_t capacity, uint32_t *count_out,
         XrExtensionProperties *props) {
+    fprintf(stderr, "  [xr] >> %s\n", "xrEnumerateInstanceExtensionProperties");
     // A layer name we do not have is XR_ERROR_API_LAYER_NOT_PRESENT, but we
     // have no layers at all, so the only legal argument is NULL and anything
     // else is the guest asking about something that cannot exist here.
-    if (layer_name && layer_name[0]) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (layer_name && layer_name[0]) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
 
     XrResult r = klxr_two_call(capacity, count_out, KLXR_EXT_COUNT);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
-    if (!props) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!props) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
 
     for (uint32_t i = 0; i < KLXR_EXT_COUNT; i++) {
         uint32_t ver = 1;
@@ -1095,11 +1173,11 @@ static XrResult klxr_EnumerateApiLayerProperties(uint32_t capacity,
 static XrResult klxr_EnumerateViewConfigurations(void *instance, XrSystemId system_id,
                                                  uint32_t capacity, uint32_t *count_out,
                                                  int32_t *configs) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (system_id != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
     XrResult r = klxr_two_call(capacity, count_out, 1);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
-    if (!configs) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!configs) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     configs[0] = KLXR_VIEW_CONFIG_PRIMARY_STEREO;
     return KLXR_SUCCESS;
 }
@@ -1113,11 +1191,11 @@ static XrResult klxr_EnumerateViewConfigurations(void *instance, XrSystemId syst
 #define KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES 42
 static XrResult klxr_GetViewConfigurationProperties(void *instance, XrSystemId system_id,
                                                     int32_t view_config_type, void *props) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (system_id != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
     if (view_config_type != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
-        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
-    if (!props) return KLXR_ERROR_VALIDATION_FAILURE;
+        KLXR_RET(KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
+    if (!props) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     char *p = props;
     *(int32_t *)(p + 0)  = KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES;
     klxr_log_chain("xrGetViewConfigurationProperties", *(void **)(p + 8));
@@ -1137,13 +1215,13 @@ static XrResult klxr_EnumerateEnvironmentBlendModes(void *instance, XrSystemId s
                                                     int32_t view_config_type,
                                                     uint32_t capacity, uint32_t *count_out,
                                                     int32_t *modes) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (system_id != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
     if (view_config_type != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
-        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+        KLXR_RET(KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
     XrResult r = klxr_two_call(capacity, count_out, 1);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
-    if (!modes) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!modes) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     modes[0] = KLXR_BLEND_OPAQUE;
     return KLXR_SUCCESS;
 }
@@ -1153,15 +1231,16 @@ static XrResult klxr_EnumerateEnvironmentBlendModes(void *instance, XrSystemId s
 // the NUMBER, which is still enough to look up. XR_MAX_STRUCTURE_NAME_SIZE is
 // 64 and the buffer is the caller's.
 static XrResult klxr_StructureTypeToString(void *instance, int32_t value, char *buffer) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!buffer) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     snprintf(buffer, 64, "XR_TYPE_%d", value);
     return KLXR_SUCCESS;
 }
 
 static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **instance) {
-    if (!info || !instance) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_INSTANCE_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    fprintf(stderr, "  [xr] >> %s\n", "xrCreateInstance");
+    if (!info || !instance) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_INSTANCE_CREATE_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
 
     // XrInstanceCreateInfoAndroidKHR rides in `next` and carries the VM and the
     // activity. We need neither — we made both — so this is logged and not read.
@@ -1189,7 +1268,7 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
         int known = klxr_ext_advertised(name);
         fprintf(stderr, "  [xr]   extension: %-40s %s\n", name,
                 known ? "enabled" : "NOT PRESENT");
-        if (!known) { g_instance.magic = 0; return KLXR_ERROR_EXTENSION_NOT_PRESENT; }
+        if (!known) { g_instance.magic = 0; KLXR_RET(KLXR_ERROR_EXTENSION_NOT_PRESENT); }
         if (strcmp(name, "XR_KHR_opengl_es_enable") == 0) g_instance.ext_opengl_es = 1;
         if (strcmp(name, "XR_KHR_vulkan_enable") == 0)    g_instance.ext_vulkan = 1;
     }
@@ -1200,14 +1279,15 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
 
 static XrResult klxr_DestroyInstance(void *instance) {
     klxr_instance *inst = klxr_inst(instance);
-    if (!inst) return KLXR_ERROR_HANDLE_INVALID;
+    if (!inst) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     inst->magic = 0;
     return KLXR_SUCCESS;
 }
 
 static XrResult klxr_GetInstanceProperties(void *instance, XrInstanceProperties *props) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!props) return KLXR_ERROR_VALIDATION_FAILURE;
+    fprintf(stderr, "  [xr] >> %s\n", "xrGetInstanceProperties");
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!props) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrGetInstanceProperties", props->next);
     props->type = XR_TYPE_INSTANCE_PROPERTIES;
     props->runtimeVersion = XR_MAKE_VERSION(1, 0, 0);
@@ -1222,25 +1302,27 @@ static XrResult klxr_GetInstanceProperties(void *instance, XrInstanceProperties 
 
 static XrResult klxr_GetSystem(void *instance, const XrSystemGetInfo *info,
                                XrSystemId *system_id) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !system_id) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_SYSTEM_GET_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    fprintf(stderr, "  [xr] >> %s\n", "xrGetSystem");
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !system_id) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_SYSTEM_GET_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrGetSystem", info->next);
     // A handheld display is a phone, and this runtime is not one. Refusing it
     // is not a limitation we are apologising for — it is the answer that sends
     // a guest with a 2D fallback down the 2D path, which is the correct one for
     // a device that is not there.
     if (info->formFactor != KLXR_FORM_FACTOR_HMD)
-        return KLXR_ERROR_FORM_FACTOR_UNSUPPORTED;
+        KLXR_RET(KLXR_ERROR_FORM_FACTOR_UNSUPPORTED);
     *system_id = KLXR_SYSTEM_ID;
     return KLXR_SUCCESS;
 }
 
 static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
                                          XrSystemProperties *props) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
-    if (!props) return KLXR_ERROR_VALIDATION_FAILURE;
+    fprintf(stderr, "  [xr] >> %s\n", "xrGetSystemProperties");
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (system_id != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
+    if (!props) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     // XrSystemHandTrackingPropertiesEXT and friends chain here, and leaving
     // them untouched is how we report the feature absent: the guest zeroes the
     // struct before the call, so an unwritten supported flag reads as false.
@@ -1290,16 +1372,17 @@ static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
 static XrResult klxr_EnumerateViewConfigurationViews(
         void *instance, XrSystemId system_id, int32_t view_config_type,
         uint32_t capacity, uint32_t *count_out, XrViewConfigurationView *views) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    fprintf(stderr, "  [xr] >> %s\n", "xrEnumerateViewConfigurationViews");
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (system_id != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
     // Stereo is the only configuration we offer, and answering for mono would
     // be answering for a device that is not this one.
     if (view_config_type != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
-        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+        KLXR_RET(KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
 
     XrResult r = klxr_two_call(capacity, count_out, 2);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
-    if (!views) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!views) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
 
     int ew = 0, eh = 0;
     kl_ovrp_eye_texture_size(&ew, &eh);
@@ -1340,14 +1423,24 @@ static XrResult klxr_EnumerateViewConfigurationViews(
 static XrResult klxr_GetOpenGLESGraphicsRequirementsKHR(
         void *instance, XrSystemId system_id,
         XrGraphicsRequirementsOpenGLESKHR *reqs) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
-    if (!reqs) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (system_id != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
+    if (!reqs) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrGetOpenGLESGraphicsRequirementsKHR", reqs->next);
     reqs->type = XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR;
     reqs->minApiVersionSupported = XR_MAKE_VERSION(3, 0, 0);
     reqs->maxApiVersionSupported = XR_MAKE_VERSION(3, 2, 0);
     g_instance.gl_requirements_queried = 1;
+    // Logged unconditionally (a one-time init call): the RunFrame graphics-binding
+    // gate (libsourcevr 0x14cd4) calls this and can bail if the version window is
+    // not what it expects — so it must be visible when diffing against the Quest
+    // reference trace. See hl2-quest-reference-trace.
+    fprintf(stderr, "  [xr] >> xrGetOpenGLESGraphicsRequirementsKHR -> GLES min "
+                    "%llu.%llu max %llu.%llu\n",
+            (unsigned long long)((reqs->minApiVersionSupported >> 48) & 0xffff),
+            (unsigned long long)((reqs->minApiVersionSupported >> 32) & 0xffff),
+            (unsigned long long)((reqs->maxApiVersionSupported >> 48) & 0xffff),
+            (unsigned long long)((reqs->maxApiVersionSupported >> 32) & 0xffff));
     return KLXR_SUCCESS;
 }
 
@@ -1374,14 +1467,14 @@ static XrResult klxr_vulkan_ext_string(void *instance, XrSystemId system_id,
                                        const char *list,
                                        uint32_t capacity, uint32_t *count_out,
                                        char *buffer) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
-    if (!count_out) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (system_id != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
+    if (!count_out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     uint32_t need = (uint32_t)strlen(list) + 1;      // the NUL is counted
     *count_out = need;
     if (capacity == 0) return KLXR_SUCCESS;
-    if (capacity < need) return KLXR_ERROR_SIZE_INSUFFICIENT;
-    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (capacity < need) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (!buffer) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     memcpy(buffer, list, need);
     return KLXR_SUCCESS;
 }
@@ -1389,6 +1482,7 @@ static XrResult klxr_vulkan_ext_string(void *instance, XrSystemId system_id,
 static XrResult klxr_GetVulkanInstanceExtensionsKHR(
         void *instance, XrSystemId system_id, uint32_t capacity,
         uint32_t *count_out, char *buffer) {
+    fprintf(stderr, "  [xr] >> %s\n", "xrGetVulkanInstanceExtensionsKHR");
     return klxr_vulkan_ext_string(instance, system_id,
                                   kl_vulkan_xr_instance_extensions(),
                                   capacity, count_out, buffer);
@@ -1409,14 +1503,15 @@ static XrResult klxr_GetVulkanDeviceExtensionsKHR(
 static XrResult klxr_GetVulkanGraphicsDeviceKHR(
         void *instance, XrSystemId system_id, void *vk_instance,
         void **vk_physical_device) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
-    if (!vk_physical_device) return KLXR_ERROR_VALIDATION_FAILURE;
+    fprintf(stderr, "  [xr] >> %s\n", "xrGetVulkanGraphicsDeviceKHR");
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (system_id != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
+    if (!vk_physical_device) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     void *pd = kl_vulkan_xr_physical_device(vk_instance);
     if (!pd) {
         fprintf(stderr, "  [xr] xrGetVulkanGraphicsDeviceKHR: no physical device "
                         "from the app's VkInstance %p\n", vk_instance);
-        return KLXR_ERROR_GRAPHICS_DEVICE_INVALID;
+        KLXR_RET(KLXR_ERROR_GRAPHICS_DEVICE_INVALID);
     }
     fprintf(stderr, "  [xr] xrGetVulkanGraphicsDeviceKHR -> VkPhysicalDevice %p\n", pd);
     *vk_physical_device = pd;
@@ -1429,9 +1524,10 @@ static XrResult klxr_GetVulkanGraphicsDeviceKHR(
 static XrResult klxr_GetVulkanGraphicsRequirementsKHR(
         void *instance, XrSystemId system_id,
         XrGraphicsRequirementsVulkanKHR *reqs) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
-    if (!reqs) return KLXR_ERROR_VALIDATION_FAILURE;
+    fprintf(stderr, "  [xr] >> %s\n", "xrGetVulkanGraphicsRequirementsKHR");
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (system_id != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
+    if (!reqs) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrGetVulkanGraphicsRequirementsKHR", reqs->next);
     unsigned lo_maj, lo_min, hi_maj, hi_min;
     kl_vulkan_xr_api_range(&lo_maj, &lo_min, &hi_maj, &hi_min);
@@ -1442,6 +1538,92 @@ static XrResult klxr_GetVulkanGraphicsRequirementsKHR(
     fprintf(stderr, "  [xr] xrGetVulkanGraphicsRequirementsKHR: Vulkan %u.%u .. %u.%u\n",
             lo_maj, lo_min, hi_maj, hi_min);
     return KLXR_SUCCESS;
+}
+
+// ---- XR_KHR_vulkan_enable2 (GTA Vice City VR / libmiamivr) ----------------
+// The 2 form of the same extension. The difference is who calls vkCreateInstance
+// and vkCreateDevice: in enable1 the app does, and asks us four questions; in
+// enable2 the app hands US its vkGetInstanceProcAddr and its Vk*CreateInfo and we
+// make the calls, so the runtime can inject whatever instance/device state it
+// needs. We have none to inject — kl_vulkan.c serves both create calls the same
+// either way — so these are thin forwarders through the app's own gIPA (which, for
+// a guest here, resolves to kl_vulkan's synthetic loader). All Vulkan handles are
+// void * for the reason stated above the binding struct.
+typedef void *(*klxr_vk_gipa)(void *vk_instance, const char *name);
+typedef struct { int32_t type; const void *next; XrSystemId systemId;
+                 uint64_t createFlags; klxr_vk_gipa pfnGetInstanceProcAddr;
+                 const void *vulkanCreateInfo; const void *vulkanAllocator;
+               } XrVulkanInstanceCreateInfoKHR;
+typedef struct { int32_t type; const void *next; XrSystemId systemId;
+                 uint64_t createFlags; klxr_vk_gipa pfnGetInstanceProcAddr;
+                 void *vulkanPhysicalDevice; const void *vulkanCreateInfo;
+                 const void *vulkanAllocator;
+               } XrVulkanDeviceCreateInfoKHR;
+typedef struct { int32_t type; const void *next; XrSystemId systemId;
+                 void *vulkanInstance; } XrVulkanGraphicsDeviceGetInfoKHR;
+
+static XrResult klxr_CreateVulkanInstanceKHR(
+        void *instance, const XrVulkanInstanceCreateInfoKHR *ci,
+        void **vk_instance, int *vk_result) {
+    fprintf(stderr, "  [xr] >> xrCreateVulkanInstanceKHR\n");
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!ci || !ci->pfnGetInstanceProcAddr || !vk_instance || !vk_result)
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (ci->systemId != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
+    // vkCreateInstance is a global function: resolved through gIPA with a NULL
+    // instance (kl_vulkan's loader serves it regardless).
+    int (*create)(const void *, const void *, void **) =
+        (int (*)(const void *, const void *, void **))
+            ci->pfnGetInstanceProcAddr(NULL, "vkCreateInstance");
+    if (!create) {
+        fprintf(stderr, "  [xr] xrCreateVulkanInstanceKHR: app gIPA has no "
+                        "vkCreateInstance\n");
+        KLXR_RET(KLXR_ERROR_RUNTIME_FAILURE);
+    }
+    int r = create(ci->vulkanCreateInfo, ci->vulkanAllocator, vk_instance);
+    *vk_result = r;
+    fprintf(stderr, "  [xr] xrCreateVulkanInstanceKHR -> VkInstance %p (VkResult %d)\n",
+            *vk_instance, r);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_CreateVulkanDeviceKHR(
+        void *instance, const XrVulkanDeviceCreateInfoKHR *ci,
+        void **vk_device, int *vk_result) {
+    fprintf(stderr, "  [xr] >> xrCreateVulkanDeviceKHR\n");
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!ci || !ci->pfnGetInstanceProcAddr || !vk_device || !vk_result)
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (ci->systemId != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
+    int (*create)(void *, const void *, const void *, void **) =
+        (int (*)(void *, const void *, const void *, void **))
+            ci->pfnGetInstanceProcAddr(NULL, "vkCreateDevice");
+    if (!create) {
+        fprintf(stderr, "  [xr] xrCreateVulkanDeviceKHR: app gIPA has no "
+                        "vkCreateDevice\n");
+        KLXR_RET(KLXR_ERROR_RUNTIME_FAILURE);
+    }
+    int r = create(ci->vulkanPhysicalDevice, ci->vulkanCreateInfo,
+                   ci->vulkanAllocator, vk_device);
+    *vk_result = r;
+    fprintf(stderr, "  [xr] xrCreateVulkanDeviceKHR -> VkDevice %p (VkResult %d)\n",
+            *vk_device, r);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetVulkanGraphicsRequirements2KHR(
+        void *instance, XrSystemId system_id, XrGraphicsRequirementsVulkanKHR *reqs) {
+    fprintf(stderr, "  [xr] >> xrGetVulkanGraphicsRequirements2KHR\n");
+    return klxr_GetVulkanGraphicsRequirementsKHR(instance, system_id, reqs);
+}
+
+static XrResult klxr_GetVulkanGraphicsDevice2KHR(
+        void *instance, const XrVulkanGraphicsDeviceGetInfoKHR *gi,
+        void **vk_physical_device) {
+    fprintf(stderr, "  [xr] >> xrGetVulkanGraphicsDevice2KHR\n");
+    if (!gi) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    return klxr_GetVulkanGraphicsDeviceKHR(instance, gi->systemId,
+                                           gi->vulkanInstance, vk_physical_device);
 }
 
 // ---------------------------------------------------------- the session, and
@@ -1516,7 +1698,17 @@ typedef struct {
     int   qhead, qcount;
 } klxr_session;
 
-enum { KLXR_EV_SESSION_STATE = 0, KLXR_EV_INTERACTION_PROFILE = 1 };
+enum { KLXR_EV_SESSION_STATE = 0, KLXR_EV_INTERACTION_PROFILE = 1,
+       KLXR_EV_USER_PRESENCE = 2 };
+
+// XR_EXT_user_presence (advertised only to missioniss, see KLXR_GATE_USER_PRESENCE).
+#define KLXR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT 1000470000
+typedef struct XrEventDataUserPresenceChangedEXT {
+    int32_t     type;
+    const void *next;
+    void       *session;
+    uint32_t    isUserPresent;   // XrBool32
+} XrEventDataUserPresenceChangedEXT;
 
 static klxr_session g_session;
 
@@ -1573,19 +1765,49 @@ static klxr_session *klxr_sess(void *h) {
 // is not a neutral answer to that negotiation — see the gate above.
 enum { KLXR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB = -1000101000 };
 
+// The display runs at one rate on this hardware, but a guest may render SLOWER
+// than the panel and pace itself to a rate it picks from this list — GTA Vice
+// City VR (libmiamivr) holds its layers until it sees 72 Hz and never renders if
+// only 120 is offered. So offer the real rate plus the standard Quest cadences
+// below it; the compositor still PRESENTS at the real rate and reprojects the
+// guest's slower frames (the ordinary guest-slower-than-panel path). Never offer a
+// rate ABOVE the panel — that would promise frames the display cannot show.
+static int klxr_refresh_list(float *out, int cap) {
+    float real = kl_ovrp_display_frequency();
+    if (real <= 0) real = 90.0f;
+    const float cand[] = { real, 90.0f, 72.0f };
+    int n = 0;
+    for (unsigned i = 0; i < sizeof cand / sizeof cand[0] && n < cap; i++) {
+        if (cand[i] <= 0.0f || cand[i] > real + 0.5f) continue;
+        int dup = 0;
+        for (int j = 0; j < n; j++) if (fabsf(out[j] - cand[i]) < 0.5f) dup = 1;
+        if (!dup) out[n++] = cand[i];
+    }
+    return n;
+}
+
+// The rate the guest last asked us to run at, or 0 for "the panel's own". Reported
+// back by xrGetDisplayRefreshRateFB so a guest that requests 72 and then waits to
+// SEE 72 can proceed; the compositor is unaffected and keeps presenting at the
+// real panel rate.
+static float g_xr_refresh_requested;   // Hz, 0 = report the real display rate
+
 static XrResult klxr_EnumerateDisplayRefreshRatesFB(void *session, uint32_t capacity,
                                                     uint32_t *count_out, float *rates) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
-    XrResult r = klxr_two_call(capacity, count_out, 1);
-    if (r == KLXR_SUCCESS && capacity >= 1 && rates)
-        rates[0] = kl_ovrp_display_frequency();
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    float list[8];
+    int n = klxr_refresh_list(list, 8);
+    XrResult r = klxr_two_call(capacity, count_out, (uint32_t)n);
+    if (r == KLXR_SUCCESS && rates && capacity >= (uint32_t)n)
+        for (int i = 0; i < n; i++) rates[i] = list[i];
     return r;
 }
 
 static XrResult klxr_GetDisplayRefreshRateFB(void *session, float *rate) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!rate) return KLXR_ERROR_VALIDATION_FAILURE;
-    *rate = kl_ovrp_display_frequency();
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!rate) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    *rate = g_xr_refresh_requested > 0.0f ? g_xr_refresh_requested
+                                          : kl_ovrp_display_frequency();
     return KLXR_SUCCESS;
 }
 
@@ -1593,14 +1815,24 @@ static XrResult klxr_GetDisplayRefreshRateFB(void *session, float *rate) {
 // have anyway. Anything else has to match it: accepting a rate we do not run at
 // would make the guest pace its frames against a clock that does not exist.
 static XrResult klxr_RequestDisplayRefreshRateFB(void *session, float rate) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
-    float have = kl_ovrp_display_frequency();
-    if (rate != 0.0f && fabsf(rate - have) > 0.5f) {
-        fprintf(stderr, "  [xr] xrRequestDisplayRefreshRateFB(%.1f) — the display "
-                        "runs at %.1f; refused\n", (double)rate, (double)have);
-        return KLXR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (rate == 0.0f) {                              // 0 = "runtime's own default"
+        g_xr_refresh_requested = 0.0f;
+        return KLXR_SUCCESS;
     }
-    return KLXR_SUCCESS;
+    float list[8];
+    int n = klxr_refresh_list(list, 8);
+    for (int i = 0; i < n; i++)
+        if (fabsf(list[i] - rate) < 0.5f) {
+            g_xr_refresh_requested = rate;
+            fprintf(stderr, "  [xr] xrRequestDisplayRefreshRateFB(%.1f) accepted; the "
+                            "panel still runs at %.1f and the compositor reprojects\n",
+                    (double)rate, (double)kl_ovrp_display_frequency());
+            return KLXR_SUCCESS;
+        }
+    fprintf(stderr, "  [xr] xrRequestDisplayRefreshRateFB(%.1f) — not an offered rate; "
+                    "refused\n", (double)rate);
+    KLXR_RET(KLXR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB);
 }
 
 
@@ -1627,7 +1859,7 @@ enum { KLXR_COLOR_SPACE_UNMANAGED = 0, KLXR_COLOR_SPACE_REC709 = 2 };
 
 static XrResult klxr_EnumerateColorSpacesFB(void *session, uint32_t capacity,
                                             uint32_t *count_out, int *spaces) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     XrResult r = klxr_two_call(capacity, count_out, 2);
     if (r == KLXR_SUCCESS && capacity >= 2 && spaces) {
         spaces[0] = KLXR_COLOR_SPACE_UNMANAGED;
@@ -1637,7 +1869,7 @@ static XrResult klxr_EnumerateColorSpacesFB(void *session, uint32_t capacity,
 }
 
 static XrResult klxr_SetColorSpaceFB(void *session, int space) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     static const char *const NAMES[] = { "unmanaged", "rec2020", "rec709",
                                          "rift-cv1", "rift-s", "quest", "p3",
                                          "adobe-rgb" };
@@ -1669,13 +1901,13 @@ enum { KLXR_PERF_DOMAIN_CPU = 1, KLXR_PERF_DOMAIN_GPU = 2 };
 
 static XrResult klxr_PerfSettingsSetPerformanceLevelEXT(void *session,
                                                         int domain, int level) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     static const char *const LEVELS[] = { "?", "power-savings", "sustained-low",
                                           "sustained-high", "boost" };
     static int last_cpu = -1, last_gpu = -1;
     int *last = domain == KLXR_PERF_DOMAIN_CPU ? &last_cpu
               : domain == KLXR_PERF_DOMAIN_GPU ? &last_gpu : NULL;
-    if (!last) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!last) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (*last == level) return KLXR_SUCCESS;
     *last = level;
     fprintf(stderr, "  [xr] perf hint: %s -> %s (advisory; visionOS owns the "
@@ -1690,20 +1922,27 @@ static XrResult klxr_PerfSettingsSetPerformanceLevelEXT(void *session,
 //
 // "This tid is my renderer thread, treat it accordingly." Recorded and not
 // acted on, for the reason in the extension table: Darwin has no door that
-// changes another thread's scheduling by tid — QoS is set by the thread on
-// itself — so the only implementation available would be to lie.
+// changes another thread's scheduling by tid EXCEPT the QoS-override door, which
+// this now uses (kl_pthread_boost_qos): the self case bumps its own QoS, the
+// cross-thread case overrides via the live-thread registry. Only guest-flagged
+// threads are touched, so the compositor is not starved.
 //
 // The tid IS worth printing. This guest spawns its render thread inside
 // onCreate and nothing else names it, so the line joins a tid in `sample <pid>`
 // output to the role the engine believes that thread has.
 static XrResult klxr_SetAndroidApplicationThreadKHR(void *session, int type,
                                                     uint32_t tid) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     static const char *const KINDS[] = { "?", "app-main", "app-worker",
                                          "renderer-main", "renderer-worker" };
     fprintf(stderr, "  [xr] thread hint: tid %u is the guest's %s "
-                    "(recorded; Darwin sets scheduling on the thread itself)\n",
+                    "-> raising its QoS\n",
             tid, (type >= 1 && type <= 4) ? KINDS[type] : "?");
+    // Act on it: raise the flagged thread to USER_INTERACTIVE so a streaming
+    // guest's receive/decode/submit pipeline is not preempted by the compositor
+    // on visionOS. See kl_pthread_boost_qos; KL_XR_THREAD_QOS=0 restores
+    // record-only for A/B.
+    kl_pthread_boost_qos((uint64_t)tid);
     return KLXR_SUCCESS;
 }
 
@@ -1719,7 +1958,7 @@ static XrResult klxr_ConvertTimespecTimeToTimeKHR(void *instance,
                                                   const struct timespec *ts,
                                                   int64_t *time_out) {
     (void)instance;
-    if (!ts || !time_out) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!ts || !time_out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     *time_out = (int64_t)ts->tv_sec * 1000000000LL + ts->tv_nsec;
     return KLXR_SUCCESS;
 }
@@ -1727,7 +1966,7 @@ static XrResult klxr_ConvertTimespecTimeToTimeKHR(void *instance,
 static XrResult klxr_ConvertTimeToTimespecTimeKHR(void *instance, int64_t time,
                                                   struct timespec *ts_out) {
     (void)instance;
-    if (!ts_out) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!ts_out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     // Floor division, so a negative XrTime does not land a nanosecond field
     // outside [0, 1e9) — which is a malformed timespec, not merely an odd one.
     int64_t sec = time / 1000000000LL, nsec = time % 1000000000LL;
@@ -1782,11 +2021,12 @@ static void klxr_post_state(klxr_session *s, int state) {
 
 static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *info,
                                    void **session) {
+    fprintf(stderr, "  [xr] >> %s\n", "xrCreateSession");
     klxr_instance *inst = klxr_inst(instance);
-    if (!inst) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !session) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_SESSION_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->systemId != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (!inst) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !session) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_SESSION_CREATE_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->systemId != KLXR_SYSTEM_ID) KLXR_RET(KLXR_ERROR_SYSTEM_INVALID);
 
     // The graphics binding is chained, not a parameter, and its absence is a
     // distinct error from a bad one: a headless session (no binding at all) is
@@ -1810,17 +2050,17 @@ static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *in
     if (gl && vk) {
         fprintf(stderr, "  [xr] xrCreateSession: BOTH a GLES and a Vulkan binding "
                         "chained — refusing rather than choosing\n");
-        return KLXR_ERROR_GRAPHICS_DEVICE_INVALID;
+        KLXR_RET(KLXR_ERROR_GRAPHICS_DEVICE_INVALID);
     }
     if (!gl && !vk) {
         fprintf(stderr, "  [xr] xrCreateSession: no graphics binding chained\n");
-        return KLXR_ERROR_GRAPHICS_DEVICE_INVALID;
+        KLXR_RET(KLXR_ERROR_GRAPHICS_DEVICE_INVALID);
     }
     // The requirements gate is per graphics API, and so is the check.
     if (gl && !inst->gl_requirements_queried)
-        return KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING;
+        KLXR_RET(KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING);
     if (vk && !inst->vk_requirements_queried)
-        return KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING;
+        KLXR_RET(KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING);
 
     memset(&g_session, 0, sizeof g_session);
     g_session.magic = KLXR_MAGIC_SESSION;
@@ -1860,19 +2100,37 @@ static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *in
 
 static XrResult klxr_DestroySession(void *session) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     s->magic = 0;
     return KLXR_SUCCESS;
 }
 
+// Env-gated per-entry trace (KL_XR_TRACE=1), to diff Klepton's actual OpenXR
+// call sequence against a real-runtime api_dump capture (see the Quest
+// reference trace saved in ~/hl2xr and the hl2-quest-reference-trace memory).
+// Logs only the first few calls of each named entry so the frame loop's
+// presence and ORDER are visible without drowning the log in per-frame spam —
+// the question this answers is whether the guest reaches xrWaitFrame at all
+// (on a real Quest hl2 runs ~11.5k frames; under Klepton the count was 0).
+static void klxr_trace_entry(const char *fn, int *counter) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_XR_TRACE", 0) ? 1 : 0;
+    if (!on || *counter >= 4) return;
+    fprintf(stderr, "  [xr] >> %s%s\n", fn,
+            *counter == 3 ? "  (further calls silenced)" : "");
+    (*counter)++;
+}
+#define KLXR_TRACE(name) do { static int _klxr_tc; klxr_trace_entry(name, &_klxr_tc); } while (0)
+
 static XrResult klxr_BeginSession(void *session, const XrSessionBeginInfo *info) {
+    KLXR_TRACE("xrBeginSession");
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (s->running) return KLXR_ERROR_SESSION_RUNNING;
-    if (s->state != KLXR_SESSION_STATE_READY) return KLXR_ERROR_SESSION_NOT_READY;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (s->running) KLXR_RET(KLXR_ERROR_SESSION_RUNNING);
+    if (s->state != KLXR_SESSION_STATE_READY) KLXR_RET(KLXR_ERROR_SESSION_NOT_READY);
     if (info->primaryViewConfigurationType != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
-        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+        KLXR_RET(KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
     klxr_log_chain("xrBeginSession", info->next);
     s->running = 1;
     // SYNCHRONIZED is "the app's frame loop is now ticking with the runtime's",
@@ -1882,14 +2140,19 @@ static XrResult klxr_BeginSession(void *session, const XrSessionBeginInfo *info)
     klxr_post_state(s, KLXR_SESSION_STATE_SYNCHRONIZED);
     klxr_post_state(s, KLXR_SESSION_STATE_VISIBLE);
     klxr_post_state(s, KLXR_SESSION_STATE_FOCUSED);
+    // Tell the user-presence-aware guest (missioniss) the user is present, so its
+    // SDK caches OVRPlugin.userPresent=1 and picks its Oculus VR helper (which
+    // reports poses) instead of the deviceless one (which does not).
+    if (klxr_ext_gate_open(KLXR_GATE_USER_PRESENCE))
+        klxr_post_event(s, KLXR_EV_USER_PRESENCE, 1);
     return KLXR_SUCCESS;
 }
 
 static XrResult klxr_EndSession(void *session) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
-    if (s->state != KLXR_SESSION_STATE_STOPPING) return KLXR_ERROR_SESSION_NOT_STOPPING;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
+    if (s->state != KLXR_SESSION_STATE_STOPPING) KLXR_RET(KLXR_ERROR_SESSION_NOT_STOPPING);
     s->running = 0;
     klxr_post_state(s, KLXR_SESSION_STATE_IDLE);
     klxr_post_state(s, s->exit_requested ? KLXR_SESSION_STATE_EXITING
@@ -1901,8 +2164,8 @@ static XrResult klxr_EndSession(void *session) {
 // it walked it in — STOPPING, so the app calls xrEndSession, and then EXITING.
 static XrResult klxr_RequestExitSession(void *session) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
     s->exit_requested = 1;
     klxr_post_state(s, KLXR_SESSION_STATE_STOPPING);
     return KLXR_SUCCESS;
@@ -1915,8 +2178,9 @@ static XrResult klxr_RequestExitSession(void *session) {
 // as an event. That is the guest's business, but it is why this returns the
 // specified code rather than an error.
 static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!data) return KLXR_ERROR_VALIDATION_FAILURE;
+    KLXR_TRACE("xrPollEvent");
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!data) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_session *s = &g_session;
     if (s->magic != KLXR_MAGIC_SESSION || s->qcount == 0) return KLXR_EVENT_UNAVAILABLE;
 
@@ -1936,6 +2200,17 @@ static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
         ev->next = NULL;
         ev->session = s;
         fprintf(stderr, "  [xr] interaction profile changed\n");
+        return KLXR_SUCCESS;
+    }
+
+    if (kind == KLXR_EV_USER_PRESENCE) {
+        XrEventDataUserPresenceChangedEXT *ev = (XrEventDataUserPresenceChangedEXT *)data;
+        ev->type = KLXR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT;
+        ev->next = NULL;
+        ev->session = s;
+        ev->isUserPresent = (uint32_t)state;   // 1 = present
+        fprintf(stderr, "  [xr] user presence changed -> %s\n",
+                state ? "present" : "absent");
         return KLXR_SUCCESS;
     }
 
@@ -2567,13 +2842,13 @@ static XrPosef klxr_space_pose(const klxr_space *sp, const klxr_head_delta *pred
 // that check are the same fact.
 static XrResult klxr_EnumerateReferenceSpaces(void *session, uint32_t capacity,
                                               uint32_t *count_out, int32_t *spaces) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     static const int32_t have[] = { KLXR_REF_SPACE_VIEW, KLXR_REF_SPACE_LOCAL,
                                     KLXR_REF_SPACE_STAGE };
     const uint32_t n = sizeof have / sizeof have[0];
     XrResult r = klxr_two_call(capacity, count_out, n);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
-    if (!spaces) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!spaces) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     memcpy(spaces, have, sizeof have);
     return KLXR_SUCCESS;
 }
@@ -2581,11 +2856,12 @@ static XrResult klxr_EnumerateReferenceSpaces(void *session, uint32_t capacity,
 static XrResult klxr_CreateReferenceSpace(void *session,
                                           const XrReferenceSpaceCreateInfo *info,
                                           void **space) {
+    fprintf(stderr, "  [xr] >> %s\n", "xrCreateReferenceSpace");
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !space) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !space) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info->type != XR_TYPE_REFERENCE_SPACE_CREATE_INFO)
-        return KLXR_ERROR_VALIDATION_FAILURE;
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrCreateReferenceSpace", info->next);
 
     // VIEW, LOCAL and STAGE are the three every runtime must offer. The vendor
@@ -2596,11 +2872,11 @@ static XrResult klxr_CreateReferenceSpace(void *session,
         info->referenceSpaceType != KLXR_REF_SPACE_STAGE) {
         fprintf(stderr, "  [xr] xrCreateReferenceSpace: type %d unsupported\n",
                 info->referenceSpaceType);
-        return KLXR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+        KLXR_RET(KLXR_ERROR_REFERENCE_SPACE_UNSUPPORTED);
     }
 
     klxr_space *sp = klxr_space_alloc();
-    if (!sp) return KLXR_ERROR_LIMIT_REACHED;
+    if (!sp) KLXR_RET(KLXR_ERROR_LIMIT_REACHED);
     sp->magic = KLXR_MAGIC_SPACE;
     sp->session = s;
     sp->reference_type = info->referenceSpaceType;
@@ -2614,7 +2890,7 @@ static XrResult klxr_CreateReferenceSpace(void *session,
 
 static XrResult klxr_DestroySpace(void *space) {
     klxr_space *sp = klxr_space_of(space);
-    if (!sp) return KLXR_ERROR_HANDLE_INVALID;
+    if (!sp) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     memset(sp, 0, sizeof *sp);
     return KLXR_SUCCESS;
 }
@@ -2625,8 +2901,8 @@ static XrResult klxr_DestroySpace(void *space) {
 // treats the stage as unbounded, which is what a seated Vision Pro user has.
 static XrResult klxr_GetReferenceSpaceBoundsRect(void *session, int32_t ref_type,
                                                  XrExtent2Df *bounds) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!bounds) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!bounds) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     (void)ref_type;
     bounds->width = bounds->height = 0.0f;
     return KLXR_SPACE_BOUNDS_UNAVAILABLE;
@@ -2700,6 +2976,14 @@ enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
 // inactive suggestion, exactly as before.
 #define KLXR_ACTIVE_PROFILE "/interaction_profiles/oculus/touch_controller"
 #define KLXR_VALVE_PROFILE  "/interaction_profiles/valve/frame_controller_valve"
+// hl1's lambda1vr suggests bindings ONLY for the Pico Neo3 controller and nothing
+// else — so with just Touch driveable, zero bindings were taken and it had no
+// input at all. The Neo3's component layout is the same as Touch's (A/B right,
+// X/Y left, trigger/value, thumbstick, grip+aim poses), so g_xr_sources — which
+// is keyed on the component suffix, not the profile — decodes it unchanged; this
+// only adds the profile to the driveable set and lets it be reported back as the
+// current interaction profile, which the guest needs to accept its own bindings.
+#define KLXR_PICO_PROFILE   "/interaction_profiles/pico/neo3_controller"
 
 // The profile the CURRENT run answers as bound, decided from the guest's own
 // suggestions (see the note above). Empty until one is suggested; the getter
@@ -2709,7 +2993,8 @@ static char g_active_profile[96];
 
 static int klxr_profile_driveable(const char *profile) {
     return strcmp(profile, KLXR_ACTIVE_PROFILE) == 0 ||
-           strcmp(profile, KLXR_VALVE_PROFILE) == 0;
+           strcmp(profile, KLXR_VALVE_PROFILE) == 0 ||
+           strcmp(profile, KLXR_PICO_PROFILE) == 0;
 }
 
 // What one binding path reads, once decoded.
@@ -2806,6 +3091,22 @@ g_xr_sources[] = {
     { "/input/thumbstick/touch", KLXR_SRC_TOUCH,  { KL_OVRP_RAW_LTHUMBSTICK,
                                                     KL_OVRP_RAW_RTHUMBSTICK } },
     { "/input/trigger/value",    KLXR_SRC_INDEX_TRIGGER, { 0, 0 } },
+    // Xash's VR ports (cs1's Xash, hl1's lambda1vr) bind their trigger — the menu
+    // select/fire — to the BARE component path /user/hand/*/input/trigger, not the
+    // .../value or .../click leaf the Touch profile documents. Without this row
+    // both hands' "index_*" actions decoded to unbound ("2 not recognised"), so
+    // the trigger never reached the menu: on cs1 only the left menu button worked,
+    // and nothing selected. Serve it from the analog index trigger like /value.
+    { "/input/trigger",          KLXR_SRC_INDEX_TRIGGER, { 0, 0 } },
+    // Xash's VR menus (cs1's Xash, hl1's lambda1vr) bind their menu select/fire to
+    // /input/trigger/click, which the Touch profile does not actually have — it
+    // has trigger/value (analog) and trigger/touch. Both hands' trigger/click were
+    // therefore the "2 not recognised" bindings, so index_left/index_right stayed
+    // UNBOUND ("never had a controller") and the trigger never reached the menu:
+    // pointing worked, selecting did nothing. Serve it from the analog index
+    // trigger — read as a boolean it is a press (value != 0, exactly how
+    // squeeze/value drives the grip BUTTON), read as a float it is the pull.
+    { "/input/trigger/click",    KLXR_SRC_INDEX_TRIGGER, { 0, 0 } },
     { "/input/squeeze/value",    KLXR_SRC_HAND_TRIGGER,  { 0, 0 } },
     { "/input/thumbstick/x",     KLXR_SRC_STICK_X, { 0, 0 } },
     { "/input/thumbstick/y",     KLXR_SRC_STICK_Y, { 0, 0 } },
@@ -2898,18 +3199,18 @@ static klxr_action     g_actions[KLXR_ACTION_MAX];
 static struct { unsigned syncs, bound, hands_seen, haptic_pulses; } g_xr_input;
 
 static XrResult klxr_StringToPath(void *instance, const char *path_string, XrPath *path) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!path_string || !path) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!path_string || !path) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     // XR_ERROR_PATH_FORMAT_INVALID is for a string that is not a well-formed
     // path. We do not police the grammar — the guest's paths come from its own
     // tables, not from a user — but the length IS a limit we would silently
     // truncate past, and a truncated path would then compare equal to a
     // different one.
-    if (strlen(path_string) >= XR_MAX_PATH_LENGTH) return KLXR_ERROR_PATH_FORMAT_INVALID;
+    if (strlen(path_string) >= XR_MAX_PATH_LENGTH) KLXR_RET(KLXR_ERROR_PATH_FORMAT_INVALID);
 
     for (uint32_t i = 0; i < g_path_count; i++)
         if (strcmp(g_paths[i], path_string) == 0) { *path = i + 1; return KLXR_SUCCESS; }
-    if (g_path_count >= KLXR_PATH_MAX) return KLXR_ERROR_PATH_COUNT_EXCEEDED;
+    if (g_path_count >= KLXR_PATH_MAX) KLXR_RET(KLXR_ERROR_PATH_COUNT_EXCEEDED);
     snprintf(g_paths[g_path_count], XR_MAX_PATH_LENGTH, "%s", path_string);
     *path = ++g_path_count;         // 1-based; 0 stays XR_NULL_PATH
     return KLXR_SUCCESS;
@@ -2922,22 +3223,22 @@ static const char *klxr_path_str(XrPath p) {
 
 static XrResult klxr_PathToString(void *instance, XrPath path, uint32_t capacity,
                                   uint32_t *count_out, char *buffer) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (path == 0 || path > g_path_count) return KLXR_ERROR_PATH_INVALID;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (path == 0 || path > g_path_count) KLXR_RET(KLXR_ERROR_PATH_INVALID);
     const char *s = g_paths[path - 1];
     uint32_t need = (uint32_t)strlen(s) + 1;         // the count INCLUDES the NUL
     XrResult r = klxr_two_call(capacity, count_out, need);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
-    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!buffer) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     memcpy(buffer, s, need);
     return KLXR_SUCCESS;
 }
 
 static XrResult klxr_CreateActionSet(void *instance, const XrActionSetCreateInfo *info,
                                      void **action_set) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !action_set) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_ACTION_SET_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !action_set) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_ACTION_SET_CREATE_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrCreateActionSet", info->next);
     for (int i = 0; i < KLXR_ACTION_SET_MAX; i++) {
         if (g_action_sets[i].magic) continue;
@@ -2950,7 +3251,7 @@ static XrResult klxr_CreateActionSet(void *instance, const XrActionSetCreateInfo
         *action_set = &g_action_sets[i];
         return KLXR_SUCCESS;
     }
-    return KLXR_ERROR_LIMIT_REACHED;
+    KLXR_RET(KLXR_ERROR_LIMIT_REACHED);
 }
 
 // Both pools are validated the same way, and by IDENTITY rather than by magic
@@ -2969,7 +3270,7 @@ static klxr_action *klxr_action_of(void *h) {
 
 static XrResult klxr_DestroyActionSet(void *action_set) {
     klxr_action_set *h = klxr_action_set_of(action_set);
-    if (!h) return KLXR_ERROR_HANDLE_INVALID;
+    if (!h) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     memset(h, 0, sizeof *h);
     return KLXR_SUCCESS;
 }
@@ -2977,9 +3278,9 @@ static XrResult klxr_DestroyActionSet(void *action_set) {
 static XrResult klxr_CreateAction(void *action_set, const XrActionCreateInfo *info,
                                   void **action) {
     klxr_action_set *set = klxr_action_set_of(action_set);
-    if (!set) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !action) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_ACTION_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!set) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !action) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_ACTION_CREATE_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrCreateAction", info->next);
     for (int i = 0; i < KLXR_ACTION_MAX; i++) {
         if (g_actions[i].magic) continue;
@@ -2990,12 +3291,12 @@ static XrResult klxr_CreateAction(void *action_set, const XrActionCreateInfo *in
         *action = &g_actions[i];
         return KLXR_SUCCESS;
     }
-    return KLXR_ERROR_LIMIT_REACHED;
+    KLXR_RET(KLXR_ERROR_LIMIT_REACHED);
 }
 
 static XrResult klxr_DestroyAction(void *action) {
     klxr_action *h = klxr_action_of(action);
-    if (!h) return KLXR_ERROR_HANDLE_INVALID;
+    if (!h) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     memset(h, 0, sizeof *h);
     return KLXR_SUCCESS;
 }
@@ -3008,14 +3309,14 @@ static XrResult klxr_CreateActionSpace(void *session,
                                        const XrActionSpaceCreateInfo *info,
                                        void **space) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !space) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_ACTION_SPACE_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (!klxr_action_of(info->action)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !space) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_ACTION_SPACE_CREATE_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!klxr_action_of(info->action)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     klxr_log_chain("xrCreateActionSpace", info->next);
 
     klxr_space *sp = klxr_space_alloc();
-    if (!sp) return KLXR_ERROR_LIMIT_REACHED;
+    if (!sp) KLXR_RET(KLXR_ERROR_LIMIT_REACHED);
     sp->magic = KLXR_MAGIC_SPACE;
     sp->session = s;
     sp->reference_type = 0;
@@ -3076,10 +3377,10 @@ static int klxr_action_space_hand(const klxr_space *sp, int *is_aim) {
 // note above g_active_profile), not from a constant.
 static XrResult klxr_SuggestInteractionProfileBindings(
         void *instance, const XrInteractionProfileSuggestedBinding *bindings) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!bindings) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!bindings) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (bindings->type != XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING)
-        return KLXR_ERROR_VALIDATION_FAILURE;
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrSuggestInteractionProfileBindings", bindings->next);
 
     const char *profile = klxr_path_str(bindings->interactionProfile);
@@ -3116,7 +3417,7 @@ static XrResult klxr_SuggestInteractionProfileBindings(
     for (uint32_t i = 0; i < bindings->countSuggestedBindings; i++) {
         const XrActionSuggestedBinding *b = &bindings->suggestedBindings[i];
         klxr_action *a = klxr_action_of(b->action);
-        if (!a) return KLXR_ERROR_HANDLE_INVALID;
+        if (!a) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
 
         const char *path = klxr_path_str(b->binding), *suffix = NULL;
         int hand = klxr_path_hand(path, &suffix);
@@ -3142,6 +3443,13 @@ static XrResult klxr_SuggestInteractionProfileBindings(
             took++;
         } else if (active) {
             unknown++;
+            // Always name an unrecognised binding — it is a control the guest
+            // asked for and did not get, i.e. dead input, and finding it should
+            // not require knowing to set KL_XR_BINDINGS in advance. (The full
+            // decode, accepted bindings included, still needs that flag.)
+            if (!detail)
+                fprintf(stderr, "  [xr]     UNRECOGNISED binding: %-24s <- %s\n",
+                        a->name, path);
         }
         // One line per binding is far too much unasked for — six profiles at
         // ~29 bindings each — so KL_XR_BINDINGS gates it and the counts always
@@ -3165,17 +3473,17 @@ static XrResult klxr_SuggestInteractionProfileBindings(
 static XrResult klxr_AttachSessionActionSets(void *session,
                                              const XrSessionActionSetsAttachInfo *info) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info->type != XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO)
-        return KLXR_ERROR_VALIDATION_FAILURE;
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrAttachSessionActionSets", info->next);
     // Attaching is once per session and permanent: after it, action sets are
     // frozen and a second attach is XR_ERROR_ACTIONSETS_ALREADY_ATTACHED.
-    if (s->action_sets_attached) return KLXR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
+    if (s->action_sets_attached) KLXR_RET(KLXR_ERROR_ACTIONSETS_ALREADY_ATTACHED);
     for (uint32_t i = 0; i < info->countActionSets; i++) {
         klxr_action_set *set = klxr_action_set_of(info->actionSets[i]);
-        if (!set) return KLXR_ERROR_HANDLE_INVALID;
+        if (!set) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
         set->attached = 1;
     }
     s->action_sets_attached = 1;
@@ -3202,9 +3510,9 @@ static XrResult klxr_AttachSessionActionSets(void *session,
 static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_level_path,
                                                   XrInteractionProfileState *state) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!s->action_sets_attached) KLXR_RET(KLXR_ERROR_ACTIONSET_NOT_ATTACHED);
     klxr_log_chain("xrGetCurrentInteractionProfile", state->next);
     state->type = XR_TYPE_INTERACTION_PROFILE_STATE;
     state->interactionProfile = 0;      // XR_NULL_PATH
@@ -3281,10 +3589,11 @@ static float klxr_eval(const klxr_action *a, int hand, const klxr_hand_input *in
 // an app that treats a failed sync as fatal is an app that never renders a
 // frame.
 static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
+    KLXR_TRACE("xrSyncActions");
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!s->action_sets_attached) KLXR_RET(KLXR_ERROR_ACTIONSET_NOT_ATTACHED);
 
     klxr_hand_input in[2];
     for (int h = 0; h < 2; h++)
@@ -3292,6 +3601,19 @@ static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
                                                  &in[h].index_trigger,
                                                  &in[h].hand_trigger,
                                                  &in[h].stick_x, &in[h].stick_y);
+    // The Oculus Touch profile has a menu button on the LEFT hand only — the
+    // right's slot is the reserved system button, and guests (Steam Link)
+    // suggest bindings accordingly. A menu press arriving on the RIGHT hand
+    // (the Sense Options button) would otherwise evaluate against a binding
+    // that does not exist and vanish. Fold it into the left hand's word, so
+    // either physical menu button lands on the one menu binding a Touch guest
+    // actually has. KL_XR_MENU_EITHER=0 restores strict per-hand routing.
+    { static int fold = -1;
+      if (fold < 0) fold = kl_env_on("KL_XR_MENU_EITHER", 0);
+      if (fold && in[1].present && (in[1].buttons & KL_OVRP_RAW_START)) {
+          in[0].buttons |= KL_OVRP_RAW_START;
+          in[0].touches |= KL_OVRP_RAW_START;
+      } }
     int64_t now = klxr_now();
     for (int i = 0; i < KLXR_ACTION_MAX; i++) {
         klxr_action *a = &g_actions[i];
@@ -3363,12 +3685,12 @@ static int klxr_hands_for(const klxr_action *a, XrPath sub, const char **why) {
 static XrResult klxr_action_state_pre(void *session, const XrActionStateGetInfo *info,
                                       const char *where, klxr_action **out) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_ACTION_STATE_GET_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_ACTION_STATE_GET_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_action *a = klxr_action_of(info->action);
-    if (!a) return KLXR_ERROR_HANDLE_INVALID;
-    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    if (!a) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!s->action_sets_attached) KLXR_RET(KLXR_ERROR_ACTIONSET_NOT_ATTACHED);
     klxr_log_chain(where, info->next);
     a->reads++;
     *out = a;
@@ -3399,7 +3721,7 @@ static XrResult klxr_GetActionStateBoolean(void *session, const XrActionStateGet
     klxr_action *a = NULL;
     XrResult r = klxr_action_state_pre(session, info, "xrGetActionStateBoolean", &a);
     if (r != KLXR_SUCCESS) return r;
-    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     state->type = XR_TYPE_ACTION_STATE_BOOLEAN;
     state->currentState = 0; state->changedSinceLastSync = 0;
     state->lastChangeTime = 0; state->isActive = 0;
@@ -3432,7 +3754,7 @@ static XrResult klxr_GetActionStateFloat(void *session, const XrActionStateGetIn
     klxr_action *a = NULL;
     XrResult r = klxr_action_state_pre(session, info, "xrGetActionStateFloat", &a);
     if (r != KLXR_SUCCESS) return r;
-    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     state->type = XR_TYPE_ACTION_STATE_FLOAT;
     state->currentState = 0.0f; state->changedSinceLastSync = 0;
     state->lastChangeTime = 0; state->isActive = 0;
@@ -3467,7 +3789,7 @@ static XrResult klxr_GetActionStatePose(void *session, const XrActionStateGetInf
     klxr_action *a = NULL;
     XrResult r = klxr_action_state_pre(session, info, "xrGetActionStatePose", &a);
     if (r != KLXR_SUCCESS) return r;
-    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     state->type = XR_TYPE_ACTION_STATE_POSE;
     state->isActive = 0;
     int hands = klxr_hands_for(a, info->subactionPath, NULL);
@@ -3494,7 +3816,7 @@ static XrResult klxr_GetActionStateVector2f(void *session,
     klxr_action *a = NULL;
     XrResult r = klxr_action_state_pre(session, info, "xrGetActionStateVector2f", &a);
     if (r != KLXR_SUCCESS) return r;
-    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     state->type = XR_TYPE_ACTION_STATE_VECTOR2F;
     state->currentState = (XrVector2f){ 0, 0 };
     state->changedSinceLastSync = 0; state->lastChangeTime = 0; state->isActive = 0;
@@ -3534,13 +3856,13 @@ static XrResult klxr_EnumerateBoundSourcesForAction(
         uint32_t sourceCapacityInput, uint32_t *sourceCountOutput,
         XrPath *sources) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !sourceCountOutput) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !sourceCountOutput) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info->type != XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO)
-        return KLXR_ERROR_VALIDATION_FAILURE;
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_action *a = klxr_action_of(info->action);
-    if (!a) return KLXR_ERROR_HANDLE_INVALID;
-    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    if (!a) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!s->action_sets_attached) KLXR_RET(KLXR_ERROR_ACTIONSET_NOT_ATTACHED);
     klxr_log_chain("xrEnumerateBoundSourcesForAction", info->next);
 
     // "Bound" is the ACTIVE map, and only that: an action suggested under an
@@ -3552,8 +3874,8 @@ static XrResult klxr_EnumerateBoundSourcesForAction(
         if (a->kind[h] != KLXR_SRC_NONE && a->bind[h]) all[n++] = a->bind[h];
     *sourceCountOutput = n;
     if (sourceCapacityInput == 0) return KLXR_SUCCESS;   // the two-call shape
-    if (sourceCapacityInput < n) return KLXR_ERROR_SIZE_INSUFFICIENT;
-    if (n && !sources) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (sourceCapacityInput < n) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (n && !sources) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     for (uint32_t i = 0; i < n; i++) sources[i] = all[i];
     return KLXR_SUCCESS;
 }
@@ -3587,19 +3909,19 @@ static XrResult klxr_GetInputSourceLocalizedName(
         uint32_t bufferCapacityInput, uint32_t *bufferCountOutput,
         char *buffer) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !bufferCountOutput) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !bufferCountOutput) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info->type != XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO)
-        return KLXR_ERROR_VALIDATION_FAILURE;
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info->sourcePath == 0 || info->sourcePath > g_path_count)
-        return KLXR_ERROR_PATH_INVALID;
+        KLXR_RET(KLXR_ERROR_PATH_INVALID);
     klxr_log_chain("xrGetInputSourceLocalizedName", info->next);
 
     const char *name = klxr_src_display_name(klxr_path_str(info->sourcePath));
     uint32_t need = (uint32_t)strlen(name) + 1;  // count includes the NUL
     *bufferCountOutput = need;
-    if (bufferCapacityInput < need) return KLXR_ERROR_SIZE_INSUFFICIENT;
-    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (bufferCapacityInput < need) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (!buffer) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     memcpy(buffer, name, need);
     return KLXR_SUCCESS;
 }
@@ -3626,12 +3948,12 @@ static int klxr_haptic_hands(const klxr_action *a, XrPath sub) {
 static XrResult klxr_ApplyHapticFeedback(void *session, const XrHapticActionInfo *info,
                                          const XrHapticBaseHeader *feedback) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !feedback) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_HAPTIC_ACTION_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !feedback) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_HAPTIC_ACTION_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_action *a = klxr_action_of(info->action);
-    if (!a) return KLXR_ERROR_HANDLE_INVALID;
-    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    if (!a) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!s->action_sets_attached) KLXR_RET(KLXR_ERROR_ACTIONSET_NOT_ATTACHED);
     klxr_log_chain("xrApplyHapticFeedback", info->next);
 
     // Read `type` before casting, exactly as a composition layer is read. The
@@ -3705,12 +4027,12 @@ static void klxr_input_report(FILE *f) {
 
 static XrResult klxr_StopHapticFeedback(void *session, const XrHapticActionInfo *info) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_HAPTIC_ACTION_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_HAPTIC_ACTION_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_action *a = klxr_action_of(info->action);
-    if (!a) return KLXR_ERROR_HANDLE_INVALID;
-    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    if (!a) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!s->action_sets_attached) KLXR_RET(KLXR_ERROR_ACTIONSET_NOT_ATTACHED);
     klxr_log_chain("xrStopHapticFeedback", info->next);
     int hands = klxr_haptic_hands(a, info->subactionPath);
     for (int h = 0; h < 2; h++) if (hands & (1 << h)) kl_ovrp_haptics_stop(h);
@@ -3765,6 +4087,14 @@ typedef struct {
                               // none. Separate from `eye` because every
                               // projection layer's views claim an eye and only
                               // the composited layer's storage is provided.
+    // Surface-backed swapchain (XR_KHR_android_surface_swapchain): the guest
+    // renders into an Android Surface's EGL window surface rather than into
+    // images it acquires. `surface` is the android/view/Surface jobject handed
+    // back to the guest; kl_ndk resolves ANativeWindow_fromSurface to it and
+    // kl_egl drives kl_xr_android_surface_present on eglSwapBuffers. blit_fbo[]
+    // are GL FBOs over tex[], reused to copy the default framebuffer in.
+    void    *surface;
+    uint32_t blit_fbo[KLXR_SWAPCHAIN_IMAGES];
 } klxr_swapchain;
 
 static klxr_swapchain g_swapchains[KLXR_SWAPCHAIN_MAX];
@@ -3850,12 +4180,12 @@ static int klxr_format_is_depth(const klxr_session *s, int64_t f) {
 static XrResult klxr_EnumerateSwapchainFormats(void *session, uint32_t capacity,
                                                uint32_t *count_out, int64_t *formats) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     uint32_t have = 0;
     const int64_t *list = klxr_formats_for(s, &have);
     XrResult r = klxr_two_call(capacity, count_out, have);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
-    if (!formats) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!formats) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     memcpy(formats, list, have * sizeof *list);
     return KLXR_SUCCESS;
 }
@@ -3868,6 +4198,17 @@ static void (*gl_DeleteTextures)(int32_t, const uint32_t *);
 static void (*gl_BindTexture)(uint32_t, uint32_t);
 static void (*gl_TexStorage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
 static void (*gl_TexStorage3D)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t);
+// The framebuffer entry points for the surface-swapchain copy (below): the
+// guest's default framebuffer holds the finished game frame at eglSwapBuffers,
+// and it is blitted into the swapchain's next image so the quad path composites
+// it. Resolved through the same gateway as the texture calls.
+static void (*gl_GenFramebuffers)(int32_t, uint32_t *);
+static void (*gl_DeleteFramebuffers)(int32_t, const uint32_t *);
+static void (*gl_BindFramebuffer)(uint32_t, uint32_t);
+static void (*gl_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+static void (*gl_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                  int32_t, int32_t, uint32_t, uint32_t);
+static void (*gl_GetIntegerv)(uint32_t, int32_t *);
 
 static void klxr_gl_init(void) {
     if (gl_GenTextures) return;
@@ -3876,6 +4217,12 @@ static void klxr_gl_init(void) {
     gl_BindTexture    = kl_egl_sym("glBindTexture");
     gl_TexStorage2D   = kl_egl_sym("glTexStorage2D");
     gl_TexStorage3D   = kl_egl_sym("glTexStorage3D");
+    gl_GenFramebuffers      = kl_egl_sym("glGenFramebuffers");
+    gl_DeleteFramebuffers   = kl_egl_sym("glDeleteFramebuffers");
+    gl_BindFramebuffer      = kl_egl_sym("glBindFramebuffer");
+    gl_FramebufferTexture2D = kl_egl_sym("glFramebufferTexture2D");
+    gl_BlitFramebuffer      = kl_egl_sym("glBlitFramebuffer");
+    gl_GetIntegerv          = kl_egl_sym("glGetIntegerv");
 }
 
 #define KLXR_GL_TEXTURE_2D       0x0DE1
@@ -3884,9 +4231,9 @@ static void klxr_gl_init(void) {
 static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo *info,
                                      void **swapchain) {
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !swapchain) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_SWAPCHAIN_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !swapchain) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_SWAPCHAIN_CREATE_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrCreateSwapchain", info->next);
 
     uint32_t nfmt = 0;
@@ -3898,23 +4245,49 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
         fprintf(stderr, "  [xr] xrCreateSwapchain: format 0x%llx unsupported (%s)\n",
                 (unsigned long long)info->format,
                 s->gfx == KLXR_GFX_VULKAN ? "VkFormat" : "GL internal format");
-        return KLXR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+        KLXR_RET(KLXR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED);
     }
     if (info->sampleCount > 1) {
         fprintf(stderr, "  [xr] xrCreateSwapchain: sampleCount %u — only 1 is served\n",
                 info->sampleCount);
-        return KLXR_ERROR_FEATURE_UNSUPPORTED;
+        KLXR_RET(KLXR_ERROR_FEATURE_UNSUPPORTED);
     }
     // faceCount 6 is a cubemap. Nothing in the eye path wants one; refused
     // rather than served as a 2D image.
-    if (info->faceCount != 1) return KLXR_ERROR_FEATURE_UNSUPPORTED;
+    if (info->faceCount != 1) KLXR_RET(KLXR_ERROR_FEATURE_UNSUPPORTED);
     if (!info->width || !info->height || !info->arraySize || !info->mipCount)
-        return KLXR_ERROR_VALIDATION_FAILURE;
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+
+    // Klepton: HL2Q3VR (hl2/portal) asks for a 2-layer ARRAY eye swapchain to drive
+    // its single-pass MULTIVIEW renderer ("direct array"/"compatible copied"), which
+    // puts togl into Quest-multiview mode (IDirect3DDevice9::BeginQuestMultiview). But
+    // this build's PCVR shader data has NO multiview vertex variants, so every world
+    // draw is "HL2Q3VR multiview: no usable vertex shader variant" and the screen is
+    // black. Refusing the array swapchain makes the port take its own documented
+    // fallback — "Unable to create stereo array swapchain; retaining separate eye
+    // chains" — i.e. per-eye submission with togl's BASE variants, which the data DOES
+    // have. Gated to that engine (ieytd's real multiview must keep its array); opt out
+    // with KL_HL2_ARRAY_SWAPCHAIN=1.
+    // Opt-IN only (KL_HL2_FORCE_PEREYE=1): refusing the array swapchain drops
+    // HL2Q3VR (hl2/portal) to its separate-eye path. Default OFF now — hl2's real
+    // fix is to make its runtime MULTIVIEW generation work (guest patch
+    // hl2-multiview-gen), and refusing the array would sabotage that. Kept as a
+    // fallback lever for the per-eye experiment.
+    if (info->arraySize > 1 && kl_env_on("KL_HL2_FORCE_PEREYE", 0)) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (t && (strcmp(t, "hl2") == 0 || strcmp(t, "portal") == 0)) {
+            fprintf(stderr, "  [xr] xrCreateSwapchain: refusing arraySize=%u for %s — "
+                    "forcing the port's separate-eye (non-multiview) path\n",
+                    info->arraySize, t);
+            KLXR_RET(KLXR_ERROR_FEATURE_UNSUPPORTED);
+        }
+    }
 
     klxr_swapchain *sc = NULL;
     for (int i = 0; i < KLXR_SWAPCHAIN_MAX; i++)
         if (!g_swapchains[i].magic) { sc = &g_swapchains[i]; break; }
-    if (!sc) return KLXR_ERROR_LIMIT_REACHED;
+    if (!sc) KLXR_RET(KLXR_ERROR_LIMIT_REACHED);
 
     memset(sc, 0, sizeof *sc);
     sc->magic = KLXR_MAGIC_SWAPCHAIN;
@@ -3943,7 +4316,7 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
                 fprintf(stderr, "  [xr] xrCreateSwapchain: VkImage %d of %d failed\n",
                         i, sc->count);
                 sc->magic = 0;
-                return KLXR_ERROR_RUNTIME_FAILURE;
+                KLXR_RET(KLXR_ERROR_RUNTIME_FAILURE);
             }
         }
         fprintf(stderr, "  [xr] swapchain %ux%u VkFormat %lld array %u mips %u "
@@ -3959,7 +4332,7 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
     if (!gl_GenTextures || !gl_BindTexture) {
         fprintf(stderr, "  [xr] xrCreateSwapchain: no GL gateway\n");
         sc->magic = 0;
-        return KLXR_ERROR_RUNTIME_FAILURE;
+        KLXR_RET(KLXR_ERROR_RUNTIME_FAILURE);
     }
     gl_GenTextures(sc->count, sc->tex);
 
@@ -4405,9 +4778,134 @@ static void klxr_quad_census(const kl_ovrp_overlay *o, int placed) {
             placed ? "composited" : "NOT composited (no MTLTexture for it)");
 }
 
+// XR_KHR_android_surface_swapchain — a guest renders its screen (its
+// GameSurfaceLayer) into an Android Surface and presents it as an XR swapchain,
+// rather than acquiring swapchain images and drawing into them itself. This
+// creates the swapchain the normal way and hands back a synthetic Surface for
+// the guest to render into. The bridge that routes that surface's frames into
+// the swapchain's images is NOT wired yet: this exists to get such a guest past the
+// abort so its next log shows HOW it renders to the surface (a GL window
+// surface, a Vulkan swapchain, or a direct blit), which is what determines how
+// to feed the compositor.
+static XrResult klxr_CreateSwapchainAndroidSurfaceKHR(void *session,
+        const XrSwapchainCreateInfo *info, void **swapchain, void **surface) {
+    if (!surface || !info) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    // For an Android-Surface swapchain the format / sampleCount / usage in the
+    // create-info are IGNORED per the extension — the producing Surface defines
+    // them — so the guest legitimately passes format 0, which the normal
+    // create-path rejects. Substitute the session's default format (and sane
+    // counts) so the backing swapchain is real; the Surface still drives the
+    // actual pixels.
+    XrSwapchainCreateInfo fixed = *info;
+    if (fixed.format == 0) {
+        klxr_session *s = klxr_sess(session);
+        uint32_t nfmt = 0;
+        const int64_t *fmts = s ? klxr_formats_for(s, &nfmt) : NULL;
+        fixed.format = (fmts && nfmt) ? fmts[0] : 0;
+    }
+    if (fixed.sampleCount == 0) fixed.sampleCount = 1;
+    if (fixed.faceCount   == 0) fixed.faceCount   = 1;
+    if (fixed.arraySize   == 0) fixed.arraySize   = 1;
+    if (fixed.mipCount    == 0) fixed.mipCount    = 1;
+    XrResult r = klxr_CreateSwapchain(session, &fixed, swapchain);
+    if (r != KLXR_SUCCESS) return r;
+    void *surf = kl_jni_new_object("android/view/Surface");
+    *surface = surf;
+    // Bind the Surface to its swapchain so the render seam can find its way back:
+    // kl_ndk's ANativeWindow_fromSurface resolves this jobject to a distinct
+    // window (owner = this Surface), kl_egl's window surface carries the
+    // swapchain, and eglSwapBuffers drives kl_xr_android_surface_present.
+    klxr_swapchain *sc = klxr_swapchain_of(*swapchain);
+    if (sc) sc->surface = surf;
+    fprintf(stderr, "  [xr] xrCreateSwapchainAndroidSurfaceKHR: %ux%u swapchain + Surface %p "
+                    "-> surface bridge wired (guest renders into it, eglSwapBuffers presents "
+                    "it as the swapchain's image)\n",
+            info ? info->width : 0, info ? info->height : 0, surf);
+    return KLXR_SUCCESS;
+}
+
+// ---- the surface -> swapchain seam, driven from kl_ndk and kl_egl ----------
+//
+// A surface-backed swapchain (XR_KHR_android_surface_swapchain) inverts the
+// normal flow: the guest does NOT acquire/wait/release images, it renders each
+// frame into the Android Surface's EGL window surface — its default framebuffer
+// — and the runtime is expected to turn that into the swapchain's presented
+// image. eglSwapBuffers is where a frame is finished, so it is the "release".
+
+// Which surface-backed swapchain, if any, this Surface jobject belongs to.
+void *kl_xr_swapchain_for_surface(void *surface) {
+    if (!surface) return NULL;
+    for (int i = 0; i < KLXR_SWAPCHAIN_MAX; i++)
+        if (g_swapchains[i].magic == KLXR_MAGIC_SWAPCHAIN &&
+            g_swapchains[i].surface == surface)
+            return &g_swapchains[i];
+    return NULL;
+}
+
+void kl_xr_android_surface_size(void *scv, int32_t *w, int32_t *h) {
+    klxr_swapchain *sc = klxr_swapchain_of(scv);
+    if (w) *w = sc ? (int32_t)sc->width  : 0;
+    if (h) *h = sc ? (int32_t)sc->height : 0;
+}
+
+// Copy the just-finished default framebuffer into the swapchain's next image and
+// name it released, so xrEndFrame's quad path composites it exactly as it does
+// an app-drawn swapchain. Called by kl_egl from eglSwapBuffers, on the guest's
+// render thread with its context current — which is the one moment the finished
+// frame is in the default framebuffer and a GL blit is legal.
+#define KLXR_GL_READ_FRAMEBUFFER          0x8CA8
+#define KLXR_GL_DRAW_FRAMEBUFFER          0x8CA9
+#define KLXR_GL_READ_FRAMEBUFFER_BINDING  0x8CAA
+#define KLXR_GL_DRAW_FRAMEBUFFER_BINDING  0x8CA6
+#define KLXR_GL_COLOR_ATTACHMENT0         0x8CE0
+#define KLXR_GL_COLOR_BUFFER_BIT          0x4000
+#define KLXR_GL_LINEAR                    0x2601
+int kl_xr_android_surface_present(void *scv) {
+    klxr_swapchain *sc = klxr_swapchain_of(scv);
+    if (!sc || !sc->surface) return -1;
+    klxr_gl_init();
+    if (!gl_GenFramebuffers || !gl_BindFramebuffer || !gl_FramebufferTexture2D ||
+        !gl_BlitFramebuffer) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [xr] surface-swapchain present: no GL framebuffer "
+                            "gateway — the game frame cannot be copied into the "
+                            "swapchain image\n");
+        return -1;
+    }
+    // Round-robin the images so a frame the compositor is still copying out is
+    // not overwritten by the next one the guest draws.
+    int idx = (sc->last_released + 1) % sc->count;
+    if (!sc->blit_fbo[idx]) gl_GenFramebuffers(1, &sc->blit_fbo[idx]);
+
+    int32_t prev_read = 0, prev_draw = 0;
+    if (gl_GetIntegerv) {
+        gl_GetIntegerv(KLXR_GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+        gl_GetIntegerv(KLXR_GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+    }
+    gl_BindFramebuffer(KLXR_GL_READ_FRAMEBUFFER, 0);   // the default fb = the frame
+    gl_BindFramebuffer(KLXR_GL_DRAW_FRAMEBUFFER, sc->blit_fbo[idx]);
+    gl_FramebufferTexture2D(KLXR_GL_DRAW_FRAMEBUFFER, KLXR_GL_COLOR_ATTACHMENT0,
+                            KLXR_GL_TEXTURE_2D, sc->tex[idx], 0);
+    gl_BlitFramebuffer(0, 0, (int32_t)sc->width, (int32_t)sc->height,
+                       0, 0, (int32_t)sc->width, (int32_t)sc->height,
+                       KLXR_GL_COLOR_BUFFER_BIT, KLXR_GL_LINEAR);
+    gl_BindFramebuffer(KLXR_GL_READ_FRAMEBUFFER, (uint32_t)prev_read);
+    gl_BindFramebuffer(KLXR_GL_DRAW_FRAMEBUFFER, (uint32_t)prev_draw);
+
+    sc->last_released = idx;
+    static unsigned n;
+    if (n == 0 || n % 300 == 0)
+        fprintf(stderr, "  [xr] surface-swapchain present #%u: default fb -> image %d "
+                        "(%ux%u), named released for the quad path\n",
+                n, idx, sc->width, sc->height);
+    n++;
+    return 0;
+}
+
 static XrResult klxr_DestroySwapchain(void *swapchain) {
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
-    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     // The compositor slots this swapchain's images were copied into, which are
     // ours and are keyed on the swapchain rather than on its image index — so
     // they cannot be found from `count` the way the eye textures below are.
@@ -4428,6 +4926,11 @@ static XrResult klxr_DestroySwapchain(void *swapchain) {
     } else if (gl_DeleteTextures) {
         gl_DeleteTextures(sc->count, sc->tex);
     }
+    // The surface-swapchain copy FBOs, if any were made (see
+    // kl_xr_android_surface_present).
+    if (gl_DeleteFramebuffers)
+        for (int i = 0; i < sc->count; i++)
+            if (sc->blit_fbo[i]) gl_DeleteFramebuffers(1, &sc->blit_fbo[i]);
     memset(sc, 0, sizeof *sc);
     return KLXR_SUCCESS;
 }
@@ -4435,10 +4938,10 @@ static XrResult klxr_DestroySwapchain(void *swapchain) {
 static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity,
                                               uint32_t *count_out, void *images) {
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
-    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     XrResult r = klxr_two_call(capacity, count_out, (uint32_t)sc->count);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
-    if (!images) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!images) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
 
     // The array is the app's, and its element type is whatever its graphics
     // binding says. Checking `type` on the first element is how the spec has a
@@ -4454,7 +4957,7 @@ static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity
         if (got != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) {
             fprintf(stderr, "  [xr] xrEnumerateSwapchainImages: image type %d is not "
                             "XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR\n", got);
-            return KLXR_ERROR_VALIDATION_FAILURE;
+            KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
         }
         XrSwapchainImageVulkanKHR *vk = (XrSwapchainImageVulkanKHR *)images;
         for (int i = 0; i < sc->count; i++) vk[i].image = sc->vk_img[i];
@@ -4463,7 +4966,7 @@ static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity
     if (got != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR) {
         fprintf(stderr, "  [xr] xrEnumerateSwapchainImages: image type %d is not "
                         "XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR\n", got);
-        return KLXR_ERROR_VALIDATION_FAILURE;
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     }
     XrSwapchainImageOpenGLESKHR *gl = (XrSwapchainImageOpenGLESKHR *)images;
     for (int i = 0; i < sc->count; i++) gl[i].image = sc->tex[i];
@@ -4484,11 +4987,12 @@ static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity
 static XrResult klxr_AcquireSwapchainImage(void *swapchain,
                                            const XrSwapchainImageAcquireInfo *info,
                                            uint32_t *index) {
+    KLXR_TRACE("xrAcquireSwapchainImage");
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
-    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
-    if (!index) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!index) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info) klxr_log_chain("xrAcquireSwapchainImage", info->next);
-    if (sc->acquired >= 0) return KLXR_ERROR_CALL_ORDER_INVALID;
+    if (sc->acquired >= 0) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     sc->acquired = sc->next_index;
     sc->next_index = (sc->next_index + 1) % sc->count;
     *index = (uint32_t)sc->acquired;
@@ -4497,19 +5001,21 @@ static XrResult klxr_AcquireSwapchainImage(void *swapchain,
 
 static XrResult klxr_WaitSwapchainImage(void *swapchain,
                                         const XrSwapchainImageWaitInfo *info) {
+    KLXR_TRACE("xrWaitSwapchainImage");
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
-    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (info) klxr_log_chain("xrWaitSwapchainImage", info->next);
-    if (sc->acquired < 0) return KLXR_ERROR_CALL_ORDER_INVALID;
+    if (sc->acquired < 0) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     return KLXR_SUCCESS;
 }
 
 static XrResult klxr_ReleaseSwapchainImage(void *swapchain,
                                            const XrSwapchainImageReleaseInfo *info) {
+    KLXR_TRACE("xrReleaseSwapchainImage");
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
-    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (info) klxr_log_chain("xrReleaseSwapchainImage", info->next);
-    if (sc->acquired < 0) return KLXR_ERROR_CALL_ORDER_INVALID;
+    if (sc->acquired < 0) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     sc->last_released = sc->acquired;
     sc->acquired = -1;
     return KLXR_SUCCESS;
@@ -4596,11 +5102,17 @@ static void klxr_fovea_trace(int eye, float x0, float y0, float x1, float y1,
 
 static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
                                XrFrameState *state) {
+    KLXR_TRACE("xrWaitFrame");
+    // hl2 (KL_HL2_FORCERT): drive the mod's CreateRenderTargets from here — the guest's
+    // render/frame thread with its GL context — instead of the log handler (which ran on a
+    // worker thread and re-entered logging, faulting). Self-gated: fires once, retries per
+    // frame until g_pSourceVR + the material system are ready. See kl_va_handlers.c.
+    { extern void kl_hl2_force_create_rendertargets(void); kl_hl2_force_create_rendertargets(); }
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info) klxr_log_chain("xrWaitFrame", info->next);
-    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
+    if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
 
     // Block here if the driver has a display to be paced by, BEFORE the latch:
     // the pose this frame is pinned to must be the one the compositor just
@@ -4641,10 +5153,11 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
 }
 
 static XrResult klxr_BeginFrame(void *session, const XrFrameBeginInfo *info) {
+    KLXR_TRACE("xrBeginFrame");
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (info) klxr_log_chain("xrBeginFrame", info->next);
-    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
+    if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
     // Calling xrBeginFrame twice without an xrEndFrame between is legal and
     // means the app discarded a frame; the runtime says so with a success code
     // rather than an error. We do not track it as an error either.
@@ -4769,15 +5282,33 @@ static void klxr_pose_trace_report(klxr_session *s) {
 }
 
 static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
+    KLXR_TRACE("xrEndFrame");
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_FRAME_END_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_FRAME_END_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrEndFrame", info->next);
-    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
-    if (!s->frame_begun) return KLXR_ERROR_CALL_ORDER_INVALID;
+    if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
+    if (!s->frame_begun) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     s->frame_begun = 0;
     s->frames_ended++;
+
+    // KL_GLFB_DRAW_CENSUS: periodically dump WHERE the guest's draws land and
+    // each framebuffer's colour attachment (texture, array layer, format). The
+    // one measurement that says whether hl2's gameplay resolve
+    // (HL2Quest_MultiviewResolveEx: opaque scene target -> OpenXR swapchain)
+    // actually targets a swapchain image, or draws into its own opaque target
+    // and never reaches the swapchain the compositor mirrors (the frozen-menu
+    // symptom). Cumulative; the attachment shown is each fb's latest.
+    {
+        static int census = -1;
+        if (census < 0) census = kl_env_on("KL_GLFB_DRAW_CENSUS", 0);
+        if (census && (s->frames_ended % 200) == 0) {
+            fprintf(stderr, "  [glfb] --- draw census at frame %llu ---\n",
+                    (unsigned long long)s->frames_ended);
+            kl_glfb_draw_census(stderr);
+        }
+    }
 
     // Which projection layer the capture reads. Some guests submit more than
     // one — Steam Link submits several, each with a left and a right view — and
@@ -4979,7 +5510,8 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             // one layer" is indistinguishable from "the guest composites nothing
             // we understand" — which is the state JKXR was in until the quad was
             // drawn. Cylinder and equirect are the two that would come next.
-            if (layer->type != XR_TYPE_COMPOSITION_LAYER_QUAD) {
+            if (layer->type != XR_TYPE_COMPOSITION_LAYER_QUAD &&
+                layer->type != XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR) {
                 static int said[8];
                 static int said_n;
                 int seen = 0;
@@ -4997,10 +5529,39 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             // A quad IS the picture for a guest that submits nothing else, so
             // it is both captured and composited — the capture through the eye
             // image (which is what KL_GLFB_OUT reads), the composite through
-            // the overlay record built below.
-            if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
-                const XrCompositionLayerQuad *q =
-                    (const XrCompositionLayerQuad *)layer;
+            // the overlay record built below. A cylinder is flattened to a quad
+            // (see XrCompositionLayerCylinderKHR) and takes the identical path.
+            if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD ||
+                layer->type == XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR) {
+                XrCompositionLayerQuad qbuf;
+                const XrCompositionLayerQuad *q;
+                if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                    q = (const XrCompositionLayerQuad *)layer;
+                } else {
+                    const XrCompositionLayerCylinderKHR *cyl =
+                        (const XrCompositionLayerCylinderKHR *)layer;
+                    qbuf.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+                    qbuf.next = cyl->next; qbuf.layerFlags = cyl->layerFlags;
+                    qbuf.space = cyl->space; qbuf.eyeVisibility = cyl->eyeVisibility;
+                    qbuf.subImage = cyl->subImage; qbuf.pose = cyl->pose;
+                    float w = cyl->radius * cyl->centralAngle;   // arc length -> flat width
+                    if (!(w > 0)) w = 1.0f;
+                    // A wide cylinder flattens to an ENORMOUS flat panel — cs1's
+                    // menu came out 18.85 m (~124deg), which is what "the menu is
+                    // huge" is. Cap the flat width to a comfortable field of view
+                    // so the flattened menu matches the quad-layer menus (hl1's is
+                    // ~58deg). The guest renders the same texture; only the panel
+                    // it is shown on shrinks, so the cursor mapping is unchanged.
+                    if (cyl->radius > 0.0f) {
+                        const float cap_deg = 53.0f;   // ~hl1's quad menu (5 m @ 4.5 m)
+                        float cap_w = 2.0f * cyl->radius *
+                                      tanf(cap_deg * 0.5f * 3.14159265f / 180.0f);
+                        if (w > cap_w) w = cap_w;
+                    }
+                    qbuf.size.width  = w;
+                    qbuf.size.height = cyl->aspectRatio > 0 ? w / cyl->aspectRatio : w;
+                    q = &qbuf;
+                }
                 klxr_swapchain *sc = klxr_swapchain_of(q->subImage.swapchain);
                 if (sc && sc->last_released >= 0 &&
                     sc->last_released < sc->count) {
@@ -5594,7 +6155,34 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // compositor to fall back to the single eye picture, which is what every
     // other guest and KL_XR_LAYERS=0 must keep getting.
     if (layers_on) {
-        kl_ovrp_proj_layers_external(pl, npl);
+        // Klepton: a TRANSITION frame can submit projection layer(s) whose
+        // swapchain has no released image yet — every slot is -1, so the
+        // per-layer composite can reach no texture and draws black. hl2's
+        // cinema<->gameplay handoff does exactly this for a frame or two: it
+        // pauses the direct array path, points a projection layer at its
+        // separate per-eye swapchains, and submits before it has rendered or
+        // released one. Publishing that list REPLACES the last good frame with
+        // black, and visionOS's compositor SIGKILLs a client that presents
+        // black across a loading transition (seen as the app dying ~2 s after
+        // the frame shape flips to per-eye). So when NO layer this frame is
+        // reachable, keep the previous frame's layers standing rather than
+        // filing an all-black one — the same rule, and the same reason, as the
+        // eye path above skipping kl_ovrp_frame_end_external when drawn_stage<0.
+        // A genuine count of zero (npl==0) still publishes, because that is how
+        // a guest says "fall back to the single eye picture".
+        int any_reachable = 0;
+        for (int k = 0; k < npl; k++)
+            if (pl[k].slot[0] >= 0 || pl[k].slot[1] >= 0) { any_reachable = 1; break; }
+        if (npl == 0 || any_reachable) {
+            kl_ovrp_proj_layers_external(pl, npl);
+        } else {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [xr] %d projection layer(s) submitted with no "
+                                "released image (all slots -1) — keeping the last "
+                                "composited frame instead of filing black (a "
+                                "cinema<->gameplay transition frame)\n", npl);
+        }
         s->proj_hist[npl < 9 ? npl : 8]++;
         for (int k = 0; k < npl && k < 8; k++) {
             s->proj_present[k]++;
@@ -5656,12 +6244,13 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
 static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
                                  XrViewState *view_state, uint32_t capacity,
                                  uint32_t *count_out, XrView *views) {
+    KLXR_TRACE("xrLocateViews");
     klxr_session *s = klxr_sess(session);
-    if (!s) return KLXR_ERROR_HANDLE_INVALID;
-    if (!info || !view_state) return KLXR_ERROR_VALIDATION_FAILURE;
-    if (info->type != XR_TYPE_VIEW_LOCATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !view_state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (info->type != XR_TYPE_VIEW_LOCATE_INFO) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info->viewConfigurationType != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
-        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+        KLXR_RET(KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
     // The guest names the instant it wants these views for, so the views below
     // are predicted to it rather than being the head as it stands now — out of
     // the frame's ONE prediction, which xrLocateSpace reads too. See
@@ -5669,7 +6258,7 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
     // queries is what made this guest draw from one head and declare another.
     klxr_head_delta pred = klxr_frame_head_delta(s, info->displayTime);
     klxr_space *base = klxr_space_of(info->space);
-    if (!base) return KLXR_ERROR_HANDLE_INVALID;
+    if (!base) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
 
     view_state->type = XR_TYPE_VIEW_STATE;
     view_state->viewStateFlags = KLXR_VIEW_ORIENTATION_VALID | KLXR_VIEW_POSITION_VALID |
@@ -5677,7 +6266,7 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
 
     XrResult r = klxr_two_call(capacity, count_out, 2);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
-    if (!views) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!views) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
 
     // The views are wanted in `base`'s frame, so each eye is composed out of the
     // tracking space and into that one — see klxr_space_pose. When `base` is
@@ -5736,10 +6325,11 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
 // UNTRACKED, which is a flags answer rather than a different computation.
 static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
                                  XrSpaceLocation *location) {
+    KLXR_TRACE("xrLocateSpace");
     klxr_space *sp = klxr_space_of(space);
     klxr_space *bs = klxr_space_of(base_space);
-    if (!sp || !bs) return KLXR_ERROR_HANDLE_INVALID;
-    if (!location) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!sp || !bs) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!location) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     (void)time;
     klxr_log_chain("xrLocateSpace", location->next);
 
@@ -5828,8 +6418,8 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
 // did not recognise. Serving it costs nothing and turns "-41" in the guest's
 // own log into a name, which is worth more to us than to it.
 static XrResult klxr_ResultToString(void *instance, XrResult value, char *buffer) {
-    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
-    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!buffer) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     const char *name = NULL;
     switch (value) {
         case KLXR_SUCCESS:                       name = "XR_SUCCESS"; break;
@@ -5877,6 +6467,34 @@ static XrResult klxr_ResultToString(void *instance, XrResult value, char *buffer
     return KLXR_SUCCESS;
 }
 
+// ---------------------------------------------------------------- XR_FB_passthrough
+// Stub passthrough: some guests require the extension and drive these, but nothing
+// here composites a passthrough layer (visionOS supplies the environment). The
+// handles are sentinels the guest only ever hands back to us; start/pause/style
+// record nothing and succeed.
+static char g_pt_handle, g_pt_layer_handle;
+static XrResult klxr_CreatePassthroughFB(void *session, const void *info, void **out) {
+    (void)session; (void)info;
+    if (!out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    *out = &g_pt_handle;
+    return KLXR_SUCCESS;
+}
+static XrResult klxr_DestroyPassthroughFB(void *pt) { (void)pt; return KLXR_SUCCESS; }
+static XrResult klxr_PassthroughStartFB(void *pt)   { (void)pt; return KLXR_SUCCESS; }
+static XrResult klxr_PassthroughPauseFB(void *pt)   { (void)pt; return KLXR_SUCCESS; }
+static XrResult klxr_CreatePassthroughLayerFB(void *session, const void *info, void **out) {
+    (void)session; (void)info;
+    if (!out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    *out = &g_pt_layer_handle;
+    return KLXR_SUCCESS;
+}
+static XrResult klxr_DestroyPassthroughLayerFB(void *l)      { (void)l; return KLXR_SUCCESS; }
+static XrResult klxr_PassthroughLayerPauseFB(void *l)        { (void)l; return KLXR_SUCCESS; }
+static XrResult klxr_PassthroughLayerResumeFB(void *l)       { (void)l; return KLXR_SUCCESS; }
+static XrResult klxr_PassthroughLayerSetStyleFB(void *l, const void *style) {
+    (void)l; (void)style; return KLXR_SUCCESS;
+}
+
 // ---------------------------------------------------------------- dispatch
 // The table is built entirely out of refusals above, and everything we actually
 // implement replaces its row here. One list, so an entry point cannot be served
@@ -5910,6 +6528,14 @@ static void klxr_install(void) {
                                    (void *)klxr_GetVulkanDeviceExtensionsKHR},
         {"xrGetVulkanGraphicsDeviceKHR",
                                    (void *)klxr_GetVulkanGraphicsDeviceKHR},
+        {"xrCreateVulkanInstanceKHR",
+                                   (void *)klxr_CreateVulkanInstanceKHR},
+        {"xrCreateVulkanDeviceKHR",
+                                   (void *)klxr_CreateVulkanDeviceKHR},
+        {"xrGetVulkanGraphicsRequirements2KHR",
+                                   (void *)klxr_GetVulkanGraphicsRequirements2KHR},
+        {"xrGetVulkanGraphicsDevice2KHR",
+                                   (void *)klxr_GetVulkanGraphicsDevice2KHR},
         {"xrEnumerateDisplayRefreshRatesFB",
                                    (void *)klxr_EnumerateDisplayRefreshRatesFB},
         {"xrGetDisplayRefreshRateFB", (void *)klxr_GetDisplayRefreshRateFB},
@@ -5925,6 +6551,16 @@ static void klxr_install(void) {
                                    (void *)klxr_SetAndroidApplicationThreadKHR},
         {"xrEnumerateColorSpacesFB", (void *)klxr_EnumerateColorSpacesFB},
         {"xrSetColorSpaceFB",        (void *)klxr_SetColorSpaceFB},
+        // XR_FB_passthrough (stubbed — see above)
+        {"xrCreatePassthroughFB",       (void *)klxr_CreatePassthroughFB},
+        {"xrDestroyPassthroughFB",      (void *)klxr_DestroyPassthroughFB},
+        {"xrPassthroughStartFB",        (void *)klxr_PassthroughStartFB},
+        {"xrPassthroughPauseFB",        (void *)klxr_PassthroughPauseFB},
+        {"xrCreatePassthroughLayerFB",  (void *)klxr_CreatePassthroughLayerFB},
+        {"xrDestroyPassthroughLayerFB", (void *)klxr_DestroyPassthroughLayerFB},
+        {"xrPassthroughLayerPauseFB",   (void *)klxr_PassthroughLayerPauseFB},
+        {"xrPassthroughLayerResumeFB",  (void *)klxr_PassthroughLayerResumeFB},
+        {"xrPassthroughLayerSetStyleFB",(void *)klxr_PassthroughLayerSetStyleFB},
         // the session, and the state machine xrPollEvent drives
         {"xrCreateSession",        (void *)klxr_CreateSession},
         {"xrDestroySession",       (void *)klxr_DestroySession},
@@ -5972,6 +6608,7 @@ static void klxr_install(void) {
         {"xrEnumerateSwapchainFormats",
                                    (void *)klxr_EnumerateSwapchainFormats},
         {"xrCreateSwapchain",      (void *)klxr_CreateSwapchain},
+        {"xrCreateSwapchainAndroidSurfaceKHR", (void *)klxr_CreateSwapchainAndroidSurfaceKHR},
         {"xrDestroySwapchain",     (void *)klxr_DestroySwapchain},
         {"xrEnumerateSwapchainImages",
                                    (void *)klxr_EnumerateSwapchainImages},

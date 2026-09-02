@@ -209,6 +209,42 @@ if [ -n "$LOG_ONLY" ]; then
   exit 0
 fi
 
+# KL_FULL=1 (alias KL_VERBOSE_ALL=1): one switch for a full-debug run, so a black
+# app can be probed on every front in a SINGLE deploy instead of round-tripping a
+# flag at a time. Expands to the whole diagnostic set — traces, probes, the mem
+# log, UE stdout, and the periodic stack sampler — with the exact values a bool
+# switch can't carry. Each is set with :=-defaults so an explicit override on the
+# command line still wins, and only LOGGING knobs are turned on here: behavioural
+# flags (KL_OVERLAY_*, KL_NET_OFFLINE, KL_JNI_SOFT_NULLCLASS, KL_DLOPEN_REFUSE, ...)
+# stay opt-in per run. run.sh forwards every KL_* to the device automatically. The
+# runtime also honours KL_VERBOSE_ALL directly (kl_env.c) for any bool diag flag
+# not listed here, so the two layers together cover on-device launches too.
+if [ -n "${KL_FULL:-}" ] || [ -n "${KL_VERBOSE_ALL:-}" ]; then
+  export KL_VERBOSE_ALL="${KL_VERBOSE_ALL:-1}"   # arms the runtime kl_env.c switch
+  export KL_TRACE_DLSYM="${KL_TRACE_DLSYM:-1}"
+  export KL_TRACE_FMOD="${KL_TRACE_FMOD:-1}"
+  export KL_TRACE_OBB="${KL_TRACE_OBB:-1}"
+  export KL_TRACE_FS="${KL_TRACE_FS:-fail}"
+  export KL_OVRP_VERBOSE="${KL_OVRP_VERBOSE:-1}"
+  export KL_MVK_VERBOSE="${KL_MVK_VERBOSE:-1}"
+  export KL_MEM_LOG="${KL_MEM_LOG:-1}"
+  export KL_RT_DEBUG="${KL_RT_DEBUG:-1}"
+  export KL_SCRATCH_DEBUG="${KL_SCRATCH_DEBUG:-1}"
+  export KL_UE4_STDOUT="${KL_UE4_STDOUT:-1}"
+  export KL_GLFB_PROBE_VIDEO="${KL_GLFB_PROBE_VIDEO:-1}"
+  export KL_GLFB_DRAW_CENSUS="${KL_GLFB_DRAW_CENSUS:-1}"   # periodic draws-per-fb + attachments (low spam)
+  export KL_GLFB_ERRPROBE="${KL_GLFB_ERRPROBE:-1}"         # GL errors after draws/blits (error-only, low spam)
+  # KL_GLFB_BLIT_LOG (per-blit src/dst/status firehose) stays OPT-IN — too spammy for KL_FULL
+  export KL_OVRP_MIRROR_PROBE="${KL_OVRP_MIRROR_PROBE:-1}"
+  export KL_VK_EMU_PROBE="${KL_VK_EMU_PROBE:-1}"
+  export KL_VK_TEXELBUF_PROBE="${KL_VK_TEXELBUF_PROBE:-1}"
+  export KL_VK_DUMP_TEXELBUF="${KL_VK_DUMP_TEXELBUF:-1}"
+  export KL_SAMPLE_MS="${KL_SAMPLE_MS:-2000}"
+  export KL_SAMPLE_STACKS="${KL_SAMPLE_STACKS:-1}"
+  export KL_SAMPLE_REPORT_S="${KL_SAMPLE_REPORT_S:-15}"
+  echo "full-debug: KL_FULL on — all traces/probes/sampler armed (override any by setting it)"
+fi
+
 # Knobs, exported for run.sh's FORWARD list. Set with :=-style defaults so an
 # environment that already has one keeps it.
 [ -z "$FRAMES" ]    || export KL_FRAMES="${KL_FRAMES:-$FRAMES}"

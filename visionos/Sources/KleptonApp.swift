@@ -62,7 +62,11 @@ enum Immersive {
     // scene SITS — scale, distance and IPD are all much easier to call against
     // real surroundings than against a black void. KL_FULL=1 restores .full,
     // which is what shipping a VR title eventually wants.
-    static var mixed: Bool { !klEnvOn("KL_FULL", default: false) }
+    // The native OpenXR VR kind (GTA Vice City) is an in-world title and defaults
+    // to FULLY immersive — .mixed leaves its menu a window floating in passthrough.
+    // Every other target keeps .mixed as the development default. KL_FULL in the
+    // environment overrides either way (KL_FULL=0 forces .mixed back).
+    static var mixed: Bool { !klEnvOn("KL_FULL", default: kl_app_target_wants_full() != 0) }
 
     // How many times the CompositorLayer closure has been entered. SwiftUI may
     // re-evaluate a scene, and a second layer would mean the render loop the log
@@ -156,6 +160,16 @@ struct KleptonApp: App {
             // makes that distinction checkable on a device rather than assumed.
             .onChange(of: scenePhase) { _, phase in Lifecycle.scenePhaseChanged(to: phase) }
 
+        // The on-demand text-entry window (KL_KBD_WINDOW). Additive: it exists in
+        // the scene graph but nothing opens it unless the flag is on and the guest
+        // asks for text, so the default keyboard path (BootView's hidden field) is
+        // untouched. visionOS centres a freshly opened window on the viewer's gaze,
+        // which is the whole point — the hidden field is anchored to a 2D window
+        // off to the side of an immersive guest, so its keyboard is never in view.
+        WindowGroup(id: "kbentry") { KeyboardEntryView() }
+            .defaultSize(width: 560, height: 240)
+            .windowResizability(.contentSize)
+
         ImmersiveSpace(id: Immersive.id) {
             CompositorLayer(configuration: KleptonStageConfiguration()) { layerRenderer in
                 // How many times this closure runs, and for which renderer. If
@@ -167,11 +181,13 @@ struct KleptonApp: App {
                 KleptonCompositor(layerRenderer).startRenderLoop()
             }
         }
-        // .mixed by default — see Immersive.mixed. The guest renders an opaque
-        // world, so passthrough only shows where Beat Saber's own sky is, which
-        // is nowhere; what it buys is being able to see the room while judging
-        // how the scene sits. KL_FULL=1 goes back.
-        .immersionStyle(selection: .constant(Immersive.mixed ? .mixed : .full),
+        // .mixed vs .full is read from the observed chroma object (set by boot
+        // once the target is known — see KleptonChroma.immersionFull and
+        // Immersive.mixed), NOT from a static read here: the scene graph is built
+        // before kl_app_configure, so a static read always saw the pre-target
+        // default. Observing the object means .full takes hold reactively before
+        // the space opens, for the native VR kind (GTA Vice City). KL_FULL wins.
+        .immersionStyle(selection: .constant(chroma.immersionFull ? .full : .mixed),
                         in: .mixed, .full)
         // See Immersive.systemOverlays. On the scene, not on a view inside it:
         // a CompositorLayer has no view hierarchy for the View-level modifier to
@@ -201,6 +217,55 @@ enum Paths {
     }
 }
 
+// Coordinates the on-demand keyboard window. It is a separate Scene from BootView
+// and cannot share @State, so a shared singleton carries the one bit BootView
+// needs — is it already open — to avoid opening a second copy on the next request.
+final class KbState: ObservableObject {
+    static let shared = KbState()
+    @Published var open = false
+}
+
+// The on-demand text-entry window (KL_KBD_WINDOW=1). Opened in front of the viewer
+// when the guest asks for text; it raises the system keyboard and feeds what is
+// typed to the guest through the SAME path as BootView's hidden field
+// (kl_mono_commit_text for characters, KEYCODE_DEL for backspace, KEYCODE_ENTER on
+// submit). Dismissing it puts the keyboard away.
+struct KeyboardEntryView: View {
+    @State private var text = ""
+    @FocusState private var focused: Bool
+    @Environment(\.dismissWindow) private var dismissWindow
+    @ObservedObject private var kb = KbState.shared
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Game text entry").font(.headline)
+            Text("Type here — it goes straight to the game. Tap Done when finished.")
+                .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            TextField("", text: $text)
+                .focused($focused)
+                .textFieldStyle(.roundedBorder)
+                .onChange(of: text) { old, new in
+                    if new.count < old.count {
+                        for _ in 0..<(old.count - new.count) {
+                            let c = kl_mono_keycode_for_char(8); kl_mono_key(1, c); kl_mono_key(0, c)
+                        }
+                    } else if new.count > old.count {
+                        String(new.dropFirst(old.count)).withCString { kl_mono_commit_text($0) }
+                    }
+                    if new.count > 128 { text = "" }   // a keyboard, not a buffer
+                }
+                .onSubmit {
+                    let c = kl_mono_keycode_for_char(10); kl_mono_key(1, c); kl_mono_key(0, c)  // Enter
+                }
+            Button("Done") { dismissWindow(id: "kbentry") }
+        }
+        .padding(28)
+        .frame(minWidth: 480)
+        .onAppear { text = ""; focused = true; kb.open = true }
+        .onDisappear { kb.open = false }
+    }
+}
+
 struct BootView: View {
     @State private var log = ""
     @State private var status = "idle"
@@ -214,7 +279,27 @@ struct BootView: View {
     // mid-frame. A timer at 5 Hz costs nothing and cannot deadlock.
     @State private var showShell = false
     @State private var handedOff = false
+    // The visionOS system keyboard for an immersive guest: there is no on-screen
+    // keyboard in an immersive space, so when the guest asks for text entry
+    // (kl_mono_text_input_wanted, set by SDLActivity.showTextInput) we focus a
+    // hidden field to raise the system keyboard and feed what is typed back
+    // through kl_mono_key. cs1 needs this to name a local server.
+    @State private var kbTyped = ""
+    @State private var kbSuppress = false
+    @FocusState private var kbFocused: Bool
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
+    @Environment(\.openWindow) private var openWindow
+    // The game-facing builds (hl1/hl2/portal) show a launcher: a chosen game
+    // folder plus per-title options, and boot on a button rather than on their own.
+    // Observe the active files object so the Start button tracks file readiness;
+    // the fallback is inert (no such bookmark) for the runtime-debugging targets.
+    @ObservedObject private var files = klActiveFiles() ?? LauncherFiles(bookmarkKey: "none", expected: "")
+    private var isLauncher: Bool { klIsLauncher() }
+    // The microphone dial only appears where voice is actually used: Steam Link's
+    // stream and the Xash titles that name a local server. Every other build hides it.
+    private var showMic: Bool {
+        ["steamlink-vr", "hl1", "cs1"].contains(klTargetName())
+    }
 
     var body: some View {
         Group {
@@ -235,6 +320,37 @@ struct BootView: View {
             let mono = kl_present_mode_now() == KL_PRESENT_MONO
             if mono != showShell { showShell = mono }
 
+            // Raise the system keyboard on EACH text-entry request. The guest
+            // calls showTextInput every time a field is clicked, so this is
+            // edge-triggered: consume the flag (set it back to 0) and (re-)focus,
+            // so the next click is a fresh request that re-raises the keyboard —
+            // even after the person dismissed it, and for a second field while the
+            // first is still up. Clearing kbTyped for the new field must not look
+            // like a deletion to onChange, hence the suppress flag.
+            if kl_mono_text_input_wanted() != 0 {
+                kl_mono_set_text_input(0)
+                if klEnvOn("KL_KBD_WINDOW", default: false) {
+                    // Gaze-centred window path: open the dedicated entry window in
+                    // front of the viewer (only if one is not already up). It raises
+                    // the keyboard itself on appear. This is the fix for an immersive
+                    // guest, whose 2D boot window (and its keyboard) is out of view.
+                    if !KbState.shared.open { openWindow(id: "kbentry") }
+                } else {
+                    if !kbTyped.isEmpty { kbSuppress = true; kbTyped = "" }
+                    // Force a focus TRANSITION. @FocusState set true==true is a no-op,
+                    // so if the field is still state-focused but the keyboard was put
+                    // away (tapped off / a second field click), re-setting true leaves
+                    // the keyboard DOWN — the "worked once, then couldn't keep writing"
+                    // flakiness. Drop focus, let SwiftUI render that, then re-take it so
+                    // the system re-raises the keyboard every time.
+                    if kbFocused {
+                        kbFocused = false
+                        try? await Task.sleep(for: .milliseconds(60))
+                    }
+                    kbFocused = true
+                }
+            }
+
             if kl_app_vrlink_pending() != 0, !handedOff {
                 handedOff = true
                 NSLog("[app] 2D -> VR handoff: \(String(cString: kl_app_vrlink_sargs()))")
@@ -253,15 +369,29 @@ struct BootView: View {
         }
     }
 
+    // One typed character to the guest, as the Android keycode SDL expects. The
+    // key list is kl_mono_keycode_for_char, shared with the flat-window shell.
+    private func kbSend(_ ch: Int32) {
+        let code = kl_mono_keycode_for_char(ch)
+        guard code != 0 else { return }
+        kl_mono_key(1, code)
+        kl_mono_key(0, code)
+    }
+
     private var bootReport: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Klepton").font(.largeTitle.bold())
-                // The guest, by name. Two apps are built from this tree and they
-                // look identical from the front; a boot log that does not say
-                // which one produced it is a log that can be read as the other's.
-                Text(String(cString: kl_app_target_name()))
-                    .foregroundStyle(.secondary)
+                if let title = klLauncherTitle() {
+                    // A game build presents as the game, not the runtime.
+                    Text(title).font(.largeTitle.bold())
+                } else {
+                    Text("Klepton").font(.largeTitle.bold())
+                    // The guest, by name. Two apps are built from this tree and they
+                    // look identical from the front; a boot log that does not say
+                    // which one produced it is a log that can be read as the other's.
+                    Text(klTargetName())
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 if finished {
                     Label(succeeded ? "initJni completed" : status,
@@ -278,6 +408,11 @@ struct BootView: View {
             }
             .frame(maxHeight: .infinity)
 
+            // The game build's launcher: a chosen game folder plus that title's
+            // options (hl1's Xash panel; hl2/portal's thinner one). See
+            // KleptonLauncher.swift / KleptonHL1.swift.
+            if isLauncher { LauncherPanel() }
+
             // The controller-alignment sliders, in THIS window because it stays
             // open beside the immersive space — so the guest keeps rendering
             // while they move, which is the entire point of them. Collapsed by
@@ -291,25 +426,79 @@ struct BootView: View {
             DisclosureGroup("Matting") { ChromaView() }
                 .font(.callout)
 
+            // ...and the microphone opt-in, same window, collapsed by default.
+            // Off unless a person turns it on: it is the one dial that opens a
+            // privacy surface and changes the audio session out from under the
+            // music, so it never engages on its own. Hidden entirely except on the
+            // targets that actually use voice — Steam Link and the Xash titles that
+            // name a local server — so no other build shows a mic control it can't use.
+            if showMic {
+                DisclosureGroup("Microphone") { MicView() }
+                    .font(.callout)
+            }
+
             HStack(spacing: 16) {
-                Button(running ? "Running…" : "Boot") { boot() }
-                    .disabled(running)
+                Button(running ? "Running…" : "Boot") {
+                    // A game build gathers its settings first: fold them into env
+                    // (+ commandline.txt for hl1), and only boot if the chosen
+                    // folder is ready.
+                    if isLauncher, !klLauncherApply() { return }
+                    boot()
+                }
+                .disabled(running || (isLauncher && !files.canLaunch))
                 if running { ProgressView() }
                 if finished, !log.isEmpty {
                     ShareLink(item: log) { Label("Export log", systemImage: "square.and.arrow.up") }
                 }
                 Spacer()
-                Text(status).font(.footnote).foregroundStyle(.secondary)
+                // The game builds don't surface the runtime's internal staging errors
+                // ("missing staged assets …") — their file UI drives availability, so
+                // only the folder-picker's own status is meaningful there.
+                if !(isLauncher && status.hasPrefix("missing")) {
+                    Text(status).font(.footnote).foregroundStyle(.secondary)
+                }
             }
         }
         .padding(24)
+        // The system-keyboard bridge for immersive text entry — hidden, and it
+        // must stay in the hierarchy: dismissing the field is what tells the
+        // system to put the keyboard away. Characters, not key events (SwiftUI
+        // hands a windowed app the resulting STRING), translated to Android
+        // keycodes the guest's SDL turns back into text via kl_mono_key.
+        .overlay(alignment: .bottom) {
+            TextField("", text: $kbTyped)
+                .focused($kbFocused)
+                .opacity(0.02)
+                .frame(width: 1, height: 1)
+                .onChange(of: kbTyped) { old, new in
+                    // A programmatic reset for a new field is not typing — skip it,
+                    // or the "" would read as deleting the previous field's text.
+                    if kbSuppress { kbSuppress = false; return }
+                    if new.count < old.count {
+                        // Deletion: backspace is an edit key, not text — keep it on
+                        // the key path (KEYCODE_DEL), which the field honours.
+                        for _ in 0..<(old.count - new.count) { kbSend(8) }
+                    } else if new.count > old.count {
+                        // New characters must go through the IME commit path or SDL
+                        // never raises SDL_TEXTINPUT and the field stays empty.
+                        String(new.dropFirst(old.count)).withCString { kl_mono_commit_text($0) }
+                    }
+                    if new.count > 128 { kbSuppress = true; kbTyped = "" }   // a keyboard, not a buffer
+                }
+        }
         // Boots on its own. Tapping an app and then tapping Boot is a harness,
         // not a product — and the scripted paths (`visionos/run.sh`) wanted
         // this anyway, which is what KL_AUTOBOOT was for. `KL_AUTOBOOT=0`
         // restores the button-only shape for hand-driven debugging, where the
         // point is to attach or start a capture before the guest runs.
         .task {
-            if klEnvOn("KL_AUTOBOOT", default: true) { boot() }
+            // A game build NEVER auto-boots — even though visionos/run.sh sets
+            // KL_AUTOBOOT=1 for scripted launches — because it must let the player
+            // choose the game folder, set options, and press "Boot" first.
+            // Only the runtime-debugging targets honour KL_AUTOBOOT (default on).
+            if !isLauncher, klEnvOn("KL_AUTOBOOT", default: true) {
+                boot()
+            }
         }
     }
 
@@ -339,10 +528,26 @@ struct BootView: View {
                 NSLog("[app] configure failed: \(String(cString: kl_app_status()))")
                 DispatchQueue.main.async {
                     status = String(cString: kl_app_status())
-                    log = "configure failed: \(status)\n\n" + stagingHelp
-                    running = false; finished = true; succeeded = false
+                    if isLauncher {
+                        // A game build has its own file UI — don't scare the player
+                        // with the developer staging instructions, and let them pick
+                        // a folder and press Boot again (boot never ran, so retry is
+                        // safe — that is why finished stays false here).
+                        log = "Choose your game folder below (or install it), then press Boot."
+                        running = false; finished = false; succeeded = false
+                    } else {
+                        log = "configure failed: \(status)\n\n" + stagingHelp
+                        running = false; finished = true; succeeded = false
+                    }
                 }
                 return
+            }
+
+            // The target is resolved now, so the immersion default (which depends
+            // on it — the native VR kind opens .full) is finally knowable. Publish
+            // it on the main actor before the space opens; the scene observes it.
+            DispatchQueue.main.async {
+                KleptonChroma.shared.immersionFull = !Immersive.mixed
             }
 
             let logPath = String(cString: kl_app_log_path())
