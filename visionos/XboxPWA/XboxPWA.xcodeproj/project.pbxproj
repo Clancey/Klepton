@@ -129,7 +129,7 @@
 				INFOPLIST_FILE = Info.plist;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				INFOPLIST_KEY_CFBundleDisplayName = "Xbox";
-				INFOPLIST_KEY_GCSupportsControllerUserInteraction = YES;
+				INFOPLIST_KEY_GCSupportsControllerUserInteraction = NO;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = "quetzalcoatl432.dev.klepton.target.xbox";
 				PRODUCT_NAME = XboxPWA;
@@ -151,7 +151,7 @@
 				INFOPLIST_FILE = Info.plist;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				INFOPLIST_KEY_CFBundleDisplayName = "Xbox";
-				INFOPLIST_KEY_GCSupportsControllerUserInteraction = YES;
+				INFOPLIST_KEY_GCSupportsControllerUserInteraction = NO;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = "quetzalcoatl432.dev.klepton.target.xbox";
 				PRODUCT_NAME = XboxPWA;
