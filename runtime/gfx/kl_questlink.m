@@ -71,8 +71,13 @@ static uint32_t hand_buttons(int hand, const qlks_hand *h, uint32_t *touches) {
     if (h->pressed & QLKS_BUTTON_UPPER) b |= upper;
     if (h->pressed & QLKS_BUTTON_STICK) b |= stick;
     if (h->pressed & QLKS_BUTTON_MENU) b |= KL_OVRP_RAW_START;
-    if (h->trigger > 0.5f) b |= trig;
-    if (h->squeeze > 0.5f) b |= grip;
+    // Analog trigger/grip as buttons need hysteresis, or a value resting near
+    // the threshold reads as press/release every poll (a gun drop in SUPERHOT).
+    static int held[2][2];
+    held[hand][0] = h->trigger >= (held[hand][0] ? 0.35f : 0.55f);
+    held[hand][1] = h->squeeze >= (held[hand][1] ? 0.35f : 0.55f);
+    if (held[hand][0]) b |= trig;
+    if (held[hand][1]) b |= grip;
     if (h->pressed & QLKS_TOUCH_LOWER) t |= lower;
     if (h->pressed & QLKS_TOUCH_UPPER) t |= upper;
     if (h->pressed & QLKS_TOUCH_STICK) t |= stick;
