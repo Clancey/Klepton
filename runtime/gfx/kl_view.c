@@ -144,6 +144,8 @@ void kl_view_frame_sink(const uint8_t *rgba, int w, int h, void *ctx) {
     pthread_mutex_unlock(&g_frame_mu);
 }
 
+int kl_view_external_pose;
+
 int kl_view_available(void) {
 #ifdef KL_VIEW_HAVE_SDL
     return 1;
@@ -658,7 +660,8 @@ int kl_view_main(const char *libdir, int hw) {
             float syw = sinf(yaw * 0.5f), cyw = cosf(yaw * 0.5f);
             // q = yaw ⊗ pitch: quat multiply of (0,syw,0,cyw) and (sp,0,0,cp).
             hqx = cyw * sp; hqy = cp * syw; hqz = -syw * sp; hqw = cyw * cp;
-            if (!mono) kl_ovrp_set_head_pose(px, py, pz, hqx, hqy, hqz, hqw);
+            if (!mono && !kl_view_external_pose)
+                kl_ovrp_set_head_pose(px, py, pz, hqx, hqy, hqz, hqw);
         }
         // Controller emulation — VR only; a flat guest has no hands.
         // Both hands ride head-relative offsets
@@ -670,7 +673,7 @@ int kl_view_main(const char *libdir, int hw) {
         // (0x200000/0x400000/0x800000, stick dirs 0x1000000..0x8000000).
         // Mouse L = right trigger, mouse R = right grip, Z/X = A/B, C/V =
         // X/Y, G/H = left trigger/grip, arrows = right thumbstick.
-        if (!mono) {
+        if (!mono && !kl_view_external_pose) {
             // KL_VIEW_AIM_AT_EYE=1 collapses both hands onto the head
             // position. Beat Saber's menu pointer (VRUIControls.
             // VRGraphicRaycaster) casts from the controller transform, so the

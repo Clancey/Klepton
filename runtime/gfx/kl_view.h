@@ -10,6 +10,10 @@
 
 int kl_view_available(void);
 
+// Set when another frontend (kl_questlink) owns the head and controllers; the
+// window then stops publishing its WASD/mouse head and emulated hands.
+extern int kl_view_external_pose;
+
 // The refresh rate of the display the viewer's window will open on, in Hz, or
 // 0 when SDL cannot say (and in a build without SDL3). Ask this BEFORE the
 // guest thread exists: a guest reads the display rate once, early, and paces

@@ -6758,6 +6758,7 @@ void kl_glfb_set_gpu_fence(void *mtl_shared_event) {
     g_gpu_fence = mtl_shared_event;
 }
 int kl_glfb_has_gpu_fence(void) { return g_gpu_fence != NULL; }
+void *kl_glfb_gpu_fence(void) { return g_gpu_fence; }
 uint64_t kl_glfb_gpu_fence_value(void) {
     return __atomic_load_n(&g_gpu_fence_value, __ATOMIC_ACQUIRE);
 }

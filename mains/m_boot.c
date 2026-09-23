@@ -28,6 +28,9 @@
 #include "../runtime/xr/kl_ovrp.h"
 #include "../runtime/xr/kl_ovrplat.h"
 #include "../runtime/gfx/kl_view.h"
+#ifdef KL_QUESTLINK
+#include "../runtime/gfx/kl_questlink.h"
+#endif
 #include "../runtime/diag/kl_sample.h"
 #include "../runtime/diag/kl_mprobe.h"
 #include "../runtime/diag/kl_metadump.h"
@@ -810,6 +813,19 @@ static int view_run(void) {
     // makes. A Unity guest is NOT in this set: kl_driver_frame already calls its
     // frame from this side, so a pacer there would be the compositor waiting on
     // itself. KL_XR_PACE=0 restores the free-running loop as the A/B.
+#ifdef KL_QUESTLINK
+    // A Quest over QuestLinkMac replaces the window's head, hands and display
+    // rate. After the viewer's rate push so the headset's wins, and before the
+    // guest thread so the guest reads it.
+    int questlink = 0;
+    if (kl_env_on("KL_QUESTLINK", 0)) {
+        questlink = hw && kl_questlink_start();
+        if (!questlink)
+            fprintf(stderr, "view: KL_QUESTLINK=1 but no headset stream — "
+                            "the window keeps the WASD head\n");
+    }
+#endif
+
     int owns_loop = (TARGET->kind == KL_GUEST_STEAMLINK && DOOR == KL_SLINK_VR) ||
                     TARGET->kind == KL_GUEST_JKXR;
     if (owns_loop && kl_env_on("KL_XR_PACE", 1)) {
@@ -826,6 +842,9 @@ static int view_run(void) {
     }
     int rc = kl_view_main(LIBDIR, hw);   // returns when the window closes
     g_view_quit = 1;
+#ifdef KL_QUESTLINK
+    if (questlink) kl_questlink_stop();
+#endif
     // The flat guest is inside its own main() and does not return on its own;
     // the process exiting is what ends it. Detaching rather than joining makes
     // closing the window close the app, which is what a window close means.

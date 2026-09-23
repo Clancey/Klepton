@@ -74,6 +74,8 @@ unsigned long kl_glfb_last_frame_lit(void);
 // the same question and the swap does one or the other, never both.
 void kl_glfb_set_gpu_fence(void *mtl_shared_event);
 int  kl_glfb_has_gpu_fence(void);
+// The registered event itself, so a second consumer can wait on the same value.
+void *kl_glfb_gpu_fence(void);
 
 // The value the most recent swap's signal will reach, or 0 before the first.
 // Read from the compositor thread; monotonically increasing, so an unchanged

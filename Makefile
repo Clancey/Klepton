@@ -389,13 +389,29 @@ vatest: build/t_variadic
 # Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
+# QuestLinkMac headset frontend (runtime/gfx/kl_questlink.m), off unless a
+# QuestLinkMac checkout and its CMake build are named:
+#   make build/m_boot QLM_ROOT=~/Projects/QuestLinkMac QLM_BUILD=$QLM_ROOT/build/klepton
+# where the build has run `cmake --build <dir> --target questlinkmac_klepton_stream`.
+ifneq ($(QLM_BUILD),)
+QLM_ROOT ?= $(QLM_BUILD)/..
+QLM_CFLAGS := -DKL_QUESTLINK=1 -I$(QLM_ROOT)/src
+QLM_SRC := runtime/gfx/kl_questlink.m
+QLM_LIBS := $(QLM_BUILD)/libquestlinkmac_klepton_stream.a \
+            $(QLM_BUILD)/src/runtime/libquestlinkmac_native_tracking_source.a \
+            $(QLM_BUILD)/libquestlinkmac_runtime_encoder_sink.a \
+            $(QLM_BUILD)/libquestlinkmac_metal_encoder.a \
+            $(QLM_BUILD)/src/runtime/libqlm_runtime_backend.a \
+            -lc++ -framework VideoToolbox -framework CoreMedia -framework CoreVideo
+endif
+
 build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
-              runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS)
+              runtime/gfx/kl_view_mtl.m $(QLM_SRC) $(RUNTIME_HDRS)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
+	$(CC) $(CFLAGS) $(QLM_CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
 	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
-	  runtime/gfx/kl_view_mtl.m \
-	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
+	  runtime/gfx/kl_view_mtl.m $(QLM_SRC) \
+	  $(LDLIBS) $(QLM_LIBS) -framework Metal -framework QuartzCore -framework Foundation \
 	  $(shell pkg-config --libs sdl3)
 
 boot: build/m_boot
