@@ -1587,10 +1587,12 @@ typedef struct {
     // whose position is visibly changing. OpenXR carries the same distinction
     // in XrSpaceVelocity.velocityFlags, which kl_openxr answers from this.
     int   motion_valid;
+    double t;                // CLOCK_MONOTONIC instant the sample is about; 0 unknown
 } klovrp_pose;
 static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
     0,   // motion_valid: nothing has been published, so there is nothing to know
+    0,
 };
 static int g_head_set;              // has a frontend ever written a head pose?
 // The two hands, published by the same frontend in the same breath. Declared
@@ -1660,8 +1662,21 @@ typedef struct {
     int    have;
     double t;
     float  px, py, pz, qx, qy, qz, qw;
+    int    sv_ok;            // smoothed velocity (kl_ovrp_set_pose_prediction)
+    float  sv[6];
 } klovrp_motion_hist;
 static klovrp_motion_hist g_head_hist, g_hand_hist[2];
+
+// Pose prediction, for a frontend whose picture reaches the eye long after the
+// sample it was drawn from (a streamed headset). Off unless the frontend asks:
+// every other frontend either predicts itself or displays immediately.
+static double g_pred_ahead, g_pred_max, g_pred_smooth;
+
+void kl_ovrp_set_pose_prediction(double ahead_s, double max_s, double smooth_s) {
+    g_pred_ahead = ahead_s > 0 ? ahead_s : 0;
+    g_pred_max = max_s > 0 ? max_s : 0;
+    g_pred_smooth = smooth_s > 0 ? smooth_s : 0;
+}
 
 static double klovrp_mono_now(void) {
     struct timespec ts;
@@ -1737,7 +1752,46 @@ static void klovrp_derive_motion(klovrp_pose *v, klovrp_motion_hist *h,
         }
         v->motion_valid = 1;
     }
+    // Differentiated velocity carries each sample's jitter at full gain, and a
+    // prediction multiplies it by the horizon. An exponential average over
+    // g_pred_smooth keeps the trend and drops the per-sample noise.
+    if (g_pred_smooth > 0 && v->motion_valid) {
+        float *raw = &v->vx, a = (float)(1.0 - exp(-dt / g_pred_smooth));
+        for (int i = 0; i < 6; i++) {
+            h->sv[i] = h->sv_ok ? h->sv[i] + a * (raw[i] - h->sv[i]) : raw[i];
+            raw[i] = h->sv[i];
+        }
+        h->sv_ok = 1;
+    } else if (!v->motion_valid) {
+        h->sv_ok = 0;
+    }
+    v->t = now;
     klovrp_hist_note(h, v, now);
+}
+
+// Move a sample forward to the instant its picture will be seen: g_pred_ahead
+// past now, capped at g_pred_max past the sample itself. Constant linear and
+// angular velocity; the angular one is in tracking-space axes, so the rotation
+// is applied on the left.
+static void klovrp_predict(klovrp_pose *v) {
+    if (g_pred_ahead <= 0 || !v->motion_valid || v->t <= 0) return;
+    double dt = klovrp_mono_now() + g_pred_ahead - v->t;
+    if (dt <= 0) return;
+    if (g_pred_max > 0 && dt > g_pred_max) dt = g_pred_max;
+    float t = (float)dt;
+    v->px += v->vx * t; v->py += v->vy * t; v->pz += v->vz * t;
+    float wx = v->avx * t, wy = v->avy * t, wz = v->avz * t;
+    float ang = sqrtf(wx*wx + wy*wy + wz*wz);
+    if (ang < 1e-7f) return;
+    float k = sinf(ang * 0.5f) / ang, dw = cosf(ang * 0.5f);
+    float dx = wx * k, dy = wy * k, dz = wz * k;
+    float qx = v->qx, qy = v->qy, qz = v->qz, qw = v->qw;
+    v->qw = dw*qw - dx*qx - dy*qy - dz*qz;
+    v->qx = dw*qx + dx*qw + dy*qz - dz*qy;
+    v->qy = dw*qy - dx*qz + dy*qw + dz*qx;
+    v->qz = dw*qz + dx*qy - dy*qx + dz*qw;
+    float n = sqrtf(v->qx*v->qx + v->qy*v->qy + v->qz*v->qz + v->qw*v->qw);
+    if (n > 0) { v->qx /= n; v->qy /= n; v->qz /= n; v->qw /= n; }
 }
 
 static void klovrp_pose_write(klovrp_pose *dst, const klovrp_pose *v) {
@@ -1878,6 +1932,7 @@ void kl_ovrp_frame_latch(void) {
     klovrp_pose h = klovrp_pose_read(&g_head_pose);
     klovrp_pose l = klovrp_pose_read(&g_hand_pose[0]);
     klovrp_pose r = klovrp_pose_read(&g_hand_pose[1]);
+    klovrp_predict(&h); klovrp_predict(&l); klovrp_predict(&r);
 
     static float worst, worst_axis[3];
     static unsigned n;
@@ -2029,7 +2084,7 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     // from the same sample. It stopped being the whole story when an OpenXR
     // guest arrived: velocity there is a chained output struct on any space,
     // and zeros in it are an assertion rather than a silence.
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
     klovrp_derive_motion(&v, &g_head_hist, g_head_pose_time);
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
@@ -2102,6 +2157,8 @@ static uint64_t klovrp_Update2(int step, int frame_index, double prediction) {
     if (!__atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) h.py = klovrp_eye_height();
     klovrp_pose l = klovrp_pose_read(&g_hand_pose[0]);
     klovrp_pose r = klovrp_pose_read(&g_hand_pose[1]);
+    // Predicted here, so the step sample BeginFrame records is the pose drawn.
+    klovrp_predict(&h); klovrp_predict(&l); klovrp_predict(&r);
 
     // How much the head moved between this frame's sample and the last one for
     // the same step. This is the quantity the old code was silently absorbing
@@ -3029,7 +3086,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float vx, float vy, float vz,
                              float avx, float avy, float avz) {
     if ((unsigned)hand > 1) return;
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1, 0 };
 // A measured velocity is authoritative — nothing is derived here. The
     // history still advances, so a publisher that later drops to the pose-only
     // call differentiates against the right previous sample instead of a gap.
@@ -3044,11 +3101,17 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
     // ...and the pose-only form, which is what the macOS viewer publishes. It
 // differentiates rather than passing six zeros to the call above — zeros are the
 // claim that a moving controller is stationary (see klovrp_pose.motion_valid).
+static double g_hand_pose_time[2];
+
+void kl_ovrp_set_hand_pose_time(int hand, double t) {
+    if ((unsigned)hand <= 1) g_hand_pose_time[hand] = t;
+}
+
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     if ((unsigned)hand > 1) return;
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
-    klovrp_derive_motion(&v, &g_hand_hist[hand], 0);
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_derive_motion(&v, &g_hand_hist[hand], g_hand_pose_time[hand]);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
     float e[3]; klovrp_pose_euler_deg(&v, e);

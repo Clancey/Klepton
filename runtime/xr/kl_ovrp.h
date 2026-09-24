@@ -132,6 +132,16 @@ int kl_ovrp_head_predict_delta(double time_s, float *quat4, float *pos3);
 
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
+// The instant the next kl_ovrp_set_hand_pose sample is about, as
+// kl_ovrp_set_head_pose_time is for the head; 0 keeps the call-time clock.
+void kl_ovrp_set_hand_pose_time(int hand, double t);
+
+// Predict the guest's head and hand poses forward, for a frontend whose picture
+// is seen long after its sample (a streamed headset): at each frame's pose
+// sample, extrapolate to `ahead_s` past now, never more than `max_s` past the
+// sample, with the derived velocities smoothed over `smooth_s`. The predicted
+// pose is the one recorded for the frame. All zero (the default) is off.
+void kl_ovrp_set_pose_prediction(double ahead_s, double max_s, double smooth_s);
 
 // ...and the same pose WITH its motion. ovrpPoseStatef carries velocity and
 // angular velocity beside the pose (kl_ovrp.c documents the layout), libunity

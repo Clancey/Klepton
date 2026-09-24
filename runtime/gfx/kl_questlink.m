@@ -104,6 +104,8 @@ static void *pose_main(void *arg) {
     (void)arg;
     pthread_setname_np("kl.questlink.pose");
     int64_t last_head = 0;
+    qlks_pose last_grip[2];
+    memset(last_grip, 0, sizeof last_grip);
     int was_tracking = -1;
     // KL_QUESTLINK_PAUSE_MS: how long the headset may be gone before the guest
     // is paused (Android's onPause on headset removal); 0 never pauses.
@@ -127,7 +129,8 @@ static void *pose_main(void *arg) {
             kl_driver_set_paused(1);
             lost_at = -1;
         }
-        if (tr.head_valid && tr.head_sample_ns != last_head) {
+        const int head_new = tr.head_valid && tr.head_sample_ns != last_head;
+        if (head_new) {
             last_head = tr.head_sample_ns;
             pthread_mutex_lock(&g_head_lock);
             g_head = tr.head;
@@ -144,11 +147,18 @@ static void *pose_main(void *arg) {
         }
         for (int hand = 0; hand < 2; hand++) {
             const qlks_hand *h = &tr.hands[hand];
-            if (h->active)
+            // Once per new sample: a republished sample differentiates to zero
+            // velocity. Grips ride in the head's pose packet, so they share its
+            // time when it moved with them.
+            if (h->active && memcmp(&h->grip, &last_grip[hand], sizeof h->grip)) {
+                last_grip[hand] = h->grip;
+                kl_ovrp_set_hand_pose_time(hand, head_new ? sample_time_s(tr.head_sample_ns)
+                                                          : monotonic_s());
                 kl_ovrp_set_hand_pose(hand, h->grip.position[0], h->grip.position[1],
                                       h->grip.position[2], h->grip.orientation[0],
                                       h->grip.orientation[1], h->grip.orientation[2],
                                       h->grip.orientation[3]);
+            }
             uint32_t touches = 0;
             uint32_t buttons = hand_buttons(hand, h, &touches);
             kl_ovrp_set_controller_input(hand, buttons, touches, h->trigger, h->squeeze,
@@ -296,7 +306,17 @@ int kl_questlink_start(void) {
     }
     fprintf(stderr, "  [questlink] headset at %.2f Hz; guest told %.1f Hz\n", hz,
             (double)kl_ovrp_display_frequency());
-    kl_ovrp_set_head_at(head_at);
+    // The picture is seen ~50-60 ms after its pose sample (render, encode,
+    // Wi-Fi, decode), and the headset's timewarp corrects only rotation, so the
+    // head's translation and both hands would otherwise be drawn that stale.
+    // KL_QUESTLINK_PREDICT_MS is how far past the guest's pose sample to aim.
+    const double ahead = kl_env_uint("KL_QUESTLINK_PREDICT_MS", 40) / 1000.0;
+    kl_ovrp_set_pose_prediction(ahead, kl_env_uint("KL_QUESTLINK_PREDICT_MAX_MS", 100) / 1000.0,
+                                kl_env_uint("KL_QUESTLINK_VEL_SMOOTH_MS", 10) / 1000.0);
+    fprintf(stderr, "  [questlink] pose prediction %.0f ms ahead\n", ahead * 1000.0);
+    // The timed head query answers from the raw sample, which would undo the
+    // latched prediction for an OpenXR guest; it only serves unpredicted runs.
+    if (ahead <= 0) kl_ovrp_set_head_at(head_at);
     kl_view_external_pose = 1;
 
     atomic_store(&g_quit, 0);
