@@ -130,7 +130,8 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB_ERRPROBE=1` — bracket draws and blits with `glGetError` and print
   the first 20 with the state around them (draw FBO, program, viewport;
   `glCheckFramebufferStatus` on 0x506). Consumes the pending error. Also
-  enables the blit-state log line.
+  enables the blit-state log line and the `glActiveTexture` error bracket,
+  which otherwise costs two `glGetError` round trips per call.
 - `KL_GLFB_DRAW_PROBE=1` — after each of the first 12 scene-sized draws (32+
   vertices), read back the centre 64x64 and report lit-pixel count and mean
   luma. `KL_GLFB_DRAW_PROBE_N` overrides the quota (0 = unlimited),

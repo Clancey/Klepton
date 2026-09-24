@@ -6841,10 +6841,14 @@ static void (*g_real_GetInternalformativ)(uint32_t, uint32_t, uint32_t, int32_t,
 // description, and a unit > 31 is the guest over-reading it.
 static void (*g_real_ActiveTexture)(uint32_t);
 static void klfb_ActiveTexture(uint32_t unit) {
+    // The error bracket costs two glGetError round trips per call (measured at 10%
+    // of the GL thread in SUPERHOT), so it runs only under KL_GLFB_ERRPROBE.
+    static int probe = -1;
+    if (probe < 0) probe = kl_env_on("KL_GLFB_ERRPROBE", 0);
     // Drain first: the guest leaves errors unread, so an undrained bracket
     // reports a leftover as glActiveTexture's own. Errors after this point are
     // provably this call's.
-    if (a_glGetError) while (a_glGetError()) {}
+    if (probe && a_glGetError) while (a_glGetError()) {}
     if (g_real_ActiveTexture) g_real_ActiveTexture(unit);
     g_tb_active_unit = (int)(unit - 0x84C0);   // track for texel-buffer sync
     // Which units does the guest actually select? Unity's "Invalid texture
@@ -6861,7 +6865,7 @@ static void klfb_ActiveTexture(uint32_t unit) {
         }
     }
     static int said;
-    if (said < 20 && a_glGetError) {
+    if (probe && said < 20 && a_glGetError) {
         uint32_t e = a_glGetError();
         if (e) {
             said++;
