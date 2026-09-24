@@ -623,7 +623,10 @@ static int recon_run(int view_pump) {
                 sampling = kl_sample_start((unsigned)strtoul(senv, NULL, 10),
                                            metadata_path(meta, sizeof meta));
             }
-            const long frame_ns = 1000000000L / 72;
+            // Pace to the display rate the headset negotiated (kl_questlink sets it
+            // before this thread starts); 72 Hz is only the no-headset default.
+            const float pump_hz = kl_ovrp_display_frequency();
+            const long frame_ns = (long)(1e9 / (pump_hz >= 30.0f && pump_hz <= 240.0f ? pump_hz : 72.0f));
             unsigned haptic_pulses = 0;
             unsigned i;
             for (i = 0; view_pump ? !g_view_quit : i < frames; i++) {
