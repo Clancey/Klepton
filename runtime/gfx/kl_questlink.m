@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "kl_env.h"
+#include "kl_driver.h"
 #include "kl_glfb.h"
 #include "kl_ovrp.h"
 #include "kl_view.h"
@@ -104,13 +105,27 @@ static void *pose_main(void *arg) {
     pthread_setname_np("kl.questlink.pose");
     int64_t last_head = 0;
     int was_tracking = -1;
+    // KL_QUESTLINK_PAUSE_MS: how long the headset may be gone before the guest
+    // is paused (Android's onPause on headset removal); 0 never pauses.
+    const double pause_after = kl_env_uint("KL_QUESTLINK_PAUSE_MS", 2000) / 1000.0;
+    double lost_at = -1;
     while (!atomic_load(&g_quit)) {
         qlks_tracking tr;
         int live = qlks_poll(g_link, &tr);
         int tracking = live && tr.head_valid;
         if (tracking != was_tracking) {
             fprintf(stderr, "  [questlink] headset tracking %s\n", tracking ? "live" : "lost");
+            if (!tracking && was_tracking == 1) lost_at = monotonic_s();
             was_tracking = tracking;
+        }
+        if (tracking) {
+            if (kl_driver_paused()) fprintf(stderr, "  [questlink] headset back; resuming game\n");
+            kl_driver_set_paused(0);
+            lost_at = -1;
+        } else if (pause_after > 0 && lost_at >= 0 && monotonic_s() - lost_at >= pause_after) {
+            fprintf(stderr, "  [questlink] headset gone %.1f s; pausing game\n", pause_after);
+            kl_driver_set_paused(1);
+            lost_at = -1;
         }
         if (tr.head_valid && tr.head_sample_ns != last_head) {
             last_head = tr.head_sample_ns;

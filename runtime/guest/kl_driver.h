@@ -89,6 +89,14 @@ int kl_driver_lifecycle_begin(FILE *out);
 // not run or the guest owns its own frame loop.
 int kl_driver_frame(void);
 
+// Pause or resume the guest the way Android does when a headset is removed or
+// disconnected: onPause/onResume. For a Unity guest the next kl_driver_frame
+// delivers nativeFocusChanged(false) + nativePause (OnApplicationPause(true) in
+// the game) or nativeResume + nativeFocusChanged(true), and a paused frame
+// skips nativeRender. Any thread may call this; it is a no-op for other doors.
+void kl_driver_set_paused(int paused);
+int  kl_driver_paused(void);
+
 // Turn the activity's looper for a guest that owns its frame loop. `seconds` is
 // a DEADLINE in wall time; negative means "until *quit", which is the shape a
 // frontend with no timer uses. `quit` may be NULL. Returns seconds spent, and 0

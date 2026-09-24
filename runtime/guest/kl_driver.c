@@ -630,9 +630,38 @@ int kl_driver_lifecycle_begin(FILE *out) {
     }
 }
 
+static int g_pause_want, g_paused;
+
+void kl_driver_set_paused(int paused) { __atomic_store_n(&g_pause_want, paused != 0, __ATOMIC_RELEASE); }
+int  kl_driver_paused(void) { return __atomic_load_n(&g_paused, __ATOMIC_ACQUIRE); }
+
+// On the pump thread, between frames: where Android's UI thread would run
+// UnityPlayer.pause()/resume().
+static void unity_apply_pause(void) {
+    const int want = __atomic_load_n(&g_pause_want, __ATOMIC_ACQUIRE);
+    if (want == g_paused) return;
+    void *focus = unity_lifecycle_native("nativeFocusChanged");
+    void *step = unity_lifecycle_native(want ? "nativePause" : "nativeResume");
+    kl_jni_local_frame_push();
+    if (want) {
+        if (focus) ((void (*)(void *, void *, uint8_t))focus)(kl_jni_env(), g_thiz, 0);
+        if (step) ((int8_t (*)(void *, void *))step)(kl_jni_env(), g_thiz);
+    } else {
+        if (step) ((void (*)(void *, void *))step)(kl_jni_env(), g_thiz);
+        if (focus) ((void (*)(void *, void *, uint8_t))focus)(kl_jni_env(), g_thiz, 1);
+    }
+    kl_jni_local_frame_pop();
+    kl_jni_drain_ui_tasks();
+    __atomic_store_n(&g_paused, want, __ATOMIC_RELEASE);
+    fprintf(stderr, "  [driver] UnityPlayer %s%s\n", want ? "paused" : "resumed",
+            step ? "" : " (lifecycle native not registered)");
+}
+
 int kl_driver_frame(void) {
     if (kl_driver_owns_frame_loop()) return -1;
     if (!g_render || !g_thiz) return -1;
+    unity_apply_pause();
+    if (g_paused) return 0;
     if (g_alarm) alarm(g_alarm);
     // Pin this frame's poses before anything in the frame can ask, so every
     // ovrp_GetNodePoseState inside it answers the same thing and the pose
