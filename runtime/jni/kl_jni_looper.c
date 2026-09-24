@@ -589,6 +589,15 @@ static klj_val klj_Choreographer_postFrameCallback(void *env, void *self,
     return (klj_val){.j = 0};
 }
 
+// Unity's onPause withdraws its callback and re-posts it on resume; until then
+// the frame clock has nothing to deliver.
+static klj_val klj_Choreographer_removeFrameCallback(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n > 0 && a[0].l == g_frame_callback) g_frame_callback = NULL;
+    return (klj_val){.j = 0};
+}
+
 // kl_jni_tick_choreographer() lives further down, next to the message delivery —
 // both call into guest proxies, and that machinery is defined there.
 
@@ -705,6 +714,7 @@ const klj_binding klj_bind_looper[] = {
     {"android/os/Message", "sendToTarget", "()V", klj_Message_sendToTarget},
     {"android/view/Choreographer", "getInstance", "()Landroid/view/Choreographer;", klj_Choreographer_getInstance},
     {"android/view/Choreographer", "postFrameCallback", "(Landroid/view/Choreographer$FrameCallback;)V", klj_Choreographer_postFrameCallback},
+    {"android/view/Choreographer", "removeFrameCallback", "(Landroid/view/Choreographer$FrameCallback;)V", klj_Choreographer_removeFrameCallback},
     {"android/os/HandlerThread", "<init>", "(Ljava/lang/String;)V", klj_HandlerThread_init},
     {"android/os/HandlerThread", "start", "()V", klj_HandlerThread_start},
     {"android/os/HandlerThread", "getLooper", "()Landroid/os/Looper;", klj_HandlerThread_getLooper},
